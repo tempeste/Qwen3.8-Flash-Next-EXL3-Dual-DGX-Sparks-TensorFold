@@ -31,7 +31,7 @@ carries the third-party notices that go with it.
     ranked by its uncached tail).
   - The idea of upstream PR #1792 (the shared partial summed where the down projection wrote it), applied in `0003`.
 - **MiaAI-Lab's single-Spark recipe**,
-  [Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold)
+  [Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/tree/20e15e41f2f514a0d287710f4665ee1b5009ba41)
   (MIT, Copyright (c) 2026 MiaAI-Lab): its patches 0001-0017 are ported in `patches/0002` and `0003`, each change
   naming its recipe patch (vision tower, image budget, the FP8 KV cache, FP8 reader prefetch, prefill speed, sampled
   GPU top-k candidates, the shared n-gram gather, host draws on worker threads, prompt HC fusion, the MX128 prompt tile,

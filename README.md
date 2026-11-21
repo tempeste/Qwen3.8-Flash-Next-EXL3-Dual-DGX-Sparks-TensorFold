@@ -128,12 +128,12 @@ Turn it on with `TF_FLASHNEXT_EXPERTS_TOPK=5 ./start.sh restart` (or `export TF_
   when both are up and addressed (`NCCL_RAILS=1`: one).
 - **Key-based ssh** from the first Spark (the head: rank 0 and the API) to the second (the worker):
   `ssh -o BatchMode=yes user@<worker> true` must work.
-- On both: Docker with the NVIDIA container runtime (your user in the `docker` group), `rsync`, `sha256sum`. On the
-  head also `curl`, `python3`, and the `hf` CLI or Python's `huggingface_hub`.
+- On both: Docker with the NVIDIA container runtime (your user in the `docker` group), `rsync`, `sha256sum`. On both also `python3`; on the
+  head also `curl` and the `hf` CLI or Python's `huggingface_hub`.
 - **Disk.** On each Spark ~96 GiB for the checkpoint under `~/.cache/huggingface`, the EXL3 experts of its rank
   (~19 GiB on the head, ~18 GiB on the worker; the head holds both ranks', ~37.5 GiB, until the worker has its copy),
   and the image under Docker's root (`IMAGE_FREE_GB`, 40 GB asked for; the build's own size is not measured here).
-  `EXL3_SOURCE=download` also keeps the six EXL3 shards (~43.4 GiB) on the head.
+  `EXL3_SOURCE=download` also keeps the six EXL3 shards (~43.2 GiB) on the head.
 - Network on the head for the first run: GitHub (TensorFold, libjpeg-turbo, TensorFold's v1.1.4 release),
   ziglang.org, storage.googleapis.com (libwebp), nvcr.io (the base image) and Hugging Face.
 
@@ -196,7 +196,7 @@ after the defaults (`./start.sh restart --max-tokens 16384`).
    with `git apply` in filename order, built with Zig 0.17.0 (sha256-checked) on `nvcr.io/nvidia/pytorch:26.07-py3`:
    `zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=fast fatbins native`. The serving image also carries
    libjpeg-turbo 3.1.4.1 and libwebp 1.6.0 (image decoding, built from sha256-checked sources) and the grammar library
-   of TensorFold's v1.1.4 release (sha256-checked), with their license files. The CUDA kernels are compiled into the
+   of TensorFold's v1.1.4 release (sha256-checked); NOTICE lists their licenses. The CUDA kernels are compiled into the
    build (no separate kernel set).
 3. The same image on the worker (`docker save | docker load`), checked identical.
 4. The checkpoint at its pin, into `~/.cache/huggingface`, checked file by file against `scripts/checkpoint.sha256`
@@ -222,7 +222,7 @@ Spark, and loads the experts its rank owns.
 
 - `EXL3_SOURCE=range` (default): reads the six shards' headers, then fetches only the routed-expert byte ranges with
   `curl -r` (~37.5 GiB instead of the whole branch), resumable.
-- `EXL3_SOURCE=download`: downloads the six shards (~43.4 GiB), checks each against the Hub's sha256, and cuts them.
+- `EXL3_SOURCE=download`: downloads the six shards (~43.2 GiB), checks each against the Hub's sha256, and cuts them.
 
 Both write the same files: the shards' headers are checked against pinned sums first, and every output file, and the
 index, against the sums of the folder the deployment serves from (`scripts/exl3-pack.sha256`). The tool only parses

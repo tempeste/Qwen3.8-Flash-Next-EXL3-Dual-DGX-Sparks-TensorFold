@@ -213,7 +213,7 @@ snapshot_download(sys.argv[1], revision=sys.argv[2], cache_dir=sys.argv[3], allo
     fi
   }
   snap=$(model_dir)
-  if [[ ! -f "$STATE_DIR/checkpoint-$MODEL_REVISION.ok" ]]; then
+  if [[ ! -f "$STATE_DIR/checkpoint-$MODEL_REVISION.ok" || ! -f "$snap/config.json" ]]; then
     if [[ ! -f "$snap/config.json" ]]; then
       have=$(free_gb "$HF_CACHE"); (( have >= CKPT_GIB + 5 )) ||
         warn "only ${have} GB free under $HF_CACHE; the checkpoint is ~$CKPT_GIB GiB (a partial download resumes)"
