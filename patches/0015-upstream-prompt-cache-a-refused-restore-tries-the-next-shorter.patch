@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ashhart <71890694+ashhart@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 20:28:10 +0000
+Subject: [PATCH 15/33] prompt cache: a refused restore tries the next shorter
+ kept state
+
+Upstream TensorFold commit by ashhart, ported onto this series (upstream main e8420316396b).
+
+Measured first on main-now with the store's fake family: with a kept state at
+7 and another at 4, a 9-token prompt whose longest state the backend refuses
+prefilled from 0 (8 tokens), while the 4-token state sat unused. The same holds
+in prompt_cache_index_test: a 12-token prompt prefilled 12 instead of 8.
+
+beginUser now drops the refused state (as before) and looks up the prompt again,
+so the next shorter kept state is restored in the same request; the pass starts
+from its position, and only when no kept state resumes does it prefill from the
+start with the first lookup's marks, exactly as main did. Refused states stay
+expired, so a later request cannot retry them. No replies change: the restored
+prefix is the prompt's own (tokens and canonical spans), and the fake family's
+pass sum equals a fresh pass's.
+
+Tests: a fake backend that refuses only the longest state resumes the shorter
+one, with equal tokens, one counted failure, no outstanding borrows and the live
+state count matching the store's; the index test now refuses the longest state
+and checks the shorter one resumes from the same begin, then that refusing
+every state drops both and prefills from 0. test-learn-recovery passes 504.
+
+(cherry picked from commit e8420316396be228556599f8f485bf6dd7e85af2)
+---
+ zig/src/core/prompt_cache.zig            | 28 ++++++++++++++++++------
+ zig/src/core/prompt_cache_fake.zig       |  2 ++
+ zig/src/core/prompt_cache_index_test.zig | 20 +++++++++--------
+ zig/src/core/prompt_cache_test.zig       | 24 ++++++++++++++++++++
+ 4 files changed, 58 insertions(+), 16 deletions(-)
+
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index e9366a51d402fece57ee2a828db07037d7ca1237..c353ec1a3561c2d607ba036a45d23cac59c9713a 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -377,13 +377,27 @@ pub const Store = struct {
+ 
+     /// Begin with a known end of the latest user message, for its optional interior state (0: unknown).
+     pub fn beginUser(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, rewind_len: u32, user_end: u32, shared: []const u32, starts: []const u32, owner: ?*anyopaque, spans: []const modes.Span) !Plan {
+-        const l = try s.lookupUser(a, prompt, @intCast(prompt.len), history_len, rewind_len, user_end, shared, starts, spans);
+-        const e = l.entry orelse return .{ .marks = l.marks };
+-        const failure: ?anyerror = if (s.family.vtable.restore(s.family.ptr, owner, e.saved)) |_| null else |err| err;
+-        const from = if (failure == null) e.at else 0;
+-        s.resumedWithReason(e, prompt, failure);
+-        s.reserve(prompt, @intCast(prompt.len), null, l.marks, spans); // restored: the state it resumed may go too (a peer restores before it drops)
+-        return .{ .from = from, .marks = l.marks };
++        var l = try s.lookupUser(a, prompt, @intCast(prompt.len), history_len, rewind_len, user_end, shared, starts, spans);
++        // the first lookup's marks, kept for the pass from the start if no shorter kept state resumes
++        var fresh_marks: ?[]const u32 = null;
++        while (l.entry) |e| {
++            if (s.family.vtable.restore(s.family.ptr, owner, e.saved)) |_| {
++                const at = e.at; // read before the reserve may evict the entry
++                s.resumedWithReason(e, prompt, null);
++                if (fresh_marks) |m| if (m.ptr != l.marks.ptr) a.free(m);
++                s.reserve(prompt, @intCast(prompt.len), null, l.marks, spans); // restored: the state it resumed may go too (a peer restores before it drops)
++                return .{ .from = at, .marks = l.marks };
++            } else |err| {
++                // a refused state is dropped, then the next shorter kept state is tried before the pass from the start
++                if (fresh_marks == null) fresh_marks = l.marks else a.free(l.marks);
++                s.resumedWithReason(e, prompt, err);
++                l = try s.lookupUser(a, prompt, @intCast(prompt.len), history_len, rewind_len, user_end, shared, starts, spans);
++            }
++        }
++        const marks_ = fresh_marks orelse l.marks;
++        if (fresh_marks != null and l.marks.ptr != marks_.ptr) a.free(l.marks);
++        s.reserve(prompt, @intCast(prompt.len), null, marks_, spans);
++        return .{ .marks = marks_ };
+     }
+ 
+     /// Look up canonical-span state and marks without restoring; the caller later reports resumed.
+diff --git a/zig/src/core/prompt_cache_fake.zig b/zig/src/core/prompt_cache_fake.zig
+index 734ecafae935de412f00094bfff625aa04b6e746..b30c11ef5b87ae8691b901c69743b96532f233c1 100644
+--- a/zig/src/core/prompt_cache_fake.zig
++++ b/zig/src/core/prompt_cache_fake.zig
+@@ -40,6 +40,7 @@ pub const Fake = struct {
+     fail_write: bool = false,
+     writes: usize = 0,
+     fail_restore: bool = false,
++    refuse_at: ?u32 = null, // a test's restore refusal for the state kept at this position
+     live: usize = 0,
+     spare_bytes: u64 = 0,
+     peer: ?*Peer = null, // speed-up mode's rank 1: it keeps the same states and drops them only when a request names them
+@@ -176,6 +177,7 @@ pub const Fake = struct {
+         const f = of(ptr);
+         if (f.fail_restore) return error.CopyFailed;
+         const st: *State = @ptrCast(@alignCast(saved));
++        if (f.refuse_at) |r| if (st.at == r) return error.CopyFailed;
+         f.at, f.sum = .{ st.at, st.sum };
+     }
+     fn dropFn(ptr: *anyopaque, saved: Saved) void {
+diff --git a/zig/src/core/prompt_cache_index_test.zig b/zig/src/core/prompt_cache_index_test.zig
+index e6ca872c00c1948a8f6b4a26e4fca91f64655216..b008ceeb926607e3dcb5246490bcaaf5ffa949b3 100644
+--- a/zig/src/core/prompt_cache_index_test.zig
++++ b/zig/src/core/prompt_cache_index_test.zig
+@@ -163,7 +163,7 @@ test "snapshot index: two borrowers survive invalidation and a later insertion"
+     try oracle.check(&s);
+ }
+ 
+-test "snapshot index: failed restore removes only its indexed state and retries a shorter one" {
++test "snapshot index: a refused restore removes only its indexed state, and the next shorter one resumes" {
+     const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+     var arena: std.heap.ArenaAllocator = .init(a);
+     defer arena.deinit();
+@@ -172,17 +172,19 @@ test "snapshot index: failed restore removes only its indexed state and retries
+     defer s.deinit();
+     try keep(&s, &f, &prompt, 4, &.{});
+     try keep(&s, &f, &prompt, 8, &.{});
+-    f.fail_restore = true;
+-    const failed = try s.begin(arena.allocator(), &prompt, 0, &.{}, &.{}, null, &.{});
+-    try std.testing.expectEqual(@as(u32, 0), failed.from);
+-    try std.testing.expectEqual(@as(u64, 0), s.counts.hits);
+-    try std.testing.expectEqual(@as(u64, 1), s.counts.failed);
+-    try oracle.check(&s);
+-    f.fail_restore = false;
++    f.refuse_at = 8; // the index's longest state is refused
+     const resumed = try s.begin(arena.allocator(), &prompt, 0, &.{}, &.{}, null, &.{});
+-    try std.testing.expectEqual(@as(u32, 4), resumed.from);
++    try std.testing.expectEqual(@as(u32, 4), resumed.from); // the next shorter state, from the same begin
++    try std.testing.expectEqual(@as(u64, 1), s.counts.failed);
++    try std.testing.expectEqual(@as(u64, 1), s.counts.hits);
++    try std.testing.expectEqual(@as(u32, 4), s.find(&prompt, &.{}, &.{}).?.at); // only the refused state left the index
+     try std.testing.expectEqual(@import("prompt_cache_test.zig").fresh(&prompt), f.pass(&s, &prompt, resumed));
+     try oracle.check(&s);
++    f.fail_restore = true; // every restore refused: the last state goes too and the pass starts from 0
++    const failed = try s.begin(arena.allocator(), &prompt, 0, &.{}, &.{}, null, &.{});
++    try std.testing.expectEqual(@as(u32, 0), failed.from);
++    try std.testing.expectEqual(@as(u64, 2), s.counts.failed);
++    try oracle.check(&s);
+ }
+ 
+ fn full(s: *pc.Store, f: *Fake, prompt: []const u32) !void {
+diff --git a/zig/src/core/prompt_cache_test.zig b/zig/src/core/prompt_cache_test.zig
+index 16d141a6e6566b83d779c3406e0c855cadc19f01..1cb5fde75165aae187ce615b091fa42b2bd6b9fb 100644
+--- a/zig/src/core/prompt_cache_test.zig
++++ b/zig/src/core/prompt_cache_test.zig
+@@ -184,6 +184,30 @@ test "a failed copy keeps nothing and a failed restore prefills from the start"
+     try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, p));
+ }
+ 
++test "a refused restore tries the next shorter kept state before the pass from the start" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .min_prompt = 0 }, 1 << 20);
++    defer s.deinit();
++    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6, 7 };
++    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null, &.{})); // keeps the 4-token state
++    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
++    _ = f.pass(&s, &t2, try s.begin(a, &t2, 7, &.{}, &.{}, null, &.{})); // resumes 4, keeps the 7-token state
++    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
++    f.refuse_at = 7; // the backend refuses the longest state
++    const t3 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
++    const p = try s.begin(a, &t3, 8, &.{}, &.{}, null, &.{});
++    try std.testing.expectEqual(@as(u32, 4), p.from); // the next shorter state, not the start: 4 of 8 tokens prefilled
++    try std.testing.expectEqual(@as(u64, 1), s.counts.failed);
++    try std.testing.expectEqual(fresh(&t3), f.pass(&s, &t3, p));
++    // every borrow is released: the refused state is gone, the resumed one holds none
++    for (s.entries.items) |e| try std.testing.expectEqual(@as(u32, 0), e.borrowers);
++    try std.testing.expectEqual(s.entries.items.len, f.live);
++}
++
+ test "marks: the stable prefix with the last prompt and shared blocks, past the resume point, before the end" {
+     const gpa = std.testing.allocator;
+     var arena: std.heap.ArenaAllocator = .init(gpa);

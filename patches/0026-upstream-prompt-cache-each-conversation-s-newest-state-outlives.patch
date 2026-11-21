@@ -1,0 +1,529 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ashhart <71890694+ashhart@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 19:03:03 +0000
+Subject: [PATCH 26/33] prompt cache: each conversation's newest state outlives
+ its redundant copies (e5f75e8be, 917a745ad)
+
+Upstream TensorFold commit by ashhart, ported onto this series (see the note below for its upstream source).
+
+Ported by hand from upstream e5f75e8be "Retain each conversation's newest prompt state before redundant
+copies" and 917a745ad "cache: distinguish later-turn branches from equal-born reply ends".
+
+A reply end kept with its request's length now links to and supersedes that request's shorter states
+unless one is the lookup's selected rewind state (Entry.rewind, Store.active_rewind_key). A resume marks
+a state branched only for a real later turn (policy.continuedLater), and an identical re-send adds no
+branch. Upstream's test changes come along (branch, warm-pass, index, scan) with its newest-cache tests;
+its last test used policy.redundant, which we do not carry, and now checks policy.victim instead.
+
+Added in this series: Store.newest (default true, upstream's order). TENSORFOLD_PCACHE_NEWEST=0 brings back the
+old order bit for bit in eviction decisions: equal-born links are still recorded but no longer read.
+Replay: --newest 0|1, replay.Config.newest. A new test checks the off order.
+---
+ zig/build/cuda.zig                        |   2 +-
+ zig/src/core/lane_host_warm_test.zig      |   4 +-
+ zig/src/core/prompt_cache.zig             |  15 ++-
+ zig/src/core/prompt_cache_branch_test.zig |  24 +++--
+ zig/src/core/prompt_cache_index_test.zig  |   9 +-
+ zig/src/core/prompt_cache_newest_test.zig | 121 ++++++++++++++++++++++
+ zig/src/core/prompt_cache_policy.zig      |  18 +++-
+ zig/src/core/prompt_cache_replay.zig      |   2 +
+ zig/src/core/prompt_cache_scan_test.zig   |   2 +-
+ zig/src/core/prompt_cache_trace.zig       |   1 +
+ zig/src/native/cuda.zig                   |   2 +
+ zig/src/native/cuda_snaps.zig             |   8 ++
+ zig/tests/pcache_replay.zig               |   9 +-
+ 13 files changed, 190 insertions(+), 27 deletions(-)
+ create mode 100644 zig/src/core/prompt_cache_newest_test.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 351acc2b6ed57e76aa093d49379bc33fc40dda85..d7e8ca538797f2074c64f5aa5102d7b3f05fe97c 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -453,7 +453,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
+     b.step("test-done-times-host", "Request-local done line times and lane admission on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"done times:"} })).step);
+     const up126 = b.step("test-up126-host", "The upstream v1.2.6 ports' host tests: shorter-state retries, image identities, first-token release, cached-token clamp, trailing tool calls");
+-    up126.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native_modules.api, .filters = &.{ "snapshot index:", "a refused", "image prefix identity", "image collision lookup", "Frame cache:", "pcache" } })).step);
++    up126.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native_modules.api, .filters = &.{ "snapshot index:", "a refused", "image prefix identity", "image collision lookup", "Frame cache:", "pcache", "newest cache:" } })).step);
+     up126.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "done times:", "image reuse:", "image guard:", "thinking tail:", "splits and holds", "an opener the reply names" } })).step);
+     up126.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.lanes, .filters = &.{"a first-token finish"} })).step);
+     b.step("test-request-seeds-host", "Fresh and explicit request seeds and completion logs without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"request seed:"} })).step);
+diff --git a/zig/src/core/lane_host_warm_test.zig b/zig/src/core/lane_host_warm_test.zig
+index c32b62a07da8a1edf2134220fe8390feecbb3cb9..2c2af2b51f9ffe498b4fe9dbe73ccdb37a1717a7 100644
+--- a/zig/src/core/lane_host_warm_test.zig
++++ b/zig/src/core/lane_host_warm_test.zig
+@@ -315,10 +315,10 @@ fn pausedTurn(lookahead: u32) !struct { cached: ?u32, same: bool } {
+     return .{ .cached = runs[5].cached, .same = runs[5].n == 2 and std.mem.eql(u32, runs[5].tokens[0..2], runs[2].tokens[0..2]) };
+ }
+ 
+-test "a finished warm pass keeps its states with its request's length: the history it extends outlives its keep and later ones" {
++test "a finished warm pass supersedes its equal-born history: a cold regenerate stays token exact" {
+     for ([_]u32{ 0, 1 }) |lookahead| { // the 27B keeps the pass's end; Nemotron on CUDA a mark one token before it
+         const got = try pausedTurn(lookahead);
+-        try std.testing.expectEqual(@as(?u32, 8), got.cached);
++        try std.testing.expectEqual(@as(?u32, 0), got.cached);
+         try std.testing.expect(got.same);
+     }
+ }
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 9c755b9050d59ab5fd2a290ae4b0ff509e2425a9..e0322c0bcf287f979bf8678996e449aaa50ffc08 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -101,6 +101,7 @@ pub const Entry = struct {
+     used: u64, // the store's clock at its last keep or resume
+     last: []u32, // the last prompt that kept or resumed it
+     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
++    rewind: bool = false,
+     branched: bool = false, // resumed again after a later prompt kept a longer state extending it: never superseded
+     expired: bool = false, // hidden from lookups immediately, reclaimed only at safe host boundaries
+     borrowers: u32 = 0, // outstanding lookups: released by resumed or release, never evicted while borrowed
+@@ -166,6 +167,8 @@ pub const Store = struct {
+     imprint: ?*imprint.Imprint = null, // --learn: shared cuts' states on disk, read back by later sessions and servers
+     disk: ?*rows.Rows = null, // --learn-conversations: every kept state written behind to disk, read back where it pays
+     active_rewind_at: u32 = 0, // the last lookup's rewind state (0: none); hosts keep a pass's states before the next lookup
++    active_rewind_key: u64 = 0,
++    newest: bool = true,
+     links_lost: bool = false, // an allocation failure left the extension links incomplete: `extended` scans
+     hold: bool = false, // memory pressure: lookups plan no marks and keeps refuse, so no new state is kept
+     /// TF_FLASHNEXT_PCACHE_LIVE (a family's cache_live): each unfinished request's newest state is pinned (pins) and
+@@ -428,6 +431,12 @@ pub const Store = struct {
+         if (s.active_rewind_at > 0) if (s.keptNear(prompt, starts, spans, s.active_rewind_at)) |at| {
+             s.active_rewind_at = at; // a state kept under min_gap before it is the rewind state: no new copy
+         };
++        s.active_rewind_key = if (s.active_rewind_at > 0) sharedKey(prompt[0 .. s.active_rewind_at + s.rules.lookahead]) else 0;
++        for (s.entries.items) |kept| if (kept.at == s.active_rewind_at and kept.tokens.len <= prompt.len and
++            std.mem.eql(u32, kept.tokens, prompt[0..kept.tokens.len]) and modes.equal(kept.decode_spans, spans, kept.at) and images.matches(s, kept))
++        {
++            kept.rewind = true;
++        };
+         const e = if (disk)
+             rows.read.recall(s, prompt, born, starts, spans, s.recall(prompt, born, starts, spans, s.find(prompt, starts, spans)))
+         else
+@@ -524,7 +533,7 @@ pub const Store = struct {
+         }
+         s.clock += 1;
+         e.used = s.clock;
+-        e.branched = e.branched or s.extended(e); // a turn several continuations share (a re-sent, edited or forked one)
++        e.branched = e.branched or (policy.continuedLater(s, e) and (!s.newest or !std.mem.eql(u32, prompt, e.last)));
+         s.counts.hits += 1;
+         if (s.keeping.any()) {
+             keeping.noteResume(s, e, prompt);
+@@ -615,6 +624,7 @@ pub const Store = struct {
+         for (s.entries.items) |e| if (!e.expired and e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n]) and modes.equal(e.decode_spans, spans, at) and images.matches(s, e)) {
+             e.used = s.clock; // the same state again: no copy
+             e.shared = e.shared or shared;
++            e.rewind = e.rewind or (at == s.active_rewind_at and sharedKey(e.tokens) == s.active_rewind_key);
+             if (s.keeping.any()) keeping.touched(s, e);
+             if (shared) learned.learn(s, e, starts);
+             s.last_kept = e;
+@@ -668,7 +678,7 @@ pub const Store = struct {
+             return s.fail(at, err);
+         };
+         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
+-        e.* = .{ .tokens = last[0..n], .images = image_ids, .image_frame = s.image_frame, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = born, .used = s.clock, .last = last, .shared = shared, .own = last, .anchor = anchor };
++        e.* = .{ .tokens = last[0..n], .images = image_ids, .image_frame = s.image_frame, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = born, .used = s.clock, .last = last, .shared = shared, .rewind = at == s.active_rewind_at and sharedKey(last[0..n]) == s.active_rewind_key, .own = last, .anchor = anchor };
+         owns_decoded = false;
+         owns_images = false;
+         index.add(s, e) catch {
+@@ -769,6 +779,7 @@ test {
+     _ = @import("prompt_cache_rewind_test.zig");
+     _ = @import("prompt_cache_interior_test.zig");
+     _ = @import("prompt_cache_branch_test.zig");
++    _ = @import("prompt_cache_newest_test.zig");
+     _ = @import("prompt_cache_fork_test.zig");
+     _ = @import("prompt_cache_shared_test.zig");
+     _ = @import("prompt_cache_give_test.zig");
+diff --git a/zig/src/core/prompt_cache_branch_test.zig b/zig/src/core/prompt_cache_branch_test.zig
+index 60d15f199d002d2bc9ada9ecf5e340a0eb620712..4d0e19e89cc493a9e0bcdb8046e2f510cfdeb2d9 100644
+--- a/zig/src/core/prompt_cache_branch_test.zig
++++ b/zig/src/core/prompt_cache_branch_test.zig
+@@ -74,7 +74,7 @@ test "a state resumed once and then extended is still superseded: a conversation
+     try std.testing.expectEqual(s.entries.items.len, f.live);
+ }
+ 
+-test "a reply's end born with its request's length supersedes none of its states: a regenerate and an edit resume the history" {
++test "a reply end supersedes its equal-born history under pressure: regeneration still equals a fresh pass" {
+     const gpa = std.testing.allocator;
+     var arena: std.heap.ArenaAllocator = .init(gpa);
+     defer arena.deinit();
+@@ -90,12 +90,13 @@ test "a reply's end born with its request's length supersedes none of its states
+     try std.testing.expectEqual(@as(u32, 0), try request(&f, &s, a, &t1));
+     const reply = t1 ++ seq(6, 500); // the reply decoded after it
+     _ = f.pass(&s, &reply, .{ .from = 20 });
+-    try std.testing.expect(s.keepBorn(&reply, 20, 26, null, &.{}, &.{})); // 126 more: the oldest goes, not the history
+-    try std.testing.expect(s.find(&x, &.{}, &.{}) == null);
+-    const y = seq(20, 300); // an unrelated prompt: the reply's end is no later turn, so it supersedes nothing either
++    // The redundant history goes before another conversation.
++    try std.testing.expect(s.keepBorn(&reply, 20, 26, null, &.{}, &.{}));
++    try std.testing.expect(s.find(&x, &.{}, &.{}) != null);
++    const y = seq(20, 300); // an unrelated prompt now needs one newest state
+     try std.testing.expectEqual(@as(u32, 0), try request(&f, &s, a, &y));
+-    try std.testing.expect(s.find(&z, &.{}, &.{}) == null);
+-    try std.testing.expectEqual(@as(u32, 13), try request(&f, &s, a, &t1)); // regenerated
++    try std.testing.expect(s.find(&z, &.{}, &.{}) != null);
++    try std.testing.expectEqual(@as(u32, 0), try request(&f, &s, a, &t1)); // regenerated without its old history
+     const edited = t1 ++ seq(6, 600) ++ seq(5, 700) ++ seq(7, 1000); // the reply edited, then the next user turn
+     try std.testing.expectEqual(@as(u32, 13), try request(&f, &s, a, &edited));
+     try std.testing.expect(s.held <= s.budget);
+@@ -128,13 +129,13 @@ test "a later turn still supersedes the history and the reply's end: both go bef
+     try std.testing.expectEqual(s.entries.items.len, f.live);
+ }
+ 
+-test "a warm pass's lookup counts with its request's length: room for its mark frees an older state, not the history" {
++test "a warm pass frees its equal-born redundant history before another conversation's newest" {
+     const gpa = std.testing.allocator;
+     var arena: std.heap.ArenaAllocator = .init(gpa);
+     defer arena.deinit();
+     const a = arena.allocator();
+     var f: Fake = .{ .gpa = gpa };
+-    var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .warm = .waits, .min_prompt = 0, .min_gap = 3 }, 470); // fake bytes 100 + at
++    var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .warm = .waits, .min_prompt = 0, .min_gap = 3 }, 470);
+     defer s.deinit();
+     const x = seq(20, 100); // another conversation's history, the least recently used state
+     try std.testing.expectEqual(@as(u32, 0), try request(&f, &s, a, &x));
+@@ -142,13 +143,14 @@ test "a warm pass's lookup counts with its request's length: room for its mark f
+     try std.testing.expectEqual(@as(u32, 0), try request(&f, &s, a, &t1));
+     const reply = t1 ++ seq(6, 500);
+     _ = f.pass(&s, reply[0..25], .{ .from = 20 });
+-    try std.testing.expect(s.keepBorn(&reply, 20, 25, null, &.{}, &.{})); // the reply's end, its lookahead token in the reply
++    // The reply's end, including its lookahead token.
++    try std.testing.expect(s.keepBorn(&reply, 20, 25, null, &.{}, &.{}));
+     const warm = reply ++ seq(3, 900); // the reply as sent and the next turn's opening: its mark at 28 needs 128 more
+     const l = try s.lookupRewind(a, &warm, 20, warm.len, 0, &.{}, &.{}, &.{});
+     try std.testing.expectEqual(@as(u32, 25), l.entry.?.at);
+     try std.testing.expectEqualSlices(u32, &.{28}, l.marks);
+-    try std.testing.expect(s.find(&x, &.{}, &.{}) == null); // the older state made the room
+-    try std.testing.expectEqual(@as(u32, 13), (s.find(&t1, &.{}, &.{}) orelse return error.HistoryEvicted).at);
++    try std.testing.expect(s.find(&x, &.{}, &.{}) != null); // another conversation's newest stays
++    try std.testing.expect(s.find(&t1, &.{}, &.{}) == null); // its redundant history made the room
+     try std.testing.expectEqual(s.entries.items.len, f.live);
+ }
+ 
+diff --git a/zig/src/core/prompt_cache_index_test.zig b/zig/src/core/prompt_cache_index_test.zig
+index b008ceeb926607e3dcb5246490bcaaf5ffa949b3..742d02966d7d385742e799dac6676b9919439a75 100644
+--- a/zig/src/core/prompt_cache_index_test.zig
++++ b/zig/src/core/prompt_cache_index_test.zig
+@@ -240,8 +240,11 @@ test "snapshot index: RAM keep unwinds every allocation failure and failed famil
+         try std.testing.expectEqual(s.entries.items.len, f.live);
+         if (failing.has_induced_failure) {
+             failures += 1;
+-            try std.testing.expect(!kept);
+-            try std.testing.expectEqual(old_len, s.entries.items.len);
++            if (kept) {
++                try std.testing.expect(s.links_lost);
++                try std.testing.expectEqual(old_len + 1, s.entries.items.len);
++                try std.testing.expectEqual(@as(u32, 100), s.find(&prompt, &.{}, &.{.{ 2, 7 }}).?.at);
++            } else try std.testing.expectEqual(old_len, s.entries.items.len);
+         } else {
+             succeeded = true;
+             try std.testing.expect(kept);
+@@ -255,7 +258,7 @@ test "snapshot index: RAM keep unwinds every allocation failure and failed famil
+         }
+     }
+     try std.testing.expect(succeeded); // spans, Entry, the one prompt copy, the save, then both publication reserves
+-    try std.testing.expectEqual(@as(usize, 6), failures);
++    try std.testing.expectEqual(@as(usize, 7), failures);
+ }
+ 
+ /// A conversation tree: each prompt a kept one's prefix and new tokens, so states share long prefixes and fork.
+diff --git a/zig/src/core/prompt_cache_newest_test.zig b/zig/src/core/prompt_cache_newest_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6e692a3d0ac2dcf3232fe3563e8e2134e9880d1
+--- /dev/null
++++ b/zig/src/core/prompt_cache_newest_test.zig
+@@ -0,0 +1,121 @@
++//! Returning conversations retain their newest state before redundant copies, including equal-born reply ends.
++const std = @import("std");
++const pc = @import("prompt_cache.zig");
++const Fake = @import("prompt_cache_fake.zig").Fake;
++const a = std.testing.allocator;
++
++fn put(f: *Fake, s: *pc.Store, words: []const u32, born: u32, at: u32) !void {
++    _ = f.pass(s, words[0..at], .{});
++    try std.testing.expect(s.keepBorn(words, born, at, null, &.{}, &.{}));
++}
++
++test "newest cache: eight cyclic conversations keep every reply end above the old three-copy fit" {
++    const n = 8;
++    var f: Fake = .{ .gpa = a };
++    var s = pc.Store.init(a, f.snapshots(), .{ .warm = .on, .min_prompt = 0 }, n * 176);
++    defer s.deinit();
++    var words: [n][80]u32 = undefined;
++    for (&words, 1..) |*conversation, id| for (conversation, 0..) |*word, i| {
++        word.* = @intCast(id * 1000 + i);
++    };
++    for (0..6) |turn| for (&words) |*conversation| {
++        const len: u32 = @intCast(24 + turn * 8);
++        if (turn > 0) {
++            const e = s.find(conversation[0..len], &.{}, &.{}) orelse return error.NewestReplyEvicted;
++            try std.testing.expectEqual(len - 4, e.at);
++            const state: *Fake.State = @ptrCast(@alignCast(e.saved));
++            try std.testing.expectEqual(e.at, state.at);
++            try std.testing.expectEqual(@import("prompt_cache_test.zig").fresh(conversation[0..e.at]), state.sum);
++            s.resumed(e, conversation[0..len], true);
++        }
++        try put(&f, &s, conversation[0..len], len, len - 8);
++        try put(&f, &s, conversation[0..len], len, len);
++        try put(&f, &s, conversation[0 .. len + 4], len, len + 4);
++        try std.testing.expect(s.held <= s.budget);
++        try std.testing.expectEqual(s.entries.items.len, f.live);
++    };
++    try std.testing.expect(s.counts.evicted > n);
++}
++
++test "newest cache: equal-born reply links evict its redundant endpoint before an older conversation" {
++    var f: Fake = .{ .gpa = a };
++    var s = pc.Store.init(a, f.snapshots(), .{ .warm = .on, .min_prompt = 0 }, 10000);
++    defer s.deinit();
++    const other = [_]u32{ 90, 91, 92, 93, 94, 95, 96, 97 };
++    const own = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
++    try put(&f, &s, &other, 8, 7);
++    try put(&f, &s, own[0..8], 8, 7);
++    try put(&f, &s, own[0..12], 8, 12);
++    const victim = s.entries.items[s.victimBut(null, &.{}, 0).?];
++    try std.testing.expectEqualSlices(u32, own[0..7], victim.tokens);
++    s.links_lost = true;
++    try std.testing.expectEqualSlices(u32, own[0..7], s.entries.items[s.victimBut(null, &.{}, 0).?].tokens);
++}
++
++test "newest cache: a reply replaces its own equal-born endpoint when only two newest states fit" {
++    var f: Fake = .{ .gpa = a };
++    var s = pc.Store.init(a, f.snapshots(), .{ .warm = .on, .min_prompt = 0 }, 220);
++    defer s.deinit();
++    const other = [_]u32{ 90, 91, 92, 93, 94, 95, 96, 97 };
++    const own = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
++    try put(&f, &s, &other, 8, 7);
++    try put(&f, &s, own[0..8], 8, 7);
++    try put(&f, &s, own[0..12], 8, 12);
++    try std.testing.expect(s.find(&other, &.{}, &.{}) != null);
++    try std.testing.expectEqual(@as(u32, 12), s.find(&own, &.{}, &.{}).?.at);
++}
++
++test "newest cache: an identical resend does not pin an endpoint ahead of another conversation's newest" {
++    var f: Fake = .{ .gpa = a };
++    var s = pc.Store.init(a, f.snapshots(), .{ .warm = .on, .min_prompt = 0 }, 330);
++    defer s.deinit();
++    const other = [_]u32{ 90, 91, 92, 93, 94, 95, 96, 97 };
++    const own = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
++    const new = [_]u32{ 50, 51, 52, 53, 54, 55, 56, 57 };
++    try put(&f, &s, &other, 8, 7);
++    try put(&f, &s, own[0..8], 8, 7);
++    try put(&f, &s, own[0..12], 8, 12);
++    const endpoint = s.find(own[0..8], &.{}, &.{}).?;
++    s.resumed(endpoint, own[0..8], true);
++    try std.testing.expect(!endpoint.branched);
++    try put(&f, &s, &new, 8, 8);
++    try std.testing.expect(s.find(&other, &.{}, &.{}) != null);
++    try std.testing.expectEqual(@as(u32, 12), s.find(&own, &.{}, &.{}).?.at);
++}
++
++test "newest cache: a re-rendered reply does not pin its equal-born endpoint as a branch" {
++    for ([_]bool{ false, true }) |scan| {
++        var f: Fake = .{ .gpa = a };
++        var s = pc.Store.init(a, f.snapshots(), .{ .min_prompt = 0 }, 10000);
++        defer s.deinit();
++        const words = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
++        try put(&f, &s, words[0..10], 10, 7);
++        try put(&f, &s, words[0..14], 10, 14);
++        const endpoint = s.find(words[0..10], &.{}, &.{}).?;
++        var next = words;
++        next[10] = 99;
++        s.links_lost = scan;
++        s.resumed(endpoint, &next, true);
++        try std.testing.expect(!endpoint.branched);
++        const v = @import("prompt_cache_policy.zig").victim(&s, null, &.{}, 0).?;
++        try std.testing.expectEqual(pc.Class.superseded, v.class);
++        try std.testing.expect(s.entries.items[v.i] == endpoint);
++    }
++}
++
++test "newest cache: with newest off an equal-born reply end leaves its endpoint and the oldest state goes first" {
++    var f: Fake = .{ .gpa = a };
++    var s = pc.Store.init(a, f.snapshots(), .{ .warm = .on, .min_prompt = 0 }, 10000);
++    defer s.deinit();
++    s.newest = false;
++    const other = [_]u32{ 90, 91, 92, 93, 94, 95, 96, 97 };
++    const own = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
++    try put(&f, &s, &other, 8, 7);
++    try put(&f, &s, own[0..8], 8, 7);
++    try put(&f, &s, own[0..12], 8, 12);
++    const v = @import("prompt_cache_policy.zig").victim(&s, null, &.{}, 0).?;
++    try std.testing.expectEqual(pc.Class.idle, v.class);
++    try std.testing.expectEqualSlices(u32, other[0..7], s.entries.items[v.i].tokens);
++    s.links_lost = true;
++    try std.testing.expectEqualSlices(u32, other[0..7], s.entries.items[s.victimBut(null, &.{}, 0).?].tokens);
++}
+diff --git a/zig/src/core/prompt_cache_policy.zig b/zig/src/core/prompt_cache_policy.zig
+index 0eef5d5fee1b47a7d5dfaaea513fb070103a4c38..2404ef934e1dd8f39b5588b649c169e2bfc38ca0 100644
+--- a/zig/src/core/prompt_cache_policy.zig
++++ b/zig/src/core/prompt_cache_policy.zig
+@@ -40,7 +40,7 @@ fn pick(s: *const pc.Store, skip: ?*pc.Entry, prompt: []const u32, born: u32, am
+             oldest_rewind = rewind;
+         }
+         if (e.borrowers > 0 or e.shared or e.branched or e == skip or rewind) continue;
+-        const now = born > e.born and prompt.len > e.tokens.len and on; // a longer request's tokens extend it
++        const now = (born > e.born or (s.newest and born == e.born and !e.rewind)) and prompt.len > e.tokens.len and on;
+         if ((now or extended(s, e)) and (best == null or e.used < s.entries.items[best.?].used)) best = i;
+     }
+     if (best) |i| return .{ .i = i, .class = if (among == .pinned) .live else .superseded };
+@@ -138,13 +138,23 @@ pub fn pinnedBytes(s: *const pc.Store) u64 {
+ /// Only live continuations make a prefix a branch point or a superseded state.
+ pub fn extended(s: *const pc.Store, e: *const pc.Entry) bool {
+     if (s.links_lost) return extendedScan(s, e);
+-    for (e.ext.items) |o| if (!o.expired) return true;
++    for (e.ext.items) |o| if (!o.expired and (o.born > e.born or (s.newest and !e.rewind))) return true;
++    return false;
++}
++
++pub fn continuedLater(s: *const pc.Store, e: *const pc.Entry) bool {
++    if (!s.links_lost) {
++        for (e.ext.items) |o| if (!o.expired and o.born > e.born) return true;
++        return false;
++    }
++    for (s.entries.items) |o| if (!o.expired and o.born > e.born and o.tokens.len > e.tokens.len and
++        std.mem.eql(u32, o.tokens[0..e.tokens.len], e.tokens)) return true;
+     return false;
+ }
+ 
+ /// `extended` over every entry, for a store whose links an allocation failure left incomplete.
+ pub fn extendedScan(s: *const pc.Store, e: *const pc.Entry) bool {
+-    for (s.entries.items) |o| if (!o.expired and o != e and o.born > e.born and o.tokens.len > e.tokens.len and
++    for (s.entries.items) |o| if (!o.expired and o != e and (o.born > e.born or (s.newest and o.born == e.born and !e.rewind)) and o.tokens.len > e.tokens.len and
+         std.mem.eql(u32, o.tokens[0..e.tokens.len], e.tokens)) return true;
+     return false;
+ }
+@@ -152,7 +162,7 @@ pub fn extendedScan(s: *const pc.Store, e: *const pc.Entry) bool {
+ /// A new entry linked to those it extends and those extending it, later born (tokens and born never change).
+ pub fn link(s: *pc.Store, x: *pc.Entry) void {
+     for (s.entries.items) |o| {
+-        if (o == x or o.born == x.born or o.tokens.len == x.tokens.len) continue;
++        if (o == x or o.tokens.len == x.tokens.len) continue;
+         const short, const long = if (o.tokens.len < x.tokens.len) .{ o, x } else .{ x, o };
+         if (long.born < short.born or !std.mem.eql(u32, long.tokens[0..short.tokens.len], short.tokens)) continue;
+         short.ext.append(s.gpa, long) catch {
+diff --git a/zig/src/core/prompt_cache_replay.zig b/zig/src/core/prompt_cache_replay.zig
+index 97f236ef4e7469f83d1899e8f404653cca1c076d..8ccc1a60b90724df4ff5599a8bc5f77d83040d08 100644
+--- a/zig/src/core/prompt_cache_replay.zig
++++ b/zig/src/core/prompt_cache_replay.zig
+@@ -30,6 +30,7 @@ pub const Config = struct {
+     chat_common: u32 = 0,
+     piece_anchors: bool = true,
+     chain_cap: u32 = 0,
++    newest: bool = true,
+ };
+ 
+ pub const Result = struct {
+@@ -452,6 +453,7 @@ pub fn run(gpa: std.mem.Allocator, cfg: Config) !Result {
+     store.keeping = cfg.keeping;
+     store.live = cfg.live;
+     store.share = cfg.share;
++    store.newest = cfg.newest;
+     store.branch = cfg.share and cfg.anchor_tokens > 0;
+     var r: Run = .{ .gpa = gpa, .cfg = cfg, .store = &store, .sim = &sim, .rng = prng.random() };
+     const chats: u32 = @intFromFloat(@ceil(cfg.chats_per_hour * cfg.seconds / 3600));
+diff --git a/zig/src/core/prompt_cache_scan_test.zig b/zig/src/core/prompt_cache_scan_test.zig
+index 9cf560142e76101178a8e99fe99b3782ddde5b3a..84be8d36e931074ce175b8613309abf355ee4c79 100644
+--- a/zig/src/core/prompt_cache_scan_test.zig
++++ b/zig/src/core/prompt_cache_scan_test.zig
+@@ -10,7 +10,7 @@ fn victimScan(s: *const pc.Store, skip: ?*pc.Entry, prompt: []const u32, born: u
+     var best: ?usize = null;
+     for (s.entries.items, 0..) |e, i| {
+         if (e.borrowers > 0 or e.shared or e.branched or e == skip or rewound(s, e, prompt)) continue;
+-        const now = born > e.born and prompt.len > e.tokens.len and std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens);
++        const now = (born > e.born or (born == e.born and !e.rewind)) and prompt.len > e.tokens.len and std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens);
+         if ((now or policy.extendedScan(s, e)) and (best == null or e.used < s.entries.items[best.?].used)) best = i;
+     }
+     if (best) |i| return i;
+diff --git a/zig/src/core/prompt_cache_trace.zig b/zig/src/core/prompt_cache_trace.zig
+index 2401902af24622883e7ae0f4b7782d63660ee6b0..e434cebe575299e814c292d6391846b19b25a387 100644
+--- a/zig/src/core/prompt_cache_trace.zig
++++ b/zig/src/core/prompt_cache_trace.zig
+@@ -73,6 +73,7 @@ pub fn run(gpa: std.mem.Allocator, cfg: replay.Config, t: Trace) !replay.Result
+     defer store.deinit();
+     store.keeping = cfg.keeping;
+     store.share = cfg.share;
++    store.newest = cfg.newest;
+     store.branch = cfg.share and cfg.anchor_tokens > 0;
+     const edits = try gpa.alloc(Edits, t.convs);
+     defer {
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 3c1e4a21056b13ddfa9312c00fb227d75e1c7f3f..40f1a5f5d75a263f3aa667d98111cb3cf6ce44e6 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -451,6 +451,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         }
+         try kv_pages.store(F, store, loaded.target, kept); // its snapshot slots, before a disk probe takes one
+         if (@hasDecl(F, "cache_live")) store.live = F.cache_live(); // TF_FLASHNEXT_PCACHE_LIVE: live requests' newest states go last
++        store.newest = try snaps.newest();
++        if (!store.newest) std.log.info("prompt cache: TENSORFOLD_PCACHE_NEWEST=0, equal-born reply ends supersede nothing", .{});
+         if (@hasDecl(F, "cache_keeping")) {
+             const k = try F.cache_keeping();
+             store.keeping = .{ .explain = k.explain, .one_copy = k.one_copy, .value = k.value };
+diff --git a/zig/src/native/cuda_snaps.zig b/zig/src/native/cuda_snaps.zig
+index 979a95524c03fbf9fd79270c0d5d10ca0793b5c0..9b1bf1845a083f297db2fab764d3820e2f542538 100644
+--- a/zig/src/native/cuda_snaps.zig
++++ b/zig/src/native/cuda_snaps.zig
+@@ -32,6 +32,14 @@ fn sharedMin() u32 {
+     return std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
+ }
+ 
++pub fn newest() !bool {
++    const v = std.mem.span(std.c.getenv("TENSORFOLD_PCACHE_NEWEST") orelse return true);
++    if (std.mem.eql(u8, v, "1")) return true;
++    if (std.mem.eql(u8, v, "0")) return false;
++    std.log.err("TENSORFOLD_PCACHE_NEWEST={s}: 0 or 1", .{v});
++    return error.BadPcacheNewest;
++}
++
+ /// The cache's bytes less what the family sets aside for its states (`snap_ready`, as Nemotron's spare buffers).
+ pub fn cacheBudget(comptime F: type, target: anytype, cache: u64) !u64 {
+     return if (@hasDecl(F, "snap_ready")) cache - try F.snap_ready(target, cache) else cache;
+diff --git a/zig/tests/pcache_replay.zig b/zig/tests/pcache_replay.zig
+index d10bf865f8b3e025de4c4210f24b9cd90b4ed745..465227b32578ae2855c3d919e918f67b20e489aa 100644
+--- a/zig/tests/pcache_replay.zig
++++ b/zig/tests/pcache_replay.zig
+@@ -21,7 +21,7 @@ const share_arms = [_]Arm{
+     .{ .name = "sh+anch", .keeping = .{ .explain = true }, .share = true, .anchors = true },
+ };
+ 
+-const Opts = struct { anchor_tokens: u32, scale: u32, token_bytes: u64, piece: u32, chain_cap: u32 };
++const Opts = struct { anchor_tokens: u32, scale: u32, token_bytes: u64, piece: u32, chain_cap: u32, newest: bool };
+ 
+ fn apply(cfg: *replay.Config, arm: Arm, o: Opts) void {
+     cfg.keeping = arm.keeping;
+@@ -29,6 +29,7 @@ fn apply(cfg: *replay.Config, arm: Arm, o: Opts) void {
+     cfg.anchor_tokens = if (arm.anchors) o.anchor_tokens else 0;
+     cfg.piece_anchors = arm.piece_anchors;
+     cfg.chain_cap = o.chain_cap;
++    cfg.newest = o.newest;
+     if (o.piece > 0) cfg.chunk = o.piece;
+ }
+ 
+@@ -69,6 +70,7 @@ pub fn main(init: std.process.Init) !void {
+     var token_bytes: u64 = 9_856;
+     var piece: u32 = 0;
+     var chain_cap: u32 = 20;
++    var newest = true;
+     const args = try init.minimal.args.toSlice(init.arena.allocator());
+     var i: usize = 1;
+     while (i + 1 < args.len) : (i += 2) {
+@@ -82,8 +84,9 @@ pub fn main(init: std.process.Init) !void {
+         if (std.mem.eql(u8, args[i], "--token-bytes")) token_bytes = try std.fmt.parseInt(u64, args[i + 1], 10);
+         if (std.mem.eql(u8, args[i], "--piece")) piece = try std.fmt.parseInt(u32, args[i + 1], 10);
+         if (std.mem.eql(u8, args[i], "--chain-cap")) chain_cap = try std.fmt.parseInt(u32, args[i + 1], 10);
++        if (std.mem.eql(u8, args[i], "--newest")) newest = std.mem.eql(u8, args[i + 1], "1");
+     }
+-    const opts: Opts = .{ .anchor_tokens = anchor_tokens, .scale = scale, .token_bytes = token_bytes, .piece = piece, .chain_cap = chain_cap };
++    const opts: Opts = .{ .anchor_tokens = anchor_tokens, .scale = scale, .token_bytes = token_bytes, .piece = piece, .chain_cap = chain_cap, .newest = newest };
+     const arms: []const Arm = if (share or trace != null) &share_arms else &keeping_arms;
+     if (trace) |path| return traceMain(init, path, arms, opts);
+     const base: replay.Config = .{ .seconds = hours * 3600, .scale = scale, .token_bytes = token_bytes };
+@@ -169,7 +172,7 @@ fn traceMain(init: std.process.Init, path: []const u8, arms: []const Arm, o: Opt
+     defer gpa.free(text);
+     const t = try replay.trace.parse(gpa, text);
+     defer t.deinit(gpa);
+-    std.debug.print("trace {s}: {d} requests, {d} conversations, scale {d}, 30 GiB, Flash Next TP=2 rank-0 state bytes (57.9 MB + {d} B a token), pieces of {d} rows (0: chunks of 3072), chain cap {d} (0: none)\n", .{ path, t.reqs.len, t.convs, o.scale, o.token_bytes, o.piece, o.chain_cap });
++    std.debug.print("trace {s}: {d} requests, {d} conversations, scale {d}, 30 GiB, Flash Next TP=2 rank-0 state bytes (57.9 MB + {d} B a token), pieces of {d} rows (0: chunks of 3072), chain cap {d} (0: none), newest {}\n", .{ path, t.reqs.len, t.convs, o.scale, o.token_bytes, o.piece, o.chain_cap, o.newest });
+     header();
+     for (arms) |arm| {
+         var cfg: replay.Config = .{ .scale = o.scale, .token_bytes = o.token_bytes };

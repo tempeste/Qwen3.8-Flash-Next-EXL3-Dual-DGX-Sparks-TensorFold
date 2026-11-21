@@ -1,0 +1,30 @@
+# Pins for tools/exl3_experts_pack.py and scripts/prepare.sh: turboderp/Qwen3.8-Flash-Next-exl3 at
+# d660113325e1eba20e760a9063580139bdbdfc22 (branch 2.68bpw_h6_ng8), cut for two ranks.
+#   header <sha256> <shard>          the shard's safetensors JSON header (the bytes after its 8-byte length)
+#   shard  <sha256> <shard> <bytes>  the whole shard (the Hub's LFS sha256), for EXL3_SOURCE=download
+#   file   <sha256> <file> <bytes>   each experts-only output file
+#   index  <sha256> model.safetensors.index.json
+# The output files' sums are those of the folder the measurements in the README were served from.
+header 0eca3eb1dda841bda66ce218f46b35643af5ebee8758d7a0622d18800da558b1 model-00001-of-00006.safetensors
+header 26b9b83a5e2a71cdb936d6ef05bec88b429b37e655d64b39aa6e0de258abd94a model-00002-of-00006.safetensors
+header 06b2b1a0149108ea9f02b9be4cb1819f7d3bfdbcf247d7833ac2272835a5e452 model-00003-of-00006.safetensors
+header 483b15ab94f7c33e7aeed25ae121cea312ab38b11c5a1c0a3f3489cf35727cf1 model-00004-of-00006.safetensors
+header 552e938380e6a37e5da78694113eb237ce050fc0ffefc0d33b1602ffd5d8fc8e model-00005-of-00006.safetensors
+header dfd1e073cacdcc68623a65cbb84464809be27de2339b3ab583cfde6d709d9ee4 model-00006-of-00006.safetensors
+shard a4b160919f4e5ac3fa3abc73c0d3c0125d7bcd908b86808f86a98059864529e3 model-00001-of-00006.safetensors 8077075319
+shard 52422f49bd306c622f19efd8486e568303e5b812610cd8d23ce67d910ee9736c model-00002-of-00006.safetensors 7847854083
+shard 89f18340d8f2738df9d315d09a4e733878c984464076450fde88275c4dcfd505 model-00003-of-00006.safetensors 7853108385
+shard 8a95fa040cf1ce8a42e3c3d32f1a3ae2ad8614afd177c8ce1c33c1ba3133b622 model-00004-of-00006.safetensors 7853108385
+shard 5a6930b13d0a6a3d337dc2389b7eceb1bb369a4e23970a05c15a97fcabfbb08a model-00005-of-00006.safetensors 7853108385
+shard 631042148b84906472b4088384adc1bd1921a014ea55de3073df60ca249653be model-00006-of-00006.safetensors 6927233748
+file 2e7e27f3b0c149afe93215411c1b12e17a492b1ff77599e5b98a3382d7e053c3 experts-r0-00001-of-00005.safetensors 4298929884
+file ad87a2a728c154491f859345fbaef52fadf33b01336ae0b313e256a86e41205b experts-r0-00002-of-00005.safetensors 4298854232
+file 76c98c745d3ef72053be1090725fca85e422cb6bcfd5bc7ee428d8a95bde96cd experts-r0-00003-of-00005.safetensors 4298853912
+file a25fa80eaa03055a624487637acd1a110567fe329f6eaa2802ad8f5a24be7456 experts-r0-00004-of-00005.safetensors 4298853600
+file 0f6ed0d79dd5d0e3d09da3f1622ad3aca27b9a2aa7a6b6b6daae6108b02d7571 experts-r0-00005-of-00005.safetensors 3360598052
+file acd2e0b67b659a79f7716d346378d4e5f12a6db09ed47075d90addc113ed5418 experts-r1-00001-of-00005.safetensors 4298943076
+file 1611a0b47645491abc0bc885700804e5a7a57f29254ca312ebaf2c5fc8466665 experts-r1-00002-of-00005.safetensors 4298868024
+file 253ee1855710501b44601dd3a33b6565178f257ddb1295fad5dd9bd5bfd69701 experts-r1-00003-of-00005.safetensors 4298868032
+file b8ddf8b0253040d36a1d0b5c67218124329c2f58c4dae0032879d3640865013a experts-r1-00004-of-00005.safetensors 4298868032
+file 0960f4bf529e694132c8371a4fa1e97d0e638de620d954b5137b488e75e806eb experts-r1-00005-of-00005.safetensors 2563628500
+index 5f3249cd766f55f0c9b24992c120fcc0dbcbcedcf44bd8b4e7601059250d1609 model.safetensors.index.json

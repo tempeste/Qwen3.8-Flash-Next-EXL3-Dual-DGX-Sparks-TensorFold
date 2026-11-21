@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ashhart <71890694+ashhart@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 00:26:46 +0000
+Subject: [PATCH 17/33] prompt cache: a refused rows-store restore ends the
+ retry (#2130)
+
+Upstream TensorFold commit by ashhart, ported onto this series (upstream main 271b691897d2).
+
+The bound from this PR covered the imprint route. The rows tier behind
+--learn-conversations is the other recall path: a disk state whose
+restore the backend refuses must not be re-read. This adds the same
+case with a real rows store: one state, every restore refused, the
+pass from the start, one counted failure and no outstanding borrow,
+and the retry reads no file.
+
+(cherry picked from commit 271b691897d287dba9fd25890bca4f04e29bca05)
+---
+ .../prompt_cache_index_persistence_test.zig   | 35 +++++++++++++++++++
+ zig/src/core/rows_fake.zig                    |  2 ++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/zig/src/core/prompt_cache_index_persistence_test.zig b/zig/src/core/prompt_cache_index_persistence_test.zig
+index fa4c1858081f7194103d739d211ad224e7db3aa9..e8cafc67b61b42f41a36cf3aed70f05c7a93f095 100644
+--- a/zig/src/core/prompt_cache_index_persistence_test.zig
++++ b/zig/src/core/prompt_cache_index_persistence_test.zig
+@@ -237,3 +237,38 @@ test "snapshot index: a slow worker publishes before row-file seed returns" {
+     try std.testing.expectEqual(@as(usize, 1), reopened.states.items.len);
+     try std.testing.expectEqualSlices([2]u32, f.spans, reopened.states.items[0].spans);
+ }
++
++test "a refused row-store state ends the retry: the pass from the start, one failure, no borrow" {
++    var arena: std.heap.ArenaAllocator = .init(a);
++    defer arena.deinit();
++    var buf: [128]u8 = undefined;
++    const dir = try root(&buf, "rows-refuse");
++    defer rmTree(dir);
++    var prompt: [1500]u32 = undefined;
++    rowPrompt(&prompt);
++    {
++        var f: RowFake = .{ .gpa = a, .prompt = &prompt, .spans = &.{.{ 500, 600 }} };
++        const r = try rows.Rows.open(a, f.snapshots(), options(dir));
++        defer r.deinit();
++        var s = pc.Store.init(a, f.snapshots(), rules, 1 << 30);
++        defer s.deinit();
++        s.disk = r;
++        const plan = try s.begin(arena.allocator(), &prompt, 1400, &.{}, &.{}, null, f.spans);
++        try std.testing.expectEqual(@import("prompt_cache_test.zig").fresh(&prompt), f.pass(&s, plan));
++        try waits.published(r);
++        try std.testing.expectEqual(@as(usize, 1), r.states.items.len);
++    }
++    var f: RowFake = .{ .gpa = a, .prompt = &prompt, .spans = &.{.{ 500, 600 }}, .refuse = true }; // the one disk state is refused every time
++    const r = try rows.Rows.open(a, f.snapshots(), options(dir));
++    defer r.deinit();
++    var s = pc.Store.init(a, f.snapshots(), rules, 1 << 30);
++    defer s.deinit();
++    s.disk = r;
++    const plan = try s.begin(arena.allocator(), &prompt, 1400, &.{}, &.{}, null, f.spans);
++    try std.testing.expectEqual(@as(u32, 0), plan.from); // the pass from the start
++    try std.testing.expectEqual(@as(u64, 1), s.counts.failed); // one failure, the one state: no recall loop
++    try std.testing.expectEqual(@as(usize, 0), s.entries.items.len); // the refused state is gone, not re-read
++    try std.testing.expectEqual(@as(usize, 1), r.counts.reads); // the retry stays in RAM
++    try std.testing.expectEqual(@import("prompt_cache_test.zig").fresh(&prompt), f.pass(&s, plan));
++    try oracle.check(&s);
++}
+diff --git a/zig/src/core/rows_fake.zig b/zig/src/core/rows_fake.zig
+index 49eb559e8ec7e43c96f958258f188e969605e87d..0815c40486610207b3a83eaaf706e30a3559cb42 100644
+--- a/zig/src/core/rows_fake.zig
++++ b/zig/src/core/rows_fake.zig
+@@ -28,6 +28,7 @@ pub const Fake = struct {
+     at: u32 = 0,
+     sum: u64 = 0,
+     restored_ok: bool = true, // every restore so far equalled the image a fresh pass gives
++    refuse: bool = false, // every restore of a kept state fails, as a backend's copy refusal
+     live: usize = 0,
+     blanks: usize = 0,
+     slots: ?usize = null, // a family whose states each take one of so many slots (Nemotron CUDA's): past them, none
+@@ -115,6 +116,7 @@ pub const Fake = struct {
+     }
+     fn restoreFn(ptr: *anyopaque, _: ?*anyopaque, saved: pc.Saved) anyerror!void {
+         const f = of(ptr);
++        if (f.refuse) return error.CopyFailed;
+         const k: *Kept = @ptrCast(@alignCast(saved));
+         const want = try f.gpa.alloc(u8, imageBytes(k.at));
+         defer f.gpa.free(want);

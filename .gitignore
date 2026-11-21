@@ -1,0 +1,8 @@
+# per-machine files, never part of the repository
+scripts/local.sh
+.env
+*.log
+*.orig
+*.rej
+__pycache__/
+*.pyc

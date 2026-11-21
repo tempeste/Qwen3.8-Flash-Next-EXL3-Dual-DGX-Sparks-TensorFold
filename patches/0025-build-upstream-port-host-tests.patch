@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tempeste <tempeste@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 18:46:27 +0000
+Subject: [PATCH 25/33] build: test-up126-host runs the host tests of the
+ upstream ports above
+
+A build step that runs the host tests of the upstream commits ported in the patches before this one.
+
+Changes, in the order they were made:
+- build: test-up126-host runs the host tests of the upstream v1.2.6 ports
+---
+ zig/build/cuda.zig | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index bbef698654bac9419e975e897eef20988647293c..351acc2b6ed57e76aa093d49379bc33fc40dda85 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -452,6 +452,10 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     b.step("test-prompt-interior-host", "Last-user metadata excludes later messages without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"interior prompt:"} })).step);
+     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
+     b.step("test-done-times-host", "Request-local done line times and lane admission on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"done times:"} })).step);
++    const up126 = b.step("test-up126-host", "The upstream v1.2.6 ports' host tests: shorter-state retries, image identities, first-token release, cached-token clamp, trailing tool calls");
++    up126.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native_modules.api, .filters = &.{ "snapshot index:", "a refused", "image prefix identity", "image collision lookup", "Frame cache:", "pcache" } })).step);
++    up126.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "done times:", "image reuse:", "image guard:", "thinking tail:", "splits and holds", "an opener the reply names" } })).step);
++    up126.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.lanes, .filters = &.{"a first-token finish"} })).step);
+     b.step("test-request-seeds-host", "Fresh and explicit request seeds and completion logs without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"request seed:"} })).step);
+     const json_test = b.addRunArtifact(b.addTest(.{ .root_module = server_json }));
+     const publication = b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"benchmark publication:"} }));

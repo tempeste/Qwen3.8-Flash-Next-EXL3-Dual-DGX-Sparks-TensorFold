@@ -1,0 +1,459 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tempeste <tempeste@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 06:44:04 +0000
+Subject: [PATCH 33/33] flashnext: TF_FLASHNEXT_EXPERTS_TOPK, route K of the
+ model's 10 experts per token (default off)
+
+Routes the top K of the model's 10 experts per token. Unset, routing is the model's own 10 experts and the engine is
+unchanged.
+
+Idea: azampatti's 5-expert INT4-AutoRound checkpoint, https://huggingface.co/azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound
+
+Changes, in the order they were made:
+- feat(flashnext): TF_FLASHNEXT_EXPERTS_TOPK, route K of the model's 10 experts per token (default off)
+
+Flags this patch adds (a flag's default is its unset value; unset leaves the engine as it was
+before the flag, and a knob named under another flag only matters when that flag is on):
+- TF_FLASHNEXT_EXPERTS_TOPK is off unset, 0 or the model's own 10, takes 1-9 and refuses anything else
+---
+ zig/kernels/cuda/route_rows.cu                | 38 ++++++++--
+ zig/src/core/route_ref.zig                    | 70 +++++++++++++++++
+ zig/src/cuda/route_rows.zig                   |  8 ++
+ zig/src/families/flashnext/cuda_glue.zig      |  1 +
+ zig/src/families/flashnext/cuda_knobs.zig     | 48 +++++++++++-
+ .../families/flashnext/cuda_lanes_load.zig    |  1 +
+ zig/src/families/flashnext/cuda_launch.zig    |  1 +
+ zig/src/families/flashnext/expert_reroute.zig | 14 +++-
+ .../cuda/flashnext_experts_topk_tests.zig     | 75 +++++++++++++++++++
+ zig/tests/cuda/main.zig                       |  2 +
+ 10 files changed, 247 insertions(+), 11 deletions(-)
+ create mode 100644 zig/tests/cuda/flashnext_experts_topk_tests.zig
+
+diff --git a/zig/kernels/cuda/route_rows.cu b/zig/kernels/cuda/route_rows.cu
+index a94fbd756a24ccd967ddc33312cb1b9132399b10..bb4ca5ddbed8f411a4404b1dc7a915e6ee8842b6 100644
+--- a/zig/kernels/cuda/route_rows.cu
++++ b/zig/kernels/cuda/route_rows.cu
+@@ -11,6 +11,13 @@
+ 
+ using namespace tf_glue;
+ 
++extern "C" __device__ int tf_route_keep = 0;
++
++__device__ __forceinline__ int kept(int top_k) {
++    const int k = tf_route_keep;
++    return k > 0 && k < top_k ? k : top_k;
++}
++
+ namespace tf_route {
+ 
+ constexpr int NT = 128;
+@@ -173,8 +180,9 @@ __device__ __forceinline__ void warp_topk(const FrontArgs& a, int r) {
+         v[j] = i < a.experts ? __ldcg(row + i) : -INFINITY;
+     }
+     float top = 0.0f, total = 0.0f, mine = 0.0f;
+-    int pick = 0;
+-    for (int k = 0; k < a.top_k; ++k) {
++    int pick = 0, first = 0;
++    const int keep = kept(a.top_k);
++    for (int k = 0; k < keep; ++k) {
+         float bv = -INFINITY;
+         int bi = 0x7fffffff;
+ #pragma unroll
+@@ -193,7 +201,10 @@ __device__ __forceinline__ void warp_topk(const FrontArgs& a, int r) {
+                 bi = oi;
+             }
+         }
+-        if (k == 0) top = bv;
++        if (k == 0) {
++            top = bv;
++            first = bi;
++        }
+ #pragma unroll
+         for (int j = 0; j < FRONT_MOST; ++j)
+             if (lane + 32 * j == bi) v[j] = -INFINITY;
+@@ -205,10 +216,14 @@ __device__ __forceinline__ void warp_topk(const FrontArgs& a, int r) {
+         }
+     }
+     const long long o = static_cast<long long>(r) * a.slots;
+-    if (lane < a.top_k) {
++    if (lane < keep) {
+         a.picks[o + lane] = pick;
+         a.wts[o + lane] = rbf(__fdiv_rn(mine, total));
+         a.own[o + lane] = own_id(pick, a.first, a.local, a.stride);
++    } else if (lane < a.top_k) {
++        a.picks[o + lane] = first;
++        a.wts[o + lane] = 0.0f;
++        a.own[o + lane] = own_id(first, a.first, a.local, a.stride);
+     }
+     if (lane == 0) {
+         a.picks[o + a.top_k] = a.experts;
+@@ -353,8 +368,9 @@ extern "C" __global__ void __launch_bounds__(NT) tf_route_topk(const float* __re
+         v[j] = i < NE ? row[i] : -INFINITY;
+     }
+     float top = 0.0f, total = 0.0f, mine = 0.0f;
+-    int pick = 0;
+-    for (int k = 0; k < TOPK; ++k) {
++    int pick = 0, first = 0;
++    const int keep = kept(TOPK);
++    for (int k = 0; k < keep; ++k) {
+         float bv = -INFINITY;
+         int bi = 0x7fffffff;
+ #pragma unroll
+@@ -366,7 +382,10 @@ extern "C" __global__ void __launch_bounds__(NT) tf_route_topk(const float* __re
+             }
+         }
+         block_best(bv, bi, sv, si, k & 1);
+-        if (k == 0) top = bv;
++        if (k == 0) {
++            top = bv;
++            first = bi;
++        }
+ #pragma unroll
+         for (int j = 0; j < MOST; ++j)
+             if (threadIdx.x + j * NT == bi) v[j] = -INFINITY;
+@@ -377,9 +396,12 @@ extern "C" __global__ void __launch_bounds__(NT) tf_route_topk(const float* __re
+             pick = bi;
+         }
+     }
+-    if (threadIdx.x < TOPK) {
++    if (threadIdx.x < keep) {
+         PICK[static_cast<long long>(r) * SLOTS + threadIdx.x] = pick;
+         WTS[static_cast<long long>(r) * SLOTS + threadIdx.x] = rbf(__fdiv_rn(mine, total));
++    } else if (threadIdx.x < TOPK) {
++        PICK[static_cast<long long>(r) * SLOTS + threadIdx.x] = first;
++        WTS[static_cast<long long>(r) * SLOTS + threadIdx.x] = 0.0f;
+     }
+     if (shared && threadIdx.x == 0) {
+         PICK[static_cast<long long>(r) * SLOTS + TOPK] = NE;
+diff --git a/zig/src/core/route_ref.zig b/zig/src/core/route_ref.zig
+index 21200dae9ffcc6b1974b67f7eb4fd0655252a5cb..75647304d93f3dd09d1cc55d128855a24b16c232 100644
+--- a/zig/src/core/route_ref.zig
++++ b/zig/src/core/route_ref.zig
+@@ -30,6 +30,76 @@ pub fn topk(logits: []const f64, ids: []usize, weights: []f64) void {
+     for (ids, weights) |id, *w| w.* = @exp(logits[id] - logits[ids[0]]) / total;
+ }
+ 
++pub fn topkKept(logits: []const f64, keep: usize, ids: []usize, weights: []f64) void {
++    const k = if (keep == 0 or keep >= ids.len) ids.len else keep;
++    topk(logits, ids[0..k], weights[0..k]);
++    for (ids[k..], weights[k..]) |*id, *w| {
++        id.* = ids[0];
++        w.* = 0;
++    }
++}
++
++test "keeping all ten picks is the model's own routing, bit for bit" {
++    var prng = std.Random.DefaultPrng.init(3970);
++    const rnd = prng.random();
++    for (0..200) |_| {
++        var l: [512]f64 = undefined;
++        for (&l) |*v| v.* = rnd.floatNorm(f64) * 2;
++        var ids: [10]usize = undefined;
++        var w: [10]f64 = undefined;
++        var kids: [10]usize = undefined;
++        var kw: [10]f64 = undefined;
++        topk(&l, &ids, &w);
++        for ([_]usize{ 0, 10, 11 }) |keep| {
++            topkKept(&l, keep, &kids, &kw);
++            try std.testing.expectEqualSlices(usize, &ids, &kids);
++            try std.testing.expectEqualSlices(f64, &w, &kw);
++        }
++    }
++}
++
++test "keeping five takes the top five, renormalised over the five as norm_topk_prob does, the rest weigh nothing on the top pick" {
++    var prng = std.Random.DefaultPrng.init(81);
++    const rnd = prng.random();
++    for (0..200) |_| {
++        var l: [512]f64 = undefined;
++        for (&l) |*v| v.* = rnd.floatNorm(f64) * 2;
++        var ids: [10]usize = undefined;
++        var w: [10]f64 = undefined;
++        topk(&l, &ids, &w);
++        var kids: [10]usize = undefined;
++        var kw: [10]f64 = undefined;
++        topkKept(&l, 5, &kids, &kw);
++        try std.testing.expectEqualSlices(usize, ids[0..5], kids[0..5]);
++        var p: [512]f64 = undefined;
++        var z: f64 = 0;
++        for (l, &p) |v, *q| {
++            q.* = @exp(v);
++            z += q.*;
++        }
++        var top5: f64 = 0;
++        for (ids[0..5]) |id| top5 += p[id] / z;
++        var sum10: f64 = 0;
++        for (w[0..5]) |x| sum10 += x;
++        var total: f64 = 0;
++        for (0..5) |k| {
++            try std.testing.expectApproxEqRel((p[ids[k]] / z) / top5, kw[k], 1e-12);
++            try std.testing.expectApproxEqRel(w[k] / sum10, kw[k], 1e-12);
++            total += kw[k];
++        }
++        try std.testing.expectApproxEqAbs(@as(f64, 1), total, 1e-12);
++        for (5..10) |k| {
++            try std.testing.expectEqual(ids[0], kids[k]);
++            try std.testing.expectEqual(@as(f64, 0), kw[k]);
++        }
++        var distinct: usize = 0;
++        for (kids, 0..) |id, i| {
++            if (std.mem.indexOfScalar(usize, kids[0..i], id) == null) distinct += 1;
++        }
++        try std.testing.expectEqual(@as(usize, 5), distinct);
++    }
++}
++
+ test "the top picks are the largest, ties to the lower id, weights summing to one" {
+     const l = [_]f64{ 1, 3, 3, -1, 2 };
+     var ids: [3]usize = undefined;
+diff --git a/zig/src/cuda/route_rows.zig b/zig/src/cuda/route_rows.zig
+index e744542d95a2b4a994cd884f53a668a654007221..9f671e7a2dbcc9d2e45502c20da1cf92023aad4c 100644
+--- a/zig/src/cuda/route_rows.zig
++++ b/zig/src/cuda/route_rows.zig
+@@ -84,6 +84,14 @@ pub const RouteRows = struct {
+         g.mod.unload();
+     }
+ 
++    pub fn keepTopk(g: *const RouteRows, keep: usize) !void {
++        if (keep > most_picks) return error.RowShape;
++        const at = try g.mod.global("tf_route_keep");
++        if (at.len != @sizeOf(i32)) return error.RowShape;
++        const v: i32 = @intCast(keep);
++        try @import("copy_source.zig").synchronousCopy(g.mod.d, at.ptr, std.mem.asBytes(&v), std.heap.page_allocator);
++    }
++
+     /// out [rows, e] fp32 = x [rows, d] (bf16, x_ld apart) times w [e, d] bf16 transposed; d % 16 == 0, 16-byte rows.
+     pub fn logits(g: *const RouteRows, s: Stream, x: u64, x_ld: usize, w: u64, out: u64, rows: usize, d: usize, e: usize) !void {
+         if (d % 16 != 0 or x_ld % 8 != 0 or x % 16 != 0 or w % 16 != 0) return error.RowShape;
+diff --git a/zig/src/families/flashnext/cuda_glue.zig b/zig/src/families/flashnext/cuda_glue.zig
+index 4cd54b957e5ef5e25994c6264a3b393bcf4b8fb3..199347c426678a365fa5f527d08a9dbeba438e1a 100644
+--- a/zig/src/families/flashnext/cuda_glue.zig
++++ b/zig/src/families/flashnext/cuda_glue.zig
+@@ -167,6 +167,7 @@ pub const Glue = struct {
+         errdefer g.norms.unload();
+         g.route = try cuda.route_rows.RouteRows.load(d);
+         errdefer g.route.unload();
++        if (try @import("cuda_knobs.zig").expertsTopk()) |k| try g.route.keepTopk(k);
+         g.f = .{
+             .wb0 = try g.hc.function("fn_hc_writeback0"),
+             .wb_moe = try g.hc.function("fn_hc_writeback_moe"),
+diff --git a/zig/src/families/flashnext/cuda_knobs.zig b/zig/src/families/flashnext/cuda_knobs.zig
+index c013a19bb6eebc7fe40791dcce594a6df0fa5b4b..af09ac69a8bd78cea01e1c0e0ebd06c6ad4cf54b 100644
+--- a/zig/src/families/flashnext/cuda_knobs.zig
++++ b/zig/src/families/flashnext/cuda_knobs.zig
+@@ -3207,6 +3207,30 @@ pub const roce_pipe_bit = 47;
+ pub const yarn_bit = 51;
+ pub const shared_pool_bit = 52;
+ pub const image_fast_bit = 53;
++pub const experts_topk_most: usize = reroute_picks;
++
++pub fn expertsTopkFrom(value: ?[]const u8) error{BadExpertsTopk}!?usize {
++    const v = value orelse return null;
++    if (v.len == 0) return error.BadExpertsTopk;
++    const k = std.fmt.parseInt(usize, v, 10) catch return error.BadExpertsTopk;
++    if (k > experts_topk_most) return error.BadExpertsTopk;
++    return if (k == 0 or k == experts_topk_most) null else k;
++}
++
++pub fn expertsTopk() error{BadExpertsTopk}!?usize {
++    return expertsTopkFrom(if (std.c.getenv("TF_FLASHNEXT_EXPERTS_TOPK")) |v| std.mem.span(v) else null);
++}
++
++test "TF_FLASHNEXT_EXPERTS_TOPK is off unset, 0 or the model's own 10, takes 1-9 and refuses anything else" {
++    try std.testing.expectEqual(@as(?usize, null), try expertsTopkFrom(null));
++    try std.testing.expectEqual(@as(?usize, null), try expertsTopkFrom("0"));
++    try std.testing.expectEqual(@as(?usize, null), try expertsTopkFrom("10"));
++    try std.testing.expectEqual(@as(?usize, 5), try expertsTopkFrom("5"));
++    try std.testing.expectEqual(@as(?usize, 1), try expertsTopkFrom("1"));
++    try std.testing.expectEqual(@as(?usize, 9), try expertsTopkFrom("9"));
++    for ([_][]const u8{ "", "11", "-1", "5 ", "five", "5,24" }) |bad| try std.testing.expectError(error.BadExpertsTopk, expertsTopkFrom(bad));
++}
++
+ pub const expert_reroute_bit = 54;
+ pub const reroute_picks: usize = 10;
+ pub const reroute_most: usize = 32;
+@@ -3235,8 +3259,28 @@ pub fn expertRerouteDigest(r: ExpertReroute) u64 {
+ }
+ 
+ fn expertRerouteBits() u64 {
+-    const r = (expertReroute() catch return 0) orelse return 0;
+-    return (1 | expertRerouteDigest(r) << 1) << expert_reroute_bit;
++    if (expertReroute() catch null) |r| return (1 | expertRerouteDigest(r) << 1) << expert_reroute_bit;
++    const k = (expertsTopk() catch return 0) orelse return 0;
++    return @as(u64, k) << 1 << expert_reroute_bit;
++}
++
++test "TF_FLASHNEXT_EXPERTS_TOPK puts K in bits 55-58 with bit 54 clear, so ranks with another K or the re-route disagree" {
++    const env = @import("sys").env;
++    defer _ = env.unsetenv("TF_FLASHNEXT_EXPERTS_TOPK");
++    _ = env.unsetenv("TF_FLASHNEXT_EXPERTS_TOPK");
++    _ = env.unsetenv("TF_FLASHNEXT_EXPERT_REROUTE");
++    const off = tpFlags();
++    try std.testing.expectEqual(@as(u64, 0), off >> expert_reroute_bit);
++    _ = env.setenv("TF_FLASHNEXT_EXPERTS_TOPK", "10", 1);
++    try std.testing.expectEqual(off, tpFlags());
++    _ = env.setenv("TF_FLASHNEXT_EXPERTS_TOPK", "5", 1);
++    const five = tpFlags();
++    try std.testing.expectEqual(off, five & ((@as(u64, 1) << expert_reroute_bit) - 1));
++    try std.testing.expectEqual(@as(u64, 10), five >> expert_reroute_bit);
++    _ = env.setenv("TF_FLASHNEXT_EXPERTS_TOPK", "6", 1);
++    try std.testing.expect(tpFlags() != five);
++    _ = env.setenv("TF_FLASHNEXT_EXPERTS_TOPK", "11", 1);
++    try std.testing.expectEqual(off, tpFlags());
+ }
+ 
+ test "TF_FLASHNEXT_EXPERT_REROUTE is off unset or 0, takes K0,KP,MIN in range, refuses anything else and sets bits 54-63 with its settings' digest" {
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index 942ddae30a1d3642eab4f6ea69d47cd08a2fc803..af30f460c0a88c351a9d433a9b307988872cf35f 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -367,6 +367,7 @@ fn loadRoute(rank: usize, tp: usize) !void {
+     const dump = try @import("cuda_knobs.zig").routeDump();
+     try reroute.configure();
+     if ((reroute.rule != null or dump != null) and @import("cuda_round_graph.zig").enabled()) return error.RouteDumpOrRerouteWithDecodeGraph;
++    if (try @import("cuda_knobs.zig").expertsTopk()) |k| std.log.warn("flashnext: experts per token {d} of the model's 10 (lossy): every MoE layer, decode, prompt and draft head, keeps each row's top {d} renormalised over them", .{ k, k });
+     if (reroute.rule) |r| std.log.warn("flashnext: expert re-route on (lossy): decode rounds of {d} streams or more keep each row's top {d} experts and prefer the batch's core among its top {d}", .{ r.min, r.k0, r.kp });
+     try @import("route_dump.zig").open(dump, rank, tp);
+ }
+diff --git a/zig/src/families/flashnext/cuda_launch.zig b/zig/src/families/flashnext/cuda_launch.zig
+index 71aef452420661af3262ef211428c76f18a516a7..d34187409a3a9a66eebd74870b7dab5821b5d72d 100644
+--- a/zig/src/families/flashnext/cuda_launch.zig
++++ b/zig/src/families/flashnext/cuda_launch.zig
+@@ -478,6 +478,7 @@ pub const Tri = struct {
+     /// moe._topk_rows over `rows` rows of [rows, 513] logits: picks and weights [rows, 11].
+     pub fn topkMany(t: Tri, logits: u64, pick: u64, wts: u64, rows: usize) !void {
+         if (t.glue("_topk_rows")) |g| return g.topkMany(t.s, logits, pick, wts, rows);
++        if (try knobs.expertsTopk() != null) return error.ExpertsTopkNeedsNativeRoute;
+         try t.run("_topk_rows", .{ u(rows), 1, 1 }, &.{
+             p("L", "*fp32", logits),
+             p("PICK", "*i32", pick),
+diff --git a/zig/src/families/flashnext/expert_reroute.zig b/zig/src/families/flashnext/expert_reroute.zig
+index 7d23262c1b6a60468c2f8e3b7d4428747c61bc1c..75dbbf5a616e632e497753f201c228fc1c475396 100644
+--- a/zig/src/families/flashnext/expert_reroute.zig
++++ b/zig/src/families/flashnext/expert_reroute.zig
+@@ -10,7 +10,12 @@ pub var rule: ?Rule = null;
+ pub var rounds: u64 = 0;
+ 
+ pub fn configure() !void {
+-    rule = try knobs.expertReroute();
++    rule = try refuseWithTopk(try knobs.expertReroute(), try knobs.expertsTopk());
++}
++
++pub fn refuseWithTopk(r: ?Rule, topk: ?usize) error{ExpertRerouteWithExpertsTopk}!?Rule {
++    if (r != null and topk != null) return error.ExpertRerouteWithExpertsTopk;
++    return r;
+ }
+ 
+ pub fn takes(r: ?Rule, streams: usize) bool {
+@@ -137,3 +142,10 @@ test "the rule runs from MIN streams and is off without a setting" {
+     try std.testing.expect(takes(.{ .k0 = 4, .kp = 16, .min = 8 }, 8));
+     try std.testing.expect(knobs.reroute_picks == wt.slots - 1 and knobs.reroute_most == @import("cuda").route_rows.most_candidates);
+ }
++
++test "TF_FLASHNEXT_EXPERT_REROUTE and TF_FLASHNEXT_EXPERTS_TOPK refuse to run together, either alone stands" {
++    const r: Rule = .{ .k0 = 5, .kp = 24, .min = 8 };
++    try std.testing.expectError(error.ExpertRerouteWithExpertsTopk, refuseWithTopk(r, 5));
++    try std.testing.expectEqual(@as(?Rule, r), try refuseWithTopk(r, null));
++    try std.testing.expectEqual(@as(?Rule, null), try refuseWithTopk(null, 5));
++}
+diff --git a/zig/tests/cuda/flashnext_experts_topk_tests.zig b/zig/tests/cuda/flashnext_experts_topk_tests.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..1c76b079c438882490de7b926b19c2e511f8502f
+--- /dev/null
++++ b/zig/tests/cuda/flashnext_experts_topk_tests.zig
+@@ -0,0 +1,75 @@
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++
++const ne = 512;
++const nl = ne + 1;
++const slots = 11;
++const top = 10;
++
++fn route(gpu: check.Gpu, rr: *const cuda.route_rows.RouteRows, stream: cuda.Stream, l: cuda.DeviceBuffer, picks: cuda.DeviceBuffer, wts: cuda.DeviceBuffer, rows: usize, keep: usize) !struct { p: []u8, w: []u8 } {
++    try rr.keepTopk(keep);
++    try rr.topk(stream, l.ptr, nl, ne, top, picks.ptr, wts.ptr, slots, rows, true);
++    try stream.synchronize();
++    return .{ .p = try check.download(gpu, picks), .w = try check.download(gpu, wts) };
++}
++
++pub fn kernel(gpu: check.Gpu, rows: usize, keep: usize) !void {
++    if (rows == 0 or rows > 1024) return error.BadRows;
++    if (keep == 0 or keep >= top) return error.BadKeep;
++    var stream = try cuda.Stream.init(gpu.d, true);
++    defer stream.deinit();
++    var rr = try cuda.route_rows.RouteRows.load(gpu.d);
++    defer rr.unload();
++    const gpa = gpu.gpa;
++    const logits = try gpa.alloc(f32, rows * nl);
++    defer gpa.free(logits);
++    var prng = std.Random.DefaultPrng.init(81);
++    const rnd = prng.random();
++    for (logits) |*x| x.* = @floatCast(rnd.floatNorm(f64) * 2.0);
++    for (0..rows / 8) |r| logits[r * nl + 3] = logits[r * nl + 7];
++    var l = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(logits));
++    defer l.free();
++    var picks = try cuda.DeviceBuffer.alloc(gpu.d, rows * slots * 4);
++    defer picks.free();
++    var wts = try cuda.DeviceBuffer.alloc(gpu.d, rows * slots * 4);
++    defer wts.free();
++    const off = try route(gpu, &rr, stream, l, picks, wts, rows, 0);
++    defer gpa.free(off.p);
++    defer gpa.free(off.w);
++    const on = try route(gpu, &rr, stream, l, picks, wts, rows, keep);
++    defer gpa.free(on.p);
++    defer gpa.free(on.w);
++    const back = try route(gpu, &rr, stream, l, picks, wts, rows, top);
++    defer gpa.free(back.p);
++    defer gpa.free(back.w);
++    try check.expect(std.mem.eql(u8, off.p, back.p) and std.mem.eql(u8, off.w, back.w), "keep {d} (the model's own ten) is not byte-equal to keep 0", .{top});
++    const p0: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, off.p));
++    const p1: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, on.p));
++    const w0: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, off.w));
++    const w1: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, on.w));
++    var worst: f64 = 0;
++    var nat: std.StaticBitSet(ne) = .empty;
++    var act: std.StaticBitSet(ne) = .empty;
++    for (0..rows) |r| {
++        const a = p0[r * slots ..][0..slots];
++        const b = p1[r * slots ..][0..slots];
++        try check.expect(std.mem.eql(u32, a[0..keep], b[0..keep]), "row {d}: the kept picks differ from the model's top {d}", .{ r, keep });
++        try check.expect(b[top] == ne and w1[r * slots + top] == w0[r * slots + top], "row {d}: the shared slot moved", .{r});
++        for (keep..top) |k| try check.expect(b[k] == b[0] and w1[r * slots + k] == 0, "row {d} slot {d}: a dropped pick is not the top pick at weight 0", .{ r, k });
++        const lg = logits[r * nl ..][0..nl];
++        var total: f64 = 0;
++        var sum: f64 = 0;
++        for (b[0..keep]) |e| total += @exp(@as(f64, lg[e]) - lg[b[0]]);
++        for (b[0..keep], 0..) |e, k| {
++            const w = @exp(@as(f64, lg[e]) - lg[b[0]]) / total;
++            worst = @max(worst, @abs(w1[r * slots + k] - w) / w);
++            sum += w1[r * slots + k];
++        }
++        try check.expect(@abs(sum - 1) < 1.0 / 64.0, "row {d}: kept weights sum to {d:.5}", .{ r, sum });
++        for (0..top) |k| nat.set(a[k]);
++        for (0..keep) |k| act.set(b[k]);
++    }
++    try check.expect(worst < 1.0 / 128.0, "a kept weight is {d:.5} off its renormalised value", .{worst});
++    check.pass("experts-topk kernel at {d} rows, keep {d}: kept picks equal the model's top {d}, dropped slots the top pick at weight 0, shared slot unchanged, weights within {d:.5} of the softmax over the kept; keep 10 byte-equal to keep 0; distinct experts {d} -> {d}", .{ rows, keep, keep, worst, nat.count(), act.count() });
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index ce0a6a86ee0331c48c72a233751f1d65547c25d7..478c3b9cf63aaa2c5d5574f8735da70e4a8b6d4f 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -176,6 +176,7 @@ const usage =
+     \\  flashnext-moe-glue-bench [REPS]  one GPU: 48 layers of router logits alone, the served chain (logits, topk, own picks, plan) and the fused front on cold router weights at 1/4/8/16/24/28 lanes (4/12/25/50/72/96 rows), ms a round (default 20 reps); kill rule GO at >= 0.4 ms saved a 4-lane round
+     \\  flashnext-moe-glue MODEL RANK PORT IDS_FILE [ROUNDS]  two-rank TF_FLASHNEXT_MOE_GLUE: 1, 4, 8 and 16 streams' greedy MTP decode, ROUNDS rounds (default 300), an off session then an on one at PORT+1: every token and every round's window scores byte-equal, both ranks took the fused front
+     \\  flashnext-moe-glue-round-bench MODEL RANK PORT IDS_FILE STREAMS ROUNDS REPS  two-rank ms a decode round with TF_FLASHNEXT_MOE_GLUE off and on, REPS alternating session pairs (ports PORT..PORT+2*REPS-1), medians
++    \\  flashnext-experts-topk-kernel [ROWS K]  one GPU: tf_route_topk with TF_FLASHNEXT_EXPERTS_TOPK's keep against the host rule (default 96 rows, K 5): kept picks equal the model's top K, dropped slots the top pick at weight 0, weights renormalised over the K; keep 10 byte-equal to keep 0
+     \\  flashnext-reroute-kernel [ROWS K0 KP]  one GPU: tf_route_reroute against the host rule on random router rows (default 96 rows, K0 7, KP 16); unchanged rows byte-equal to tf_route_topk
+     \\  flashnext-reroute MODEL RANK PORT IDS_FILE [STREAMS ROUNDS K0 KP]  two-rank TF_FLASHNEXT_EXPERT_REROUTE (default 24 streams, 40 rounds, 7,16): flag off, the route dump on, the re-route under MIN, then MIN=2 (ports PORT..PORT+3); the first three byte-equal; distinct experts a layer, score change and argmax flips
+     \\  flashnext-lanes-any-bench MODEL RANK PORT IDS_FILE STREAMS ROUNDS REPS  two-rank ms a decode round with TF_FLASHNEXT_ATTN_LANES_ANY off and on, REPS alternating session pairs (ports PORT..PORT+2*REPS-1), medians
+@@ -505,6 +506,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "flashnext-moe-glue-bench")) return @import("flashnext_moe_glue_tests.zig").bench(gpu, if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else 20);
+     if (std.mem.eql(u8, cmd, "flashnext-moe-glue")) return @import("flashnext_moe_glue_tests.zig").run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3), if (rest.len > 4) try std.fmt.parseInt(usize, rest[4], 10) else 300);
+     if (std.mem.eql(u8, cmd, "flashnext-moe-glue-round-bench")) return @import("flashnext_moe_glue_tests.zig").roundBench(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(usize, try arg(rest, 4), 10), try std.fmt.parseInt(usize, try arg(rest, 5), 10), try std.fmt.parseInt(usize, try arg(rest, 6), 10));
++    if (std.mem.eql(u8, cmd, "flashnext-experts-topk-kernel")) return @import("flashnext_experts_topk_tests.zig").kernel(gpu, if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else 96, if (rest.len > 1) try std.fmt.parseInt(usize, rest[1], 10) else 5);
+     if (std.mem.eql(u8, cmd, "flashnext-reroute-kernel")) return @import("flashnext_reroute_tests.zig").kernel(gpu, if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else 96, if (rest.len > 1) try std.fmt.parseInt(usize, rest[1], 10) else 7, if (rest.len > 2) try std.fmt.parseInt(usize, rest[2], 10) else 16);
+     if (std.mem.eql(u8, cmd, "flashnext-reroute")) return @import("flashnext_reroute_tests.zig").run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3), if (rest.len > 4) try std.fmt.parseInt(usize, rest[4], 10) else 24, if (rest.len > 5) try std.fmt.parseInt(usize, rest[5], 10) else 40, if (rest.len > 6) try std.fmt.parseInt(usize, rest[6], 10) else 7, if (rest.len > 7) try std.fmt.parseInt(usize, rest[7], 10) else 16);
+     if (std.mem.eql(u8, cmd, "flashnext-lanes-any-bench")) return @import("flashnext_lanes_any_tests.zig").bench(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(usize, try arg(rest, 4), 10), try std.fmt.parseInt(usize, try arg(rest, 5), 10), try std.fmt.parseInt(usize, try arg(rest, 6), 10));

@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ashhart <71890694+ashhart@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 20:28:10 +0000
+Subject: [PATCH 16/33] prompt cache: the shorter-state retry is bounded to RAM
+
+Upstream TensorFold commit by ashhart, ported onto this series (upstream main 2adb8f944722).
+
+A cold review found the K38 loop unbounded: each refusal called lookupUser,
+which recalls the imprint and the spill tier, so a disk state this request just
+refused came back every time and the engine thread never left beginUser.
+
+beginUser's retries now call lookupUserAt with disk=false: only states already
+in RAM are tried after the first refusal. The first lookup still recalls every
+tier, so a learned or spilled state is tried once; a refused one is expired and
+removed, and the retry cannot bring it back. Marks on the fallback pass stay the
+first lookup's, as main had them.
+
+Test: a fake family with a learned state at 5 and an imprint whose restore
+refuses that state every time ends with from = 0, one counted failure, no entry
+left and a pass equal to a fresh one (prompt_cache_learn_test.zig). Unfixed, the
+loop recalls the same state forever. test-learn-recovery passes 504.
+
+(cherry picked from commit 2adb8f94472262cc857898fbc0a91b4465433466)
+---
+ zig/src/core/prompt_cache.zig            | 14 +++++++--
+ zig/src/core/prompt_cache_learn_test.zig | 40 ++++++++++++++++++++++++
+ 2 files changed, 51 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index c353ec1a3561c2d607ba036a45d23cac59c9713a..05b9828f0448eb5362f39653a5a3998617994d98 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -388,10 +388,10 @@ pub const Store = struct {
+                 s.reserve(prompt, @intCast(prompt.len), null, l.marks, spans); // restored: the state it resumed may go too (a peer restores before it drops)
+                 return .{ .from = at, .marks = l.marks };
+             } else |err| {
+-                // a refused state is dropped, then the next shorter kept state is tried before the pass from the start
++                // a refused state is dropped, then the next shorter RAM state is tried before the pass from the start
+                 if (fresh_marks == null) fresh_marks = l.marks else a.free(l.marks);
+                 s.resumedWithReason(e, prompt, err);
+-                l = try s.lookupUser(a, prompt, @intCast(prompt.len), history_len, rewind_len, user_end, shared, starts, spans);
++                l = try s.lookupUserAt(a, prompt, @intCast(prompt.len), history_len, rewind_len, user_end, shared, starts, spans, false);
+             }
+         }
+         const marks_ = fresh_marks orelse l.marks;
+@@ -412,6 +412,11 @@ pub const Store = struct {
+ 
+     /// `lookupRewind` with an explicit last-user end: history may also include later tool or assistant messages.
+     pub fn lookupUser(s: *Store, a: Allocator, prompt: []const u32, born: u32, history_len: u32, rewind_len: u32, user_end: u32, shared: []const u32, starts: []const u32, spans: []const modes.Span) !Lookup {
++        return s.lookupUserAt(a, prompt, born, history_len, rewind_len, user_end, shared, starts, spans, true);
++    }
++
++    /// `lookupUser`; with `disk` false only RAM states (a retry after a refusal must not recall the refused one).
++    fn lookupUserAt(s: *Store, a: Allocator, prompt: []const u32, born: u32, history_len: u32, rewind_len: u32, user_end: u32, shared: []const u32, starts: []const u32, spans: []const modes.Span, disk: bool) !Lookup {
+         s.collectExpired();
+         const endpoint = if (s.rules.planned) s.startAt(starts, history_len) else history_len;
+         const rewind = if (s.rules.planned) s.startAt(starts, rewind_len -| s.rules.lookahead) else rewind_len -| s.rules.lookahead;
+@@ -422,7 +427,10 @@ pub const Store = struct {
+         if (s.active_rewind_at > 0) if (s.keptNear(prompt, starts, spans, s.active_rewind_at)) |at| {
+             s.active_rewind_at = at; // a state kept under min_gap before it is the rewind state: no new copy
+         };
+-        const e = rows.read.recall(s, prompt, born, starts, spans, s.recall(prompt, born, starts, spans, s.find(prompt, starts, spans)));
++        const e = if (disk)
++            rows.read.recall(s, prompt, born, starts, spans, s.recall(prompt, born, starts, spans, s.find(prompt, starts, spans)))
++        else
++            s.find(prompt, starts, spans);
+         if (e == null) s.counts.misses += 1;
+         if (s.keeping.explain) if (explain.look(s, prompt, e, history_len, spans)) |l| explain.line(s, prompt.len, l);
+         const from = if (e) |x| x.at else 0;
+diff --git a/zig/src/core/prompt_cache_learn_test.zig b/zig/src/core/prompt_cache_learn_test.zig
+index 8ad77062a7828dc944651a586bbc9546e1c60edc..8686b55a1a77fcf38700101c6422a1cf2b1859bf 100644
+--- a/zig/src/core/prompt_cache_learn_test.zig
++++ b/zig/src/core/prompt_cache_learn_test.zig
+@@ -295,3 +295,43 @@ test "under-cap disk pressure selects the same LRU victim before either half is
+     try std.testing.expectEqual(@as(usize, 1), fake.disk_peer_writes);
+     try std.testing.expect(!fake.disk_reserved);
+ }
++
++test "a refused learned state ends the retry: the pass from the start, one failure, no recall loop" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var root_buf: [128]u8 = undefined;
++    const root = try std.fmt.bufPrint(&root_buf, "/tmp/tf-learn-refuse-{d}", .{platform.c.getpid()});
++    defer rmTree(root);
++    const rules: pc.Rules = .{ .lookahead = 1, .min_prompt = 0, .min_gap = 1 };
++    const harness = [_]u32{ 7, 7, 7, 7, 7, 7 }; // shared by every session: a state at 5 reads it all (lookahead 1)
++    const key = imprint.Imprint.keyOf(&harness);
++    {
++        var im = try imprint.Imprint.open(gpa, root, 3, 1 << 30);
++        defer im.deinit();
++        im.admission.floor = 1 << 20;
++        {
++            var f: Fake = .{ .gpa = gpa };
++            var s = Store.init(gpa, f.learned(), rules, 1 << 20);
++            defer s.deinit();
++            s.imprint = &im;
++            const first = harness ++ [_]u32{ 1, 2, 9 };
++            try std.testing.expectEqual(fresh(&first), f.pass(&s, &first, try s.begin(a, &first, 8, &.{5}, &.{}, null, &.{})));
++            try std.testing.expect(im.has(key));
++        }
++        var again = try imprint.Imprint.open(gpa, root, 3, 1 << 30); // a new server reads the index back
++        defer again.deinit();
++        again.admission.floor = 1 << 20;
++        var f: Fake = .{ .gpa = gpa, .refuse_at = 5 }; // the one learned state is refused every time
++        var s = Store.init(gpa, f.learned(), rules, 1 << 20);
++        defer s.deinit();
++        s.imprint = &again;
++        const second = harness ++ [_]u32{ 3, 4, 9 };
++        const p = try s.begin(a, &second, 8, &.{5}, &.{}, null, &.{});
++        try std.testing.expectEqual(@as(u32, 0), p.from); // the pass from the start
++        try std.testing.expectEqual(@as(u64, 1), s.counts.failed); // one failure, the one state: no recall loop
++        try std.testing.expectEqual(@as(usize, 0), s.entries.items.len); // the refused state is gone, not re-read
++        try std.testing.expectEqual(fresh(&second), f.pass(&s, &second, p));
++    }
++}

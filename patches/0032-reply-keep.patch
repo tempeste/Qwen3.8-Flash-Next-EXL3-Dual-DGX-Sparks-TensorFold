@@ -1,0 +1,1372 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tempeste <tempeste@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 00:04:29 +0000
+Subject: [PATCH 32/33] flashnext: TF_FLASHNEXT_REPLY_KEEP, a finished reply
+ keeps its lane's state for the next turn
+
+A finished reply keeps its lane's state, so the turn that extends the reply resumes past it instead of re-reading
+it. Off unless TF_FLASHNEXT_REPLY_KEEP=1.
+
+Changes, in the order they were made:
+- feat(flashnext): TF_FLASHNEXT_REPLY_KEEP, a finished reply keeps its lane's state so the turn that extends it
+  resumes past the reply
+
+Flags this patch adds (a flag's default is its unset value; unset leaves the engine as it was
+before the flag, and a knob named under another flag only matters when that flag is on):
+- TF_FLASHNEXT_REPLY_KEEP is off unset or 0, on at 1, refuses any other value, and leaves tp_flags alone
+---
+ zig/build/cuda.zig                            |   2 +-
+ zig/src/core/lane_host.zig                    |   1 +
+ zig/src/core/lane_host_reply.zig              |  62 ++++
+ zig/src/core/lane_host_reply_test.zig         | 307 ++++++++++++++++
+ zig/src/core/lane_host_tests.zig              |   1 +
+ zig/src/core/lanes/backend.zig                |   5 +
+ zig/src/core/lanes/engine.zig                 |   6 +-
+ zig/src/core/lanes/fake.zig                   |  16 +
+ zig/src/core/prompt_cache.zig                 |   7 +
+ zig/src/core/prompt_cache_reply.zig           |  95 +++++
+ zig/src/core/prompt_cache_reply_test.zig      |  56 +++
+ zig/src/families/flashnext/cuda_knobs.zig     |  21 ++
+ zig/src/families/flashnext/cuda_lanes.zig     |  24 +-
+ .../families/flashnext/cuda_lanes_load.zig    |   2 +
+ zig/src/families/flashnext/cuda_launch.zig    |   1 +
+ zig/src/families/flashnext/cuda_reply_end.zig |  54 +++
+ zig/src/native/cuda.zig                       |   2 +-
+ zig/src/native/cuda_bound.zig                 |  14 +
+ zig/tests/cuda/flashnext_reply_keep_tests.zig | 338 ++++++++++++++++++
+ zig/tests/cuda/main.zig                       |   2 +
+ 20 files changed, 1012 insertions(+), 4 deletions(-)
+ create mode 100644 zig/src/core/lane_host_reply.zig
+ create mode 100644 zig/src/core/lane_host_reply_test.zig
+ create mode 100644 zig/src/core/prompt_cache_reply.zig
+ create mode 100644 zig/src/core/prompt_cache_reply_test.zig
+ create mode 100644 zig/src/families/flashnext/cuda_reply_end.zig
+ create mode 100644 zig/tests/cuda/flashnext_reply_keep_tests.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 5207fa8bc295be49fc53f57bc5456977aafc2b06..4394e553f8acec07464c4ca2fd410ebbfdf5c2c7 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -453,7 +453,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     media_gate.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.core, .filters = &.{ "qwen_vl", "video" } })).step);
+     b.step("test-http-limits-host", "Total HTTP read deadlines and connection admission without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"HTTP limits:"} })).step);
+     b.step("test-server-recovery-host", "Incomplete replies, token allocation and bounded SSE storage without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"Server recovery:"} })).step);
+-    b.step("test-pcache-host", "The prompt cache's live-request eviction order and lent bytes (TF_FLASHNEXT_PCACHE_LIVE, TF_FLASHNEXT_RESTORE_HEAD_KV), its keeping orders and miss diagnostic (TF_FLASHNEXT_PCACHE_ONE_COPY, _VALUE, _EXPLAIN), shared kept rows and anchors (TF_FLASHNEXT_PCACHE_SHARE, _ANCHOR_TOKENS), the cut before a first picture (TF_FLASHNEXT_IMAGE_FAST) and an agent-trace replay on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native_modules.api, .filters = &.{ "pcache live:", "pcache lend:", "pcache keeping:", "pcache replay:", "pcache share:", "pcache image cut:" } })).step);
++    b.step("test-pcache-host", "The prompt cache's live-request eviction order and lent bytes (TF_FLASHNEXT_PCACHE_LIVE, TF_FLASHNEXT_RESTORE_HEAD_KV), its keeping orders and miss diagnostic (TF_FLASHNEXT_PCACHE_ONE_COPY, _VALUE, _EXPLAIN), shared kept rows and anchors (TF_FLASHNEXT_PCACHE_SHARE, _ANCHOR_TOKENS), the cut before a first picture (TF_FLASHNEXT_IMAGE_FAST), a finished reply's kept state (TF_FLASHNEXT_REPLY_KEEP) and an agent-trace replay on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native_modules.api, .filters = &.{ "pcache live:", "pcache lend:", "pcache keeping:", "pcache replay:", "pcache share:", "pcache image cut:", "pcache reply:" } })).step);
+     b.step("test-prompt-interior-host", "Last-user metadata excludes later messages without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"interior prompt:"} })).step);
+     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
+     b.step("test-done-times-host", "Request-local done line times and lane admission on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"done times:"} })).step);
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index b56fa26f41c88eaa4025b0a3c0150b5c11c0a6ff..3546e4f07538a5246c5eb0a67ec756741eadc9bc 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -111,6 +111,7 @@ pub const LaneHost = struct {
+     pub fn start(h: *LaneHost) !void {
+         if (h.rounds != null and !h.core.backend.pieces()) return error.PiecesUnsupported; // a drafter wrapper runs whole prompts
+         h.ledger = try @import("lane_host_ledger.zig").fromEnv();
++        @import("lane_host_reply.zig").install(h);
+         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
+     }
+ 
+diff --git a/zig/src/core/lane_host_reply.zig b/zig/src/core/lane_host_reply.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..39d84369f42eef792218c8aa4f155cca2ec11e97
+--- /dev/null
++++ b/zig/src/core/lane_host_reply.zig
+@@ -0,0 +1,62 @@
++const std = @import("std");
++const lanes = @import("lanes");
++const pc = @import("prompt_cache.zig");
++const modes = @import("cache_modes.zig");
++const LaneHost = @import("lane_host.zig").LaneHost;
++const Job = LaneHost.Job;
++const be = lanes.backend.Backend;
++
++pub fn install(h: *LaneHost) void {
++    const store = h.cache orelse return;
++    if (!h.core.backend.reply_keep or h.core.backend.vtable.reply_end == null) return;
++    store.reply.on = true;
++    h.core.reply = .{ .ctx = h, .kept = kept };
++    std.log.info("prompt cache: a finished reply keeps its state for the turn that extends it (TF_FLASHNEXT_REPLY_KEEP)", .{});
++}
++
++fn jobOf(h: *LaneHost, s: *lanes.Stream) ?*Job {
++    for (h.admitted.items) |j| if (&j.stream == s) return j;
++    return null;
++}
++
++fn why(m: be.ReplyMiss) ?pc.reply.Why {
++    return switch (m) {
++        .off => null,
++        .prompt_open => .prompt_open,
++        .position => .position,
++        .drafts_open => .drafts_open,
++        .head_behind => .head_behind,
++        .failed => .failed,
++    };
++}
++
++pub fn kept(ctx: *anyopaque, s: *lanes.Stream) void {
++    const h: *LaneHost = @ptrCast(@alignCast(ctx));
++    const store = h.cache orelse return;
++    const end = h.core.backend.vtable.reply_end orelse return;
++    const job = jobOf(h, s) orelse return;
++    keepEnd(h, store, job, s, end);
++}
++
++pub fn keepEnd(h: *LaneHost, store: *pc.Store, job: *Job, s: *lanes.Stream, end: *const fn (*anyopaque, *lanes.Stream) be.ReplyEnd) void {
++    const r = job.request;
++    const key = job.cacheKey();
++    const prompt = s.prompt_len;
++    const tokens = s.context.items;
++    if (r.untaught or tokens.len <= prompt) return;
++    if (r.images.len > 0 or key.len != prompt) return pc.reply.unkept(store, tokens, r.bornLen(), .image);
++    const at = switch (end(h.core.backend.ptr, s)) {
++        .miss => |m| return if (why(m)) |w| pc.reply.unkept(store, tokens, r.bornLen(), w),
++        .at => |a| a,
++    };
++    if (@as(usize, at) + 1 != tokens.len or at < prompt or store.rules.lookahead > 1) return pc.reply.unkept(store, tokens, r.bornLen(), .position);
++    const words = h.gpa.alloc(u32, at + store.rules.lookahead) catch return pc.reply.unkept(store, tokens, r.bornLen(), .failed);
++    defer h.gpa.free(words);
++    @memcpy(words[0..prompt], key);
++    @memcpy(words[prompt..], tokens[prompt..words.len]);
++    const spans = if (h.decoded_rows) modes.reply(h.gpa, r.decode_spans, @intCast(prompt), at) catch return pc.reply.unkept(store, tokens, r.bornLen(), .failed) else &.{};
++    defer if (h.decoded_rows) h.gpa.free(spans);
++    job.reported();
++    if (!store.keepBornFrame(words, r.bornLen(), at, s, r.chunks, spans, r.images, job.frame)) return pc.reply.unkept(store, tokens, r.bornLen(), .refused);
++    if (store.last_kept) |e| pc.reply.kept(store, e);
++}
+diff --git a/zig/src/core/lane_host_reply_test.zig b/zig/src/core/lane_host_reply_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..811acc4a149f4ffe1157a18aa693c5ffecd6891b
+--- /dev/null
++++ b/zig/src/core/lane_host_reply_test.zig
+@@ -0,0 +1,307 @@
++const std = @import("std");
++const lanes = @import("lanes");
++const api = @import("engine_api.zig");
++const pc = @import("prompt_cache.zig");
++const LaneHost = api.LaneHost;
++const Id = api.Id;
++const Event = api.Event;
++const Request = api.Request;
++const Reason = api.Reason;
++const gpa = std.testing.allocator;
++
++const Snaps = struct {
++    fn bytes(_: *anyopaque, at: u32) u64 {
++        return 64 + 4 * @as(u64, at);
++    }
++    fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
++        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++        return f.save(@ptrCast(@alignCast(owner.?)), at);
++    }
++    fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
++        return error.BackendRestores;
++    }
++    fn drop(ptr: *anyopaque, saved: pc.Saved) void {
++        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++        f.drop(saved);
++    }
++};
++
++const Box = struct {
++    mutex: std.Io.Mutex = .init,
++    tokens: std.ArrayList(u32) = .empty,
++    cached: ?u32 = null,
++    done: ?Reason = null,
++    fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++        const b: *@This() = @ptrCast(@alignCast(ctx));
++        b.mutex.lockUncancelable(std.testing.io);
++        defer b.mutex.unlock(std.testing.io);
++        switch (e.*) {
++            .prefilled => |c| b.cached = c,
++            .logprobs, .prompt_logprobs, .audio => {},
++            .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
++            .finished => |f| b.done = f.reason,
++        }
++    }
++    fn wait(b: *@This()) Reason {
++        while (true) {
++            b.mutex.lockUncancelable(std.testing.io);
++            const d = b.done;
++            b.mutex.unlock(std.testing.io);
++            if (d) |r| return r;
++            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++        }
++    }
++};
++
++const Rig = struct {
++    cfg: lanes.Config,
++    target: lanes.fake.Fake,
++    clock: lanes.fake.FixedClock = .{},
++    core: lanes.Engine,
++    store: pc.Store,
++    host: LaneHost,
++    next_id: Id = 1,
++
++    fn init(r: *Rig, on: bool, budget: u64, streams: u32) !void {
++        r.cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = false, .hidden_rows = true }, 8, 7);
++        r.target = .{ .gpa = gpa };
++        r.clock = .{};
++        r.core = lanes.Engine.init(gpa, &r.cfg, if (on) r.target.replying() else r.target.backend(), r.clock.clock());
++        r.store = pc.Store.init(gpa, .{ .ptr = &r.target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, budget);
++        r.host = LaneHost.init(gpa, std.testing.io, &r.core, .{ .lanes = streams });
++        r.host.cache = &r.store;
++        r.next_id = 1;
++        try r.host.start();
++    }
++
++    fn deinit(r: *Rig) void {
++        r.host.stop();
++        r.store.deinit();
++        r.core.deinit();
++        r.target.deinit();
++        r.cfg.deinit(gpa);
++    }
++
++    fn turn(r: *Rig, prompt: []const u32, max_tokens: u32, b: *Box) !Reason {
++        const req = try gpa.create(Request);
++        defer gpa.destroy(req);
++        req.* = .{ .prompt = prompt, .max_tokens = max_tokens, .history_len = @intCast(prompt.len - 2) };
++        const id = r.next_id;
++        r.next_id += 1;
++        try r.host.engine().submit(id, req, .{ .ctx = b, .event = Box.event });
++        return b.wait();
++    }
++};
++
++fn replyOf(history: []const u32, n: usize, out: *std.ArrayList(u32)) !void {
++    var h: std.ArrayList(u32) = .empty;
++    defer h.deinit(gpa);
++    try h.appendSlice(gpa, history);
++    for (0..n) |_| {
++        const t = lanes.fake.next(h.items, null, h.items.len);
++        try h.append(gpa, t);
++        try out.append(gpa, t);
++    }
++}
++
++fn expectReplies(prompt: []const u32, got: []const u32) !void {
++    var want: std.ArrayList(u32) = .empty;
++    defer want.deinit(gpa);
++    try replyOf(prompt, got.len, &want);
++    try std.testing.expectEqualSlices(u32, want.items, got);
++}
++
++fn conversation(c: u32, len: usize, out: []u32) []u32 {
++    for (out[0..len], 0..) |*t, i| t.* = c * 1000 + @as(u32, @intCast((i * 7 + 3) % 97));
++    return out[0..len];
++}
++
++fn followUp(prompt: []const u32, reply: []const u32, tail: []const u32, out: *std.ArrayList(u32)) !void {
++    try out.appendSlice(gpa, prompt);
++    try out.appendSlice(gpa, reply);
++    try out.appendSlice(gpa, tail);
++}
++
++const template_tail = [_]u32{ 151645, 198, 151644, 872, 198, 41, 42, 43 };
++
++test "pcache reply: a follow-up whose prompt extends prompt and reply resumes past the reply, through the template tail, with the tokens a full read gives" {
++    var r: Rig = undefined;
++    try r.init(true, 1 << 20, 2);
++    defer r.deinit();
++    var buf: [40]u32 = undefined;
++    const t1 = conversation(1, 20, &buf);
++    var b1: Box = .{};
++    defer b1.tokens.deinit(gpa);
++    try std.testing.expectEqual(Reason.length, try r.turn(t1, 6, &b1));
++    try expectReplies(t1, b1.tokens.items);
++    try std.testing.expect(r.store.reply.on);
++    try std.testing.expectEqual(@as(u64, 1), r.store.reply.kept);
++    try std.testing.expectEqual(@as(u64, 5), r.store.reply.kept_rows);
++    var t2: std.ArrayList(u32) = .empty;
++    defer t2.deinit(gpa);
++    try followUp(t1, b1.tokens.items, &template_tail, &t2);
++    var b2: Box = .{};
++    defer b2.tokens.deinit(gpa);
++    try std.testing.expectEqual(Reason.length, try r.turn(t2.items, 8, &b2));
++    try std.testing.expectEqual(@as(?u32, 20 + 6 - 1), b2.cached);
++    try expectReplies(t2.items, b2.tokens.items);
++    try std.testing.expectEqual(@as(u64, 1), r.store.reply.hits);
++    try std.testing.expectEqual(@as(u64, 5), r.store.reply.hit_rows);
++    try std.testing.expectEqual(@as(u64, 2), r.store.reply.kept);
++}
++
++test "pcache reply: flag off keeps no reply end and resumes at the prompt's history, as before" {
++    var r: Rig = undefined;
++    try r.init(false, 1 << 20, 2);
++    defer r.deinit();
++    var buf: [40]u32 = undefined;
++    const t1 = conversation(1, 20, &buf);
++    var b1: Box = .{};
++    defer b1.tokens.deinit(gpa);
++    _ = try r.turn(t1, 6, &b1);
++    try std.testing.expect(!r.store.reply.on);
++    try std.testing.expectEqual(@as(usize, 1), r.store.entries.items.len);
++    try std.testing.expectEqual(@as(usize, 0), r.target.reply_ends);
++    var t2: std.ArrayList(u32) = .empty;
++    defer t2.deinit(gpa);
++    try followUp(t1, b1.tokens.items, &template_tail, &t2);
++    var b2: Box = .{};
++    defer b2.tokens.deinit(gpa);
++    _ = try r.turn(t2.items, 8, &b2);
++    try std.testing.expectEqual(@as(?u32, 18), b2.cached);
++    try expectReplies(t2.items, b2.tokens.items);
++    try std.testing.expectEqual(@as(u64, 0), r.store.reply.hits);
++}
++
++test "pcache reply: a follow-up whose reply differs (a re-serialized tool call) or stops inside it resumes at the prompt's history, counted diverged or shorter" {
++    var r: Rig = undefined;
++    try r.init(true, 1 << 20, 2);
++    defer r.deinit();
++    var buf: [40]u32 = undefined;
++    const t1 = conversation(2, 24, &buf);
++    var b1: Box = .{};
++    defer b1.tokens.deinit(gpa);
++    _ = try r.turn(t1, 6, &b1);
++    var changed = try gpa.dupe(u32, b1.tokens.items);
++    defer gpa.free(changed);
++    changed[3] +%= 1;
++    var t2: std.ArrayList(u32) = .empty;
++    defer t2.deinit(gpa);
++    try followUp(t1, changed, &template_tail, &t2);
++    var b2: Box = .{};
++    defer b2.tokens.deinit(gpa);
++    _ = try r.turn(t2.items, 4, &b2);
++    try std.testing.expectEqual(@as(?u32, 22), b2.cached);
++    try expectReplies(t2.items, b2.tokens.items);
++    try std.testing.expectEqual(@as(u64, 0), r.store.reply.hits);
++    try std.testing.expectEqual(@as(u64, 1), r.store.reply.diverged);
++    var t3: std.ArrayList(u32) = .empty;
++    defer t3.deinit(gpa);
++    try followUp(t1, b1.tokens.items[0..2], &.{}, &t3);
++    var b3: Box = .{};
++    defer b3.tokens.deinit(gpa);
++    _ = try r.turn(t3.items, 3, &b3);
++    try expectReplies(t3.items, b3.tokens.items);
++    try std.testing.expectEqual(@as(u64, 1), r.store.reply.short);
++}
++
++test "pcache reply: a lane whose drafts were not settled keeps nothing for the reply, and its follow-up counts the miss as not kept" {
++    var r: Rig = undefined;
++    try r.init(true, 1 << 20, 2);
++    defer r.deinit();
++    r.target.reply_miss = .drafts_open;
++    var buf: [40]u32 = undefined;
++    const t1 = conversation(3, 20, &buf);
++    var b1: Box = .{};
++    defer b1.tokens.deinit(gpa);
++    _ = try r.turn(t1, 6, &b1);
++    try std.testing.expectEqual(@as(u64, 0), r.store.reply.kept);
++    try std.testing.expectEqual(@as(u64, 1), r.store.reply.unkept.get(.drafts_open));
++    try std.testing.expectEqual(@as(usize, 1), r.store.entries.items.len);
++    var t2: std.ArrayList(u32) = .empty;
++    defer t2.deinit(gpa);
++    try followUp(t1, b1.tokens.items, &template_tail, &t2);
++    var b2: Box = .{};
++    defer b2.tokens.deinit(gpa);
++    _ = try r.turn(t2.items, 4, &b2);
++    try std.testing.expectEqual(@as(?u32, 18), b2.cached);
++    try expectReplies(t2.items, b2.tokens.items);
++    try std.testing.expectEqual(@as(u64, 1), r.store.reply.missed_unkept);
++}
++
++test "pcache reply: the kept state outlives its lane: another conversation reuses the lane before the follow-up resumes past the reply" {
++    var r: Rig = undefined;
++    try r.init(true, 1 << 20, 1);
++    defer r.deinit();
++    var buf_a: [40]u32 = undefined;
++    var buf_b: [40]u32 = undefined;
++    const a = conversation(4, 20, &buf_a);
++    const b = conversation(5, 30, &buf_b);
++    var ba: Box = .{};
++    defer ba.tokens.deinit(gpa);
++    _ = try r.turn(a, 6, &ba);
++    var bb: Box = .{};
++    defer bb.tokens.deinit(gpa);
++    _ = try r.turn(b, 9, &bb);
++    var t2: std.ArrayList(u32) = .empty;
++    defer t2.deinit(gpa);
++    try followUp(a, ba.tokens.items, &template_tail, &t2);
++    var b2: Box = .{};
++    defer b2.tokens.deinit(gpa);
++    _ = try r.turn(t2.items, 5, &b2);
++    try std.testing.expectEqual(@as(?u32, 25), b2.cached);
++    try expectReplies(t2.items, b2.tokens.items);
++    try std.testing.expectEqual(@as(u64, 1), r.store.reply.hits);
++}
++
++test "pcache reply: under memory pressure the budget evicts reply ends like any state, and the follow-up of an evicted one counts it and reads the reply again" {
++    var r: Rig = undefined;
++    try r.init(true, 3 * (64 + 4 * 40), 2);
++    defer r.deinit();
++    var bufs: [4][40]u32 = undefined;
++    var replies: [4]Box = @splat(.{});
++    defer for (&replies) |*x| x.tokens.deinit(gpa);
++    var prompts: [4][]u32 = undefined;
++    for (0..4) |c| {
++        prompts[c] = conversation(@intCast(10 + c), 24, &bufs[c]);
++        _ = try r.turn(prompts[c], 6, &replies[c]);
++    }
++    try std.testing.expect(r.store.reply.evicted > 0);
++    try std.testing.expect(r.store.held <= r.store.budget);
++    var t2: std.ArrayList(u32) = .empty;
++    defer t2.deinit(gpa);
++    try followUp(prompts[0], replies[0].tokens.items, &template_tail, &t2);
++    var b2: Box = .{};
++    defer b2.tokens.deinit(gpa);
++    _ = try r.turn(t2.items, 4, &b2);
++    try expectReplies(t2.items, b2.tokens.items);
++    try std.testing.expectEqual(@as(u64, 0), r.store.reply.hits);
++    try std.testing.expectEqual(@as(u64, 1), r.store.reply.missed_evicted);
++}
++
++test "pcache reply: the lane core asks for a reply's keep only for a stream that stopped or reached its length, never a cancelled or failed one" {
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.replying(), clock.clock());
++    defer core.deinit();
++    const Count = struct {
++        n: usize = 0,
++        fn kept(ctx: *anyopaque, _: *lanes.Stream) void {
++            const c: *@This() = @ptrCast(@alignCast(ctx));
++            c.n += 1;
++        }
++    };
++    var count: Count = .{};
++    core.reply = .{ .ctx = &count, .kept = Count.kept };
++    for ([_]struct { lanes.stream.Reason, bool, usize }{ .{ .cancelled, true, 0 }, .{ .@"error", true, 0 }, .{ .stop, false, 0 }, .{ .stop, true, 1 }, .{ .length, true, 2 } }) |c| {
++        var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 4 });
++        defer s.deinit(gpa);
++        s.reason = c[0];
++        s.finished = c[1];
++        core.release(&s);
++        try std.testing.expectEqual(c[2], count.n);
++    }
++}
+diff --git a/zig/src/core/lane_host_tests.zig b/zig/src/core/lane_host_tests.zig
+index ab38b0e3d892589ab93307e547cbe5b6d4cd5269..c5ec1d9a4948ebbf5519e66a4bf47eb13c097854 100644
+--- a/zig/src/core/lane_host_tests.zig
++++ b/zig/src/core/lane_host_tests.zig
+@@ -29,4 +29,5 @@ test {
+ 
+ test {
+     _ = @import("lane_activity_test.zig");
++    _ = @import("lane_host_reply_test.zig");
+ }
+diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
+index 2f672e5681187b240b995ac570853fa45f9755c7..937ed58dc43d0ec86885c2f54a142db833c22bd2 100644
+--- a/zig/src/core/lanes/backend.zig
++++ b/zig/src/core/lanes/backend.zig
+@@ -91,6 +91,7 @@ pub const Backend = struct {
+     pack_whole: u32 = 0,
+     mixed_queue: u32 = 0,
+     alone_debt: bool = false,
++    reply_keep: bool = false,
+     ptr: *anyopaque,
+     vtable: *const VTable,
+ 
+@@ -149,6 +150,7 @@ pub const Backend = struct {
+         first_masked: ?*const fn (ptr: *anyopaque, s: *Stream, position: u64, mask: []const u32) anyerror!u64 = null,
+         /// The stream's held drafts as host tokens in window order, waiting for the draft (a grammar walks them).
+         held: ?*const fn (ptr: *anyopaque, s: *Stream, out: []u32) anyerror!void = null,
++        reply_end: ?*const fn (ptr: *anyopaque, s: *Stream) ReplyEnd = null,
+         /// `prefill` fills `Stream.prompt_rows` for a stream with `prompt_logprobs` (it then starts from 0).
+         prompt_rows: bool = false,
+         /// The backend stores `Stream.fill_at` as its pass runs: the status reader may count its fill totals.
+@@ -170,6 +172,9 @@ pub const Backend = struct {
+     /// One stream's prompt rows [start, end) of a round (`save`: the prompt's snapshot right after them).
+     pub const Piece = struct { stream: *Stream, start: u64, end: u64, save: bool };
+ 
++    pub const ReplyMiss = enum { off, prompt_open, position, drafts_open, head_behind, failed };
++    pub const ReplyEnd = union(enum) { at: u32, miss: ReplyMiss };
++
+     /// `begin`'s outcome: restored prefix tokens, or a damaged saved entry dropped (the prompt runs from 0).
+     pub const Begun = struct { cached: u64 = 0, damaged: bool = false };
+ 
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index ccf553d0bb1895c97edde08a0a81b2bbb97ce0bc..c029496e975fc5ee10a368ed5204c68c8f2a2c6a 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -55,6 +55,9 @@ pub const Engine = struct {
+     unread: std.ArrayList(Unread) = .empty, // queued draws the log reads at the step's end
+     rows_log: @import("rows_log.zig").RowsLog = .{},
+     draft_dump: @import("draft_dump.zig").Dump = .{},
++    reply: ?Reply = null,
++
++    pub const Reply = struct { ctx: *anyopaque, kept: *const fn (ctx: *anyopaque, s: *Stream) void };
+ 
+     pub fn init(gpa: Allocator, cfg: *const Config, backend: be.Backend, clock: be.Clock) Engine {
+         return .{
+@@ -441,7 +444,7 @@ pub const Engine = struct {
+         }
+         const landed = try s.commit(e.gpa, committed.items, committed_rows);
+         const got = committed.items[0..landed];
+-        if (s.finished and got.len < path.len) path = path[0 .. got.len + 1];
++        if (s.finished and got.len < path.len) path = path[0 .. got.len + @intFromBool(e.reply == null or got.len == 0)];
+         const keep = path.len;
+         s.cache_len += keep;
+         s.pending = committed.items[keep - 1];
+@@ -612,6 +615,7 @@ pub const Engine = struct {
+         e.late.cancel(s);
+         if (e.cfg.lone_cost_tile > 0) lone_costs.keep(e.gpa, lone_costs.slot(&e.lone_kept, s), s) catch {};
+         if (s.inflight) |h| _ = e.backend.read(h) catch 0; // the handle frees the backend's ring slot
++        if (e.reply) |r| if (s.finished and (s.reason == .stop or s.reason == .length)) r.kept(r.ctx, s);
+         s.dropRoundState(e.gpa);
+         e.backend.release(s);
+     }
+diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
+index 8fadea28b62e23d3ea7c816fa243de3c4cff4db1..8915ec0f4f419e1c19f94aa7615f29081d2e22b3 100644
+--- a/zig/src/core/lanes/fake.zig
++++ b/zig/src/core/lanes/fake.zig
+@@ -95,6 +95,8 @@ pub const Fake = struct {
+     image_words: bool = false, // an image row feeds a word of its image's identity, as a tower's row would
+     image_rows: usize = 0, // image rows fed (`image_words`): the rows a tower had to make
+     gpu_charge: ?f64 = null, // each verify and step charges its streams this many GPU seconds, as a timed backend does
++    reply_miss: ?be.Backend.ReplyMiss = null,
++    reply_ends: usize = 0,
+ 
+     pub fn deinit(x: *Fake) void {
+         var it = x.lanes.valueIterator();
+@@ -114,6 +116,20 @@ pub const Fake = struct {
+         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .alternatives = alternatives, .held = heldDrafts, .reports_fill = true }, .chunk_invariant = true };
+     }
+ 
++    pub fn replying(x: *Fake) be.Backend {
++        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .alternatives = alternatives, .held = heldDrafts, .reports_fill = true, .reply_end = replyEnd }, .chunk_invariant = true, .reply_keep = true };
++    }
++
++    fn replyEnd(ptr: *anyopaque, s: *Stream) be.Backend.ReplyEnd {
++        const x = self(ptr);
++        x.reply_ends += 1;
++        if (x.reply_miss) |m| return .{ .miss = m };
++        const l = x.lanes.getPtr(s) orelse return .{ .miss = .position };
++        const at = l.history.items.len;
++        if (at != s.cache_len or s.context.items.len != at + 1) return .{ .miss = .position };
++        return .{ .at = @intCast(at) };
++    }
++
+     /// The same target taking several prompts in one pass (`prefill_many`).
+     pub fn batched(x: *Fake) be.Backend {
+         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_many = prefillMany, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true }, .chunk_invariant = true };
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index a153798c32fe82351f13292fb61e0859545923f1..de03dc327c7f6c851b1b1368a11b2e4ae89b8013 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -20,6 +20,7 @@ pub const Class = policy.Class;
+ pub const replay = @import("prompt_cache_replay.zig");
+ pub const kept_rows = @import("kept_rows.zig");
+ const sharing = @import("prompt_cache_share.zig");
++pub const reply = @import("prompt_cache_reply.zig");
+ 
+ /// A family's copy of one state.
+ pub const Saved = *anyopaque;
+@@ -116,6 +117,7 @@ pub const Entry = struct {
+     image_cut: bool = false,
+     below: ?*Entry = null,
+     kids: u32 = 0,
++    reply: bool = false,
+ };
+ 
+ pub const Counts = struct {
+@@ -187,6 +189,7 @@ pub const Store = struct {
+     explained: explain.Explain = .{},
+     share: bool = false,
+     branch: bool = false,
++    reply: reply.Reply = .{},
+ 
+     repeat_log: @import("prompt_cache_repeat.zig").Log = .{},
+     const SHARED_KEYS = 64;
+@@ -303,6 +306,7 @@ pub const Store = struct {
+             if (s.keeping.value and v.class == .idle) s.inflation = @max(s.inflation, keeping.worth(s, e));
+             if (s.keeping.explain) s.explained.record(s, e, v.class);
+         }
++        reply.evicted(s, s.entries.items[v.i]);
+         s.remove(v.i);
+         s.counts.evicted += 1;
+         return true;
+@@ -444,6 +448,7 @@ pub const Store = struct {
+         else
+             s.find(prompt, starts, spans);
+         if (e == null) s.counts.misses += 1;
++        reply.looked(s, prompt, e);
+         if (s.keeping.explain) if (explain.look(s, prompt, e, history_len, spans)) |l| explain.line(s, prompt.len, l);
+         const from = if (e) |x| x.at else 0;
+         const common_at = common.mark(s, prompt, from, starts);
+@@ -759,6 +764,7 @@ pub const Store = struct {
+         std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, refused {d}, failed {d})", .{ prompt, from, kept, s.entries.items.len, s.held >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.refused, s.counts.failed });
+         if (s.keeping.explain) explain.report(s);
+         if (s.share) sharing.report(s);
++        reply.report(s);
+         if (s.live or s.counts.lends + s.counts.lend_refused > 0) std.log.info("prompt cache live: {d} pinned ({d} MiB), {d} MiB lent; evicted {d} superseded, {d} idle, {d} live; pinned {d}, lends {d}, refused {d}", .{ s.pins.items.len, policy.pinnedBytes(s) >> 20, s.lent >> 20, s.counts.evicted_superseded, s.counts.evicted_idle, s.counts.evicted_live, s.counts.pinned, s.counts.lends, s.counts.lend_refused });
+     }
+ 
+@@ -806,4 +812,5 @@ test {
+     _ = @import("prompt_cache_share_test.zig");
+     _ = @import("prompt_cache_trace.zig");
+     _ = kept_rows;
++    _ = @import("prompt_cache_reply_test.zig");
+ }
+diff --git a/zig/src/core/prompt_cache_reply.zig b/zig/src/core/prompt_cache_reply.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..d537310a06566c3a4b121736a06a97fac35b047e
+--- /dev/null
++++ b/zig/src/core/prompt_cache_reply.zig
+@@ -0,0 +1,95 @@
++const std = @import("std");
++const pc = @import("prompt_cache.zig");
++
++pub const Why = enum { prompt_open, position, drafts_open, head_behind, failed, image, refused };
++
++pub const tail_words: usize = 64;
++const ring_len = 64;
++
++pub const Kind = enum { evicted, unkept };
++pub const Gone = struct { born: u32 = 0, len: u32 = 0, tail: u64 = 0, why: Kind = .evicted, used: bool = false };
++
++pub const Reply = struct {
++    on: bool = false,
++    kept: u64 = 0,
++    kept_rows: u64 = 0,
++    hits: u64 = 0,
++    hit_rows: u64 = 0,
++    diverged: u64 = 0,
++    short: u64 = 0,
++    evicted: u64 = 0,
++    missed_evicted: u64 = 0,
++    missed_unkept: u64 = 0,
++    unkept: std.EnumArray(Why, u64) = .initFill(0),
++    ring: [ring_len]Gone = @splat(.{}),
++    next: usize = 0,
++};
++
++pub fn tailOf(tokens: []const u32, born: u32) u64 {
++    const from = born -| @as(u32, @intCast(tail_words));
++    return std.hash.Wyhash.hash(born, std.mem.sliceAsBytes(tokens[from..born]));
++}
++
++fn remember(r: *Reply, born: u32, len: u32, tail: u64, why: Kind) void {
++    r.ring[r.next] = .{ .born = born, .len = len, .tail = tail, .why = why, .used = true };
++    r.next = (r.next + 1) % ring_len;
++}
++
++pub fn kept(s: *pc.Store, e: *pc.Entry) void {
++    if (!e.reply) {
++        e.reply = true;
++        s.reply.kept += 1;
++        s.reply.kept_rows += e.at -| e.born;
++    }
++}
++
++pub fn unkept(s: *pc.Store, tokens: []const u32, born: u32, why: Why) void {
++    if (!s.reply.on) return;
++    s.reply.unkept.getPtr(why).* += 1;
++    if (born == 0 or born > tokens.len) return;
++    remember(&s.reply, born, @intCast(tokens.len), tailOf(tokens, born), .unkept);
++}
++
++pub fn evicted(s: *pc.Store, e: *const pc.Entry) void {
++    if (!s.reply.on or !e.reply) return;
++    s.reply.evicted += 1;
++    if (e.born == 0 or e.born > e.tokens.len) return;
++    remember(&s.reply, e.born, @intCast(e.tokens.len), tailOf(e.tokens, e.born), .evicted);
++}
++
++fn extendsBorn(prompt: []const u32, born: u32, tail: u64) bool {
++    return born < prompt.len and tailOf(prompt, born) == tail;
++}
++
++pub fn looked(s: *pc.Store, prompt: []const u32, found: ?*const pc.Entry) void {
++    if (!s.reply.on) return;
++    if (found) |e| if (e.reply) {
++        s.reply.hits += 1;
++        s.reply.hit_rows += e.at -| e.born;
++        return;
++    };
++    const from = if (found) |e| e.at else 0;
++    for (s.entries.items) |o| {
++        if (o.expired or !o.reply or o.at <= from or o.born == 0) continue;
++        if (!extendsBorn(prompt, o.born, tailOf(o.tokens, o.born))) continue;
++        if (prompt.len < o.tokens.len and std.mem.eql(u32, prompt[o.born..], o.tokens[o.born..prompt.len])) s.reply.short += 1 else s.reply.diverged += 1;
++        return;
++    }
++    for (&s.reply.ring) |*g| {
++        if (!g.used or g.len > prompt.len or !extendsBorn(prompt, g.born, g.tail)) continue;
++        if (from >= g.len -| 1) continue;
++        switch (g.why) {
++            .evicted => s.reply.missed_evicted += 1,
++            .unkept => s.reply.missed_unkept += 1,
++        }
++        g.used = false;
++        return;
++    }
++}
++
++pub fn report(s: *const pc.Store) void {
++    if (@import("builtin").is_test or !s.reply.on) return;
++    const r = &s.reply;
++    const u = &r.unkept;
++    std.log.info("prompt cache reply ends: kept {d} ({d} reply rows), hits {d} ({d} rows not read again); a later turn missed one: diverged {d}, shorter {d}, evicted {d} (of {d} evicted), not kept {d}; not kept: prompt open {d}, position {d}, drafts open {d}, head behind {d}, failed {d}, image {d}, refused {d}", .{ r.kept, r.kept_rows, r.hits, r.hit_rows, r.diverged, r.short, r.missed_evicted, r.evicted, r.missed_unkept, u.get(.prompt_open), u.get(.position), u.get(.drafts_open), u.get(.head_behind), u.get(.failed), u.get(.image), u.get(.refused) });
++}
+diff --git a/zig/src/core/prompt_cache_reply_test.zig b/zig/src/core/prompt_cache_reply_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..7dfe7c85d6470c7274e0a4b0376285172e277906
+--- /dev/null
++++ b/zig/src/core/prompt_cache_reply_test.zig
+@@ -0,0 +1,56 @@
++const std = @import("std");
++const pc = @import("prompt_cache.zig");
++const reply = pc.reply;
++
++const Copies = struct {
++    live: usize = 0,
++    fn bytes(_: *anyopaque, at: u32) u64 {
++        return 16 + @as(u64, at);
++    }
++    fn save(p: *anyopaque, _: ?*anyopaque, at: u32) anyerror!pc.Saved {
++        const c: *Copies = @ptrCast(@alignCast(p));
++        c.live += 1;
++        return @ptrFromInt(0x1000 + @as(usize, at));
++    }
++    fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {}
++    fn drop(p: *anyopaque, _: pc.Saved) void {
++        const c: *Copies = @ptrCast(@alignCast(p));
++        c.live -= 1;
++    }
++};
++
++test "pcache reply: a lookup that resumes a reply end is a hit; one that extends its prompt but not its reply is counted once; a gone reply end's follow-up is counted by why it went" {
++    const gpa = std.testing.allocator;
++    var copies: Copies = .{};
++    var store = pc.Store.init(gpa, .{ .ptr = &copies, .vtable = &.{ .bytes = Copies.bytes, .save = Copies.save, .restore = Copies.restore, .drop = Copies.drop } }, .{ .lookahead = 1 }, 1 << 20);
++    defer store.deinit();
++    store.reply.on = true;
++    var words: [300]u32 = undefined;
++    for (&words, 0..) |*t, i| t.* = @intCast(i * 3 + 1);
++    const ended = words[0..131];
++    try std.testing.expect(store.keepBorn(ended, 100, 130, null, &.{}, &.{}));
++    reply.kept(&store, store.last_kept.?);
++    try std.testing.expectEqual(@as(u64, 30), store.reply.kept_rows);
++    const l = try store.lookup(gpa, words[0..200], 190, &.{}, &.{}, &.{});
++    defer gpa.free(l.marks);
++    try std.testing.expect(l.entry != null);
++    store.release(l.entry.?);
++    try std.testing.expectEqual(@as(u64, 1), store.reply.hits);
++    var other: [200]u32 = undefined;
++    @memcpy(other[0..110], words[0..110]);
++    for (other[110..], 0..) |*t, i| t.* = @intCast(900_000 + i);
++    const d = try store.lookup(gpa, &other, 190, &.{}, &.{}, &.{});
++    defer gpa.free(d.marks);
++    if (d.entry) |e| store.release(e);
++    try std.testing.expectEqual(@as(u64, 1), store.reply.diverged);
++    var third: [300]u32 = undefined;
++    for (&third, 0..) |*t, i| t.* = @intCast(500_000 + i * 5);
++    reply.unkept(&store, third[0..161], 140, .refused);
++    try std.testing.expectEqual(@as(u64, 1), store.reply.unkept.get(.refused));
++    for (0..2) |_| {
++        const g = try store.lookup(gpa, third[0..250], 240, &.{}, &.{}, &.{});
++        defer gpa.free(g.marks);
++        if (g.entry) |e| store.release(e);
++    }
++    try std.testing.expectEqual(@as(u64, 1), store.reply.missed_unkept);
++}
+diff --git a/zig/src/families/flashnext/cuda_knobs.zig b/zig/src/families/flashnext/cuda_knobs.zig
+index e7c919782c0644d1011166faa1681194ef70045d..c013a19bb6eebc7fe40791dcce594a6df0fa5b4b 100644
+--- a/zig/src/families/flashnext/cuda_knobs.zig
++++ b/zig/src/families/flashnext/cuda_knobs.zig
+@@ -697,6 +697,27 @@ pub const PcacheKeeping = struct { explain: bool = false, one_copy: bool = false
+ 
+ pub const anchor_least: u32 = 256;
+ 
++pub fn replyKeep() error{BadReplyKeep}!bool {
++    return onOff(envOf("TF_FLASHNEXT_REPLY_KEEP")) orelse error.BadReplyKeep;
++}
++
++test "TF_FLASHNEXT_REPLY_KEEP is off unset or 0, on at 1, refuses any other value, and leaves tp_flags alone" {
++    const env = @import("sys").env;
++    defer _ = env.unsetenv("TF_FLASHNEXT_REPLY_KEEP");
++    _ = env.unsetenv("TF_FLASHNEXT_REPLY_KEEP");
++    const flags = tpFlags();
++    try std.testing.expect(!try replyKeep());
++    _ = env.setenv("TF_FLASHNEXT_REPLY_KEEP", "0", 1);
++    try std.testing.expect(!try replyKeep());
++    _ = env.setenv("TF_FLASHNEXT_REPLY_KEEP", "1", 1);
++    try std.testing.expect(try replyKeep());
++    try std.testing.expectEqual(flags, tpFlags());
++    for ([_][:0]const u8{ "2", "on", "", "true" }) |bad| {
++        _ = env.setenv("TF_FLASHNEXT_REPLY_KEEP", bad, 1);
++        try std.testing.expectError(error.BadReplyKeep, replyKeep());
++    }
++}
++
+ pub fn pcacheShare() error{BadPcacheShare}!bool {
+     return onOff(envOf("TF_FLASHNEXT_PCACHE_SHARE")) orelse error.BadPcacheShare;
+ }
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 99ddb6708fc984b90104f471ee1ba6dc0884d5e8..f924e34f181644afec6e92575c6d559a213566af 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -19,6 +19,7 @@ const kvl = @import("cuda_kv_lanes.zig");
+ const knobs = @import("cuda_knobs.zig");
+ const mixed_plan = @import("cuda_mixed_plan.zig");
+ const beside_pack = @import("cuda_beside_pack.zig");
++const reply_end = @import("cuda_reply_end.zig");
+ const be = lanes.backend;
+ const aledger = lanes.alone_ledger;
+ const ring = 1024;
+@@ -249,6 +250,7 @@ pub fn Namespace(comptime Tri: type) type {
+             packed_rows: usize = 0,
+             beside_sums: beside_pack.Sums = .{ .scatter_bf16 = false, .exact = false },
+             queue_on: bool = false,
++            reply_keep: bool = false,
+             ledger_open_ns: u64 = 0,
+             ledger_blocking: bool = false,
+ 
+@@ -303,13 +305,14 @@ pub fn Namespace(comptime Tri: type) type {
+                     .draft_tops = draftTopsFn,
+                     .score = @import("cuda_score.zig").Hook(Cuda, Tri).call,
+                     .first_masked = firstMaskedFn,
++                    .reply_end = replyEndFn,
+                 };
+                 const ranked_table = comptime @import("cuda_score.zig").withoutScore(scoring_table);
+                 const scoring_many = comptime withSteps(scoring_table);
+                 const ranked_many = comptime withSteps(ranked_table);
+                 const many = knobs.promptMulti() catch false;
+                 const table = if (self.ranks == null) (if (many) &scoring_many else &scoring_table) else if (many) &ranked_many else &ranked_table;
+-                return .{ .ptr = self, .proposal_head = if (self.head) |h| &h.service else null, .whole_rows = self.overlap_rows, .ride = if (self.pace) .{ .least = @intCast(self.mixed_rows), .most = @intCast(self.overlap_room) } else .{}, .pack_whole = if (many) self.pack_whole else 0, .mixed_queue = if (self.queue_on) @intCast(self.waiting.depth) else 0, .alone_debt = self.beside_on, .vtable = table };
++                return .{ .ptr = self, .proposal_head = if (self.head) |h| &h.service else null, .whole_rows = self.overlap_rows, .ride = if (self.pace) .{ .least = @intCast(self.mixed_rows), .most = @intCast(self.overlap_room) } else .{}, .pack_whole = if (many) self.pack_whole else 0, .mixed_queue = if (self.queue_on) @intCast(self.waiting.depth) else 0, .alone_debt = self.beside_on, .reply_keep = self.reply_keep, .vtable = table };
+             }
+ 
+             /// `t` packing several streams' prompt pieces into one pass (TF_FLASHNEXT_PROMPT_MULTI).
+@@ -1482,6 +1485,25 @@ pub fn Namespace(comptime Tri: type) type {
+             return true;
+         }
+ 
++        fn replyEndFn(ptr: *anyopaque, s: *lanes.Stream) be.Backend.ReplyEnd {
++            const self = of(ptr);
++            if (!self.reply_keep) return .{ .miss = .off };
++            const l = self.lane(s) catch return .{ .miss = .position };
++            const d: ?reply_end.Draft = if (l.draft) |*x| .{ .open = x.open, .fed0 = x.fed0, .rows = x.rows, .len = x.len, .drafted = x.drafted } else null;
++            const step = reply_end.plan(.{ .prompt_open = l.filled != null or self.besideHolds(s) or self.waiting.holds(s), .fed = l.seq.fed, .cache_len = s.cache_len, .context = s.context.items.len, .draft = d });
++            const at = switch (step) {
++                .miss => |m| return .{ .miss = m },
++                .at => |a| a,
++            };
++            if (l.draft) |*x| {
++                if (at.roll > 0) self.ops().rollback(&l.seq, x, at.roll) catch return .{ .miss = .failed };
++                if (at.absorb > 0) self.ops().absorb(x, s.context.items[at.at + 1 - at.absorb .. at.at + 1], x.streams.ptr, false) catch return .{ .miss = .failed };
++                if (x.open or x.len -| x.drafted != at.at) return .{ .miss = .head_behind };
++            }
++            if (l.seq.fed != at.at) return .{ .miss = .position };
++            return .{ .at = at.at };
++        }
++
+         fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
+             const self = of(ptr);
+             if (self.besideHolds(s)) self.besideJoin() catch {};
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index a66a8050c4a90883f4c60b9719d586fd5522a2f8..942ddae30a1d3642eab4f6ea69d47cd08a2fc803 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -209,6 +209,8 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+         own.queue_on = own.mixed_last != .off and (try @import("cuda_knobs.zig").mixedQueue()) > 0;
+         if (own.queue_on) std.log.info("flashnext: mixed queue, up to {d} prompt pieces wait for decode rounds, one rides each round; a piece runs alone only when no stream decodes", .{own.waiting.depth});
+         own.pace = own.overlap_rows > 0 and try @import("cuda_knobs.zig").mixedPace();
++        own.reply_keep = try @import("cuda_knobs.zig").replyKeep();
++        if (own.reply_keep) std.log.info("flashnext: a finished reply keeps its lane's state for the turn that extends it (TF_FLASHNEXT_REPLY_KEEP; relaxed: decoded rows stand where a prompt pass would read them)", .{});
+         own.pack_whole = if (own.overlap_rows > 0) try @import("cuda_knobs.zig").prefillMany() else 0;
+         if (own.pack_whole > 0) std.log.info("flashnext: up to {d} prompts under {d} uncached rows share one prompt pass when they wait together", .{ own.pack_whole, own.overlap_rows });
+         if (own.pace) std.log.info("flashnext: paced mixed rounds, a riding piece of {d} to {d} rows sized to the decode share; prompts under {d} uncached rows run whole", .{ own.mixed_rows, own.overlap_room, own.overlap_rows });
+diff --git a/zig/src/families/flashnext/cuda_launch.zig b/zig/src/families/flashnext/cuda_launch.zig
+index fa87e94a62a1c37c15208b0167ae43bf73786a15..71aef452420661af3262ef211428c76f18a516a7 100644
+--- a/zig/src/families/flashnext/cuda_launch.zig
++++ b/zig/src/families/flashnext/cuda_launch.zig
+@@ -569,6 +569,7 @@ pub const fn_back = @import("cuda_fn_back.zig");
+ pub const gradient_gate = @import("cuda_gradient_gate.zig");
+ test {
+     _ = gradient_gate;
++    _ = @import("cuda_reply_end.zig");
+     _ = @import("rope_yarn_core_test.zig");
+ }
+ 
+diff --git a/zig/src/families/flashnext/cuda_reply_end.zig b/zig/src/families/flashnext/cuda_reply_end.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..137f07601d929498934c66eee9f95faf85137504
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_reply_end.zig
+@@ -0,0 +1,54 @@
++const std = @import("std");
++const lanes = @import("lanes");
++const Miss = lanes.backend.Backend.ReplyMiss;
++
++pub const Draft = struct { open: bool, fed0: usize, rows: usize, len: usize, drafted: usize };
++pub const Lane = struct { prompt_open: bool, fed: usize, cache_len: u64, context: usize, draft: ?Draft = null };
++pub const At = struct { at: u32, roll: usize = 0, absorb: usize = 0 };
++pub const Step = union(enum) { miss: Miss, at: At };
++
++pub fn plan(l: Lane) Step {
++    if (l.prompt_open) return .{ .miss = .prompt_open };
++    const at = l.cache_len;
++    if (at == 0 or at > std.math.maxInt(u32) or l.context != at + 1) return .{ .miss = .position };
++    const d = l.draft orelse return if (l.fed == at) .{ .at = .{ .at = @intCast(at) } } else .{ .miss = .position };
++    var out: At = .{ .at = @intCast(at) };
++    if (d.open) {
++        if (at <= d.fed0 or at - d.fed0 > d.rows) return .{ .miss = .drafts_open };
++        out.roll = @intCast(at - d.fed0);
++    } else if (l.fed != at) return .{ .miss = .position };
++    const head = d.len -| d.drafted;
++    if (head == at) return .{ .at = out };
++    if (head > at) return .{ .miss = .position };
++    if (head != d.fed0 or at - head > d.rows) return .{ .miss = .head_behind };
++    out.absorb = @intCast(at - head);
++    return .{ .at = out };
++}
++
++test "a reply's lane: settled at its last fed row, its open window rolled back to the kept rows, its head brought up from the window's rows" {
++    try std.testing.expectEqual(Step{ .miss = .prompt_open }, plan(.{ .prompt_open = true, .fed = 10, .cache_len = 10, .context = 11 }));
++    try std.testing.expectEqual(Step{ .at = .{ .at = 10 } }, plan(.{ .prompt_open = false, .fed = 10, .cache_len = 10, .context = 11 }));
++    try std.testing.expectEqual(Step{ .miss = .position }, plan(.{ .prompt_open = false, .fed = 10, .cache_len = 10, .context = 12 }));
++    try std.testing.expectEqual(Step{ .miss = .position }, plan(.{ .prompt_open = false, .fed = 9, .cache_len = 10, .context = 11 }));
++    try std.testing.expectEqual(Step{ .miss = .position }, plan(.{ .prompt_open = false, .fed = 0, .cache_len = 0, .context = 1 }));
++    const settled: Draft = .{ .open = false, .fed0 = 7, .rows = 4, .len = 10, .drafted = 0 };
++    try std.testing.expectEqual(Step{ .at = .{ .at = 10 } }, plan(.{ .prompt_open = false, .fed = 10, .cache_len = 10, .context = 11, .draft = settled }));
++    var chained = settled;
++    chained.len = 13;
++    chained.drafted = 3;
++    try std.testing.expectEqual(Step{ .at = .{ .at = 10 } }, plan(.{ .prompt_open = false, .fed = 10, .cache_len = 10, .context = 11, .draft = chained }));
++    const open: Draft = .{ .open = true, .fed0 = 7, .rows = 6, .len = 7, .drafted = 0 };
++    try std.testing.expectEqual(Step{ .at = .{ .at = 10, .roll = 3, .absorb = 3 } }, plan(.{ .prompt_open = false, .fed = 13, .cache_len = 10, .context = 11, .draft = open }));
++    var past = open;
++    past.rows = 2;
++    try std.testing.expectEqual(Step{ .miss = .drafts_open }, plan(.{ .prompt_open = false, .fed = 9, .cache_len = 10, .context = 11, .draft = past }));
++    var behind = settled;
++    behind.len = 5;
++    try std.testing.expectEqual(Step{ .miss = .head_behind }, plan(.{ .prompt_open = false, .fed = 10, .cache_len = 10, .context = 11, .draft = behind }));
++    var kept_rows = settled;
++    kept_rows.len = 7;
++    try std.testing.expectEqual(Step{ .at = .{ .at = 10, .absorb = 3 } }, plan(.{ .prompt_open = false, .fed = 10, .cache_len = 10, .context = 11, .draft = kept_rows }));
++    var ahead = settled;
++    ahead.len = 12;
++    try std.testing.expectEqual(Step{ .miss = .position }, plan(.{ .prompt_open = false, .fed = 10, .cache_len = 10, .context = 11, .draft = ahead }));
++}
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 6d62dcfb77935e0bb93076b60be3f6b0ebd49c4a..4fc0de833368945f383690bc13ce81cd261d603e 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -173,7 +173,7 @@ pub const Host = struct {
+     /// The family's backend, each call made with the context current on the calling thread.
+     fn backend(h: *Host) lanes.backend.Backend {
+         h.vtable = lane_backend.vtable(Host, h.inner.vtable.*);
+-        return .{ .ptr = h, .round_observer = h.inner.round_observer, .vtable = &h.vtable, .first_before_draft = h.inner.first_before_draft, .penalties = h.inner.penalties, .chunk_invariant = h.inner.chunk_invariant, .whole_rows = h.inner.whole_rows, .ride = h.inner.ride, .pack_whole = h.inner.pack_whole, .mixed_queue = h.inner.mixed_queue, .alone_debt = h.inner.alone_debt };
++        return .{ .ptr = h, .round_observer = h.inner.round_observer, .vtable = &h.vtable, .first_before_draft = h.inner.first_before_draft, .penalties = h.inner.penalties, .chunk_invariant = h.inner.chunk_invariant, .whole_rows = h.inner.whole_rows, .ride = h.inner.ride, .pack_whole = h.inner.pack_whole, .mixed_queue = h.inner.mixed_queue, .alone_debt = h.inner.alone_debt, .reply_keep = h.inner.reply_keep };
+     }
+ };
+ const refusals = @import("cuda_refusal.zig");
+diff --git a/zig/src/native/cuda_bound.zig b/zig/src/native/cuda_bound.zig
+index 6a05733fa69b9900135535094c50c3e065fe8877..fa20aedce1a0247585ca0505d3c69783ff1ff7c7 100644
+--- a/zig/src/native/cuda_bound.zig
++++ b/zig/src/native/cuda_bound.zig
+@@ -139,6 +139,12 @@ pub fn vtable(comptime H: type, v: be.Backend.VTable) be.Backend.VTable {
+                 return x.inner.vtable.held.?(x.inner.ptr, s, out);
+             }
+         }.f else null,
++        .reply_end = if (v.reply_end != null) struct {
++            fn f(p: *anyopaque, s: *lanes.Stream) be.Backend.ReplyEnd {
++                const x = H.bind(p);
++                return x.inner.vtable.reply_end.?(x.inner.ptr, s);
++            }
++        }.f else null,
+         .prompt_rows = v.prompt_rows,
+         .reports_fill = v.reports_fill, // the family's fill-progress reporting reaches the CUDA wrapper
+         .release = struct {
+@@ -297,6 +303,12 @@ test "each forwarded entry calls the family's entry of the same name, once" {
+                 Rec.hit(p, "held");
+             }
+         }.f,
++        .reply_end = struct {
++            fn f(p: *anyopaque, _: *S) be.Backend.ReplyEnd {
++                Rec.hit(p, "reply_end");
++                return .{ .miss = .off };
++            }
++        }.f,
+         .release = struct {
+             fn f(p: *anyopaque, _: *S) void {
+                 Rec.hit(p, "release");
+@@ -364,6 +376,8 @@ test "each forwarded entry calls the family's entry of the same name, once" {
+     try rec.once("score");
+     try w.held.?(p, &s, &out);
+     try rec.once("held");
++    _ = w.reply_end.?(p, &s);
++    try rec.once("reply_end");
+     w.release(p, &s);
+     try rec.once("release");
+ }
+diff --git a/zig/tests/cuda/flashnext_reply_keep_tests.zig b/zig/tests/cuda/flashnext_reply_keep_tests.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a00ba0f102aa23e9f95616c2efca1ab36cf7bdf
+--- /dev/null
++++ b/zig/tests/cuda/flashnext_reply_keep_tests.zig
+@@ -0,0 +1,338 @@
++const std = @import("std");
++const cuda = @import("cuda");
++const flash = @import("flashnext");
++const check = @import("check.zig");
++const prompt = flash.prompt;
++const mtp = flash.mtp;
++const Session = flash.rank_engine.Session;
++
++const depth = mtp.default_depth;
++const row = prompt.vocabulary * 2;
++const lengths = [_]usize{ 700, 1300, 2100, 3000 };
++const tail = [_]u32{ 151645, 198, 151644, 872, 198, 151644, 77091, 198 };
++const user_tokens = 300;
++const greedy = 64;
++pub const least_context: usize = 262_144;
++
++const Rig = struct {
++    gpu: check.Gpu,
++    stream: cuda.Stream,
++    glue: flash.Glue,
++    session: ?*Session = null,
++    e: *prompt.Engine,
++    head: ?*mtp.Head = null,
++    out: cuda.DeviceBuffer,
++    host: []u8,
++    identity: flash.rank_engine.Identity,
++    rank: usize,
++    context: usize,
++
++    fn init(r: *Rig, gpu: check.Gpu, dir: []const u8, rank: usize, context: usize) !void {
++        r.gpu = gpu;
++        r.rank = rank;
++        r.context = context;
++        r.session = null;
++        r.head = null;
++        r.stream = try cuda.Stream.init(gpu.d, true);
++        errdefer r.stream.deinit();
++        r.glue = try flash.Glue.load(gpu.d);
++        errdefer r.glue.deinit();
++        const chunk = try flash.chunk_rows.soloRows(try flash.chunk_rows.chunkRowsAt(2));
++        r.identity = try flash.rank_engine.identity(gpu.gpa, gpu.io, dir, context, chunk);
++        r.identity.mtp = 1;
++        r.e = try prompt.Engine.initRank(gpu.gpa, gpu.io, @constCast(gpu.d), &r.stream, dir, 2, rank);
++        errdefer r.e.deinit();
++        if (r.e.chunk != chunk) return error.EngineChunk;
++        _ = try r.e.reserve(@min(context, r.e.chunk));
++        r.out = try cuda.DeviceBuffer.alloc(gpu.d, mtp.max_rows * row);
++        errdefer r.out.free();
++        r.host = try gpu.gpa.alloc(u8, mtp.max_rows * row);
++        errdefer gpu.gpa.free(r.host);
++        if (rank == 0) r.head = try mtp.Head.init(gpu.gpa, gpu.io, @constCast(gpu.d), &r.stream, dir);
++    }
++
++    fn open(r: *Rig, port: u16) !void {
++        mtp.Draft.late_on = mtp.Draft.lateWanted() orelse true;
++        const s = try Session.init(r.gpu.gpa, r.gpu.io, @import("flashnext_rank_tests.zig").rankHost(), port, r.rank, r.identity, flash.rank_engine.linkWait());
++        errdefer {
++            s.poison();
++            s.deinit();
++        }
++        s.engine = r.e;
++        r.e.collective = &s.collective;
++        if (flash.knobs.tpRoce()) try s.collective.openRoce(r.gpu.gpa, r.gpu.io, r.gpu.d, true, try flash.knobs.tpRoceMaxBytes());
++        r.session = s;
++    }
++
++    fn close(r: *Rig) void {
++        if (r.session) |s| s.deinit();
++        r.session = null;
++        mtp.Draft.late_on = false;
++    }
++
++    fn deinit(r: *Rig) void {
++        r.close();
++        if (r.head) |h| h.deinit();
++        r.e.deinit();
++        r.gpu.gpa.free(r.host);
++        r.out.free();
++        r.glue.deinit();
++        r.stream.deinit();
++    }
++
++    fn tri(r: *Rig) flash.Tri {
++        return .{ .s = r.stream, .own = &r.glue };
++    }
++
++    fn ops(r: *Rig) mtp.Ops(flash.Tri) {
++        return .{ .e = r.e, .tri = r.tri(), .h = r.head.?, .main = .{ .ptr = r, .forward = forward, .verify = verify, .rollback = rollback, .rollback_many = rollbackMany } };
++    }
++
++    fn of(p: *anyopaque) *Rig {
++        return @ptrCast(@alignCast(p));
++    }
++    fn forward(p: *anyopaque, q: *prompt.Seq, ids: []const u32, hooks: prompt.batch.Hooks) anyerror!void {
++        const r = of(p);
++        return r.session.?.forward(flash.Tri, r.tri(), q, ids, hooks);
++    }
++    fn verify(p: *anyopaque, q: *prompt.Seq, d: *mtp.Draft, ids: []const u32) anyerror!void {
++        const r = of(p);
++        return r.session.?.verify(flash.Tri, r.tri(), q, d, ids);
++    }
++    fn rollback(p: *anyopaque, q: *prompt.Seq, d: *mtp.Draft, keep: usize) anyerror!void {
++        const r = of(p);
++        return r.session.?.keep(flash.Tri, r.tri(), q, d, keep);
++    }
++    fn rollbackMany(p: *anyopaque, qs: []const *prompt.Seq, ds: []const *mtp.Draft, keeps: []const usize) anyerror!void {
++        const r = of(p);
++        return r.session.?.keepMany(flash.Tri, r.tri(), qs, ds, keeps);
++    }
++};
++
++const Lane = struct {
++    q: prompt.Seq,
++    d: mtp.Draft,
++
++    fn make(r: *Rig) !Lane {
++        const s = r.session.?;
++        var q = try s.create(r.context);
++        errdefer s.drop(&q);
++        const d = try mtp.Draft.init(r.gpu.gpa, r.e.driver, r.stream, r.context, r.head.?.ids.len, r.e.chunk, r.e.heads);
++        return .{ .q = q, .d = d };
++    }
++
++    fn free(l: *Lane, r: *Rig) void {
++        l.d.deinit();
++        r.session.?.drop(&l.q);
++    }
++};
++
++fn seedOf(gpu: check.Gpu, ids_path: []const u8) !std.ArrayList(u32) {
++    const source = try std.Io.Dir.cwd().readFileAlloc(gpu.io, ids_path, gpu.gpa, .limited(1 << 20));
++    defer gpu.gpa.free(source);
++    var seed: std.ArrayList(u32) = .empty;
++    errdefer seed.deinit(gpu.gpa);
++    var words = std.mem.tokenizeAny(u8, source, " \r\n\t");
++    while (words.next()) |word| try seed.append(gpu.gpa, try std.fmt.parseInt(u32, word, 10));
++    if (seed.items.len < 16) return error.BadPrompt;
++    return seed;
++}
++
++fn bf16(v: u16) f32 {
++    return @bitCast(@as(u32, v) << 16);
++}
++
++fn best(bytes: []const u8) u32 {
++    const v = std.mem.bytesAsSlice(u16, bytes);
++    var at: usize = 0;
++    var top = -std.math.inf(f32);
++    for (v, 0..) |x, i| {
++        const f = bf16(x);
++        if (f > top) {
++            top = f;
++            at = i;
++        }
++    }
++    return @intCast(at);
++}
++
++const Compare = struct { same: bool, max_abs: f64, kl: f64, top1: bool };
++
++fn compare(a: []const u8, b: []const u8) Compare {
++    const va = std.mem.bytesAsSlice(u16, a);
++    const vb = std.mem.bytesAsSlice(u16, b);
++    var ma: f64 = -std.math.inf(f64);
++    var mb: f64 = -std.math.inf(f64);
++    var max_abs: f64 = 0;
++    for (va, vb) |x, y| {
++        const fx: f64 = bf16(x);
++        const fy: f64 = bf16(y);
++        ma = @max(ma, fx);
++        mb = @max(mb, fy);
++        max_abs = @max(max_abs, @abs(fx - fy));
++    }
++    var za: f64 = 0;
++    var zb: f64 = 0;
++    for (va, vb) |x, y| {
++        za += @exp(@as(f64, bf16(x)) - ma);
++        zb += @exp(@as(f64, bf16(y)) - mb);
++    }
++    var kl: f64 = 0;
++    for (va, vb) |x, y| {
++        const la = @as(f64, bf16(x)) - ma - @log(za);
++        const lb = @as(f64, bf16(y)) - mb - @log(zb);
++        kl += @exp(lb) * (lb - la);
++    }
++    return .{ .same = std.mem.eql(u8, a, b), .max_abs = max_abs, .kl = @max(0, kl), .top1 = best(a) == best(b) };
++}
++
++fn readRest(r: *Rig, l: *Lane, ids: []const u32, from: usize) !void {
++    return readRange(r, l, ids, from, ids.len);
++}
++
++fn readRange(r: *Rig, l: *Lane, ids: []const u32, from: usize, to: usize) !void {
++    const ops = r.ops();
++    var at = from;
++    while (at < to) {
++        const stop = @min(to, at + @min(r.e.chunk, l.d.rows_cap));
++        try ops.prefillChunk(&l.q, &l.d, ids, at, stop);
++        at = stop;
++    }
++}
++
++fn decodeReply(r: *Rig, l: *Lane, p: []const u32, n: usize, reply: *std.ArrayList(u32)) !void {
++    const gpa = r.gpu.gpa;
++    const s = r.session.?;
++    const ops = r.ops();
++    try ops.prefill(&l.q, &l.d, p);
++    var follow: [mtp.max_rows]u32 = undefined;
++    follow[0] = best(l.q.logits[0..row]);
++    var nf: usize = 1;
++    try reply.append(gpa, follow[0]);
++    var chain: mtp.Chain = .{};
++    var fresh = true;
++    var window: [mtp.max_rows]u32 = undefined;
++    while (reply.items.len < n) {
++        const count = @min(depth, l.q.cap - l.q.fed - 1);
++        try ops.draft(&l.d, follow[0..nf], if (fresh) l.d.prompt_last else l.d.streams.ptr, l.q.fed + 1, count, null, mtp.default_confidence, &chain);
++        fresh = false;
++        window[0] = follow[nf - 1];
++        @memcpy(window[1..][0..chain.n], chain.slice());
++        const nw = 1 + chain.n;
++        var qs = [_]*prompt.Seq{&l.q};
++        var ds = [_]*mtp.Draft{&l.d};
++        const idss = [_][]const u32{window[0..nw]};
++        try s.verifyMany(flash.Tri, r.tri(), &qs, &ds, &idss, r.out.ptr);
++        try r.stream.synchronize();
++        const scores = r.host[0 .. nw * row];
++        try r.gpu.d.check(r.gpu.d.api.cuMemcpyDtoH_v2(scores.ptr, r.out.ptr, scores.len), "cuMemcpyDtoH");
++        var kept: usize = 0;
++        while (true) {
++            const g = best(scores[kept * row ..][0..row]);
++            follow[kept] = g;
++            kept += 1;
++            if (kept == nw or window[kept] != g) break;
++        }
++        kept = @min(kept, n - reply.items.len);
++        try reply.appendSlice(gpa, follow[0..kept]);
++        nf = kept;
++        var keeps = [_]usize{kept};
++        try s.keepMany(flash.Tri, r.tri(), &qs, &ds, &keeps);
++    }
++    const at = p.len + reply.items.len - 1;
++    if (l.q.fed != at) return error.ReplyPosition;
++    if (l.d.len -| l.d.drafted < at) try ops.absorb(&l.d, follow[0..nf], l.d.streams.ptr, false);
++    if (l.d.len -| l.d.drafted != at) return error.HeadBehind;
++    if (l.d.pending != 0) try ops.flushLate(&l.q, &l.d);
++}
++
++fn greedyRun(r: *Rig, l: *Lane, out: []u32) !void {
++    const s = r.session.?;
++    var t = best(l.q.logits[0..row]);
++    for (out) |*o| {
++        o.* = t;
++        var qs = [_]*prompt.Seq{&l.q};
++        try s.round(flash.Tri, r.tri(), &qs, &.{t}, r.out.ptr);
++        try r.stream.synchronize();
++        try r.gpu.d.check(r.gpu.d.api.cuMemcpyDtoH_v2(r.host.ptr, r.out.ptr, row), "cuMemcpyDtoH");
++        t = best(r.host[0..row]);
++    }
++}
++
++pub fn run(gpu: check.Gpu, dir: []const u8, rank: usize, port: u16, ids_path: []const u8, reply_len: usize, context: usize) !void {
++    if (context < least_context) return error.ContextUnder262144;
++    if (reply_len < 2 or reply_len > 2048) return error.BadReply;
++    var seed = try seedOf(gpu, ids_path);
++    defer seed.deinit(gpu.gpa);
++    var r: Rig = undefined;
++    try r.init(gpu, dir, rank, context);
++    defer r.deinit();
++    try r.open(port);
++    defer r.close();
++    const s = r.session.?;
++    if (rank == 1) {
++        try s.follow(flash.Tri, r.tri(), r.out.ptr);
++        check.pass("rank 1 followed every reply's decode, save, restore and both follow-up reads", .{});
++        return;
++    }
++    const gpa = gpu.gpa;
++    var same_logits: usize = 0;
++    var top1: usize = 0;
++    var greedy_same: usize = 0;
++    var kl_sum: f64 = 0;
++    var kl_max: f64 = 0;
++    var abs_max: f64 = 0;
++    var first_diff_sum: usize = 0;
++    var kept_bytes: u64 = 0;
++    for (lengths, 0..) |len, c| {
++        const p = try gpa.alloc(u32, len);
++        defer gpa.free(p);
++        for (p, 0..) |*t, j| t.* = seed.items[(c * 31 + j * 7) % seed.items.len];
++        var reply: std.ArrayList(u32) = .empty;
++        defer reply.deinit(gpa);
++        var live = try Lane.make(&r);
++        defer live.free(&r);
++        try decodeReply(&r, &live, p, reply_len, &reply);
++        const at = live.q.fed;
++        const snap = try s.save(&live.q, &live.d);
++        defer s.dropSaved(snap);
++        kept_bytes = @max(kept_bytes, snap.buf.len);
++        var follow_up: std.ArrayList(u32) = .empty;
++        defer follow_up.deinit(gpa);
++        try follow_up.appendSlice(gpa, p);
++        try follow_up.appendSlice(gpa, reply.items);
++        try follow_up.appendSlice(gpa, &tail);
++        for (0..user_tokens) |j| try follow_up.append(gpa, seed.items[(c * 17 + j * 13 + 5) % seed.items.len]);
++        const f = follow_up.items;
++        var kept = try Lane.make(&r);
++        defer kept.free(&r);
++        try s.restore(&kept.q, &kept.d, snap);
++        if (kept.q.fed != at or kept.d.len != at) return error.RestorePosition;
++        try readRest(&r, &kept, f, at);
++        try readRest(&r, &live, f, at);
++        try check.sameBytes("the live lane read on equals the kept state restored and read on", live.q.logits[0..row], kept.q.logits[0..row]);
++        var reread = try Lane.make(&r);
++        defer reread.free(&r);
++        reread.d.reset();
++        try readRange(&r, &reread, f, 0, p.len - 1);
++        try readRest(&r, &reread, f, p.len - 1);
++        const cmp = compare(kept.q.logits[0..row], reread.q.logits[0..row]);
++        var a: [greedy]u32 = undefined;
++        var b: [greedy]u32 = undefined;
++        try greedyRun(&r, &kept, &a);
++        try greedyRun(&r, &reread, &b);
++        const diff = std.mem.indexOfDiff(u32, &a, &b);
++        same_logits += @intFromBool(cmp.same);
++        top1 += @intFromBool(cmp.top1);
++        greedy_same += @intFromBool(diff == null);
++        first_diff_sum += diff orelse greedy;
++        kl_sum += cmp.kl;
++        kl_max = @max(kl_max, cmp.kl);
++        abs_max = @max(abs_max, cmp.max_abs);
++        std.debug.print("REPLY-KEEP conv={d} prompt={d} reply={d} at={d} follow_up={d} logits_equal={} max_abs={d:.5} kl={e:.3} top1={} greedy64_equal={} first_diff={?d} kept_mib={d:.1}\n", .{ c, p.len, reply.items.len, at, f.len, cmp.same, cmp.max_abs, cmp.kl, cmp.top1, diff == null, diff, @as(f64, @floatFromInt(snap.buf.len)) / (1 << 20) });
++    }
++    const n = lengths.len;
++    const verdict = if (same_logits == n and greedy_same == n) "exact" else "relaxed";
++    check.pass("{d} replies of {d} tokens: the kept decode state against the re-read: first-token logits byte-equal {d}/{d}, top-1 {d}/{d}, 64 greedy tokens equal {d}/{d}", .{ n, reply_len, same_logits, n, top1, n, greedy_same, n });
++    std.debug.print("BENCH reply-keep verdict={s} convs={d} reply={d} logits_equal={d} top1={d} greedy64_equal={d} kl_mean={e:.3} kl_max={e:.3} max_abs={d:.5} first_diff_mean={d:.1} kept_mib_max={d:.1}\n", .{ verdict, n, reply_len, same_logits, top1, greedy_same, kl_sum / @as(f64, @floatFromInt(n)), kl_max, abs_max, @as(f64, @floatFromInt(first_diff_sum)) / @as(f64, @floatFromInt(n)), @as(f64, @floatFromInt(kept_bytes)) / (1 << 20) });
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index c8dca3b184a00769743e86334aec288d5485845f..ce0a6a86ee0331c48c72a233751f1d65547c25d7 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -181,6 +181,7 @@ const usage =
+     \\  flashnext-lanes-any-bench MODEL RANK PORT IDS_FILE STREAMS ROUNDS REPS  two-rank ms a decode round with TF_FLASHNEXT_ATTN_LANES_ANY off and on, REPS alternating session pairs (ports PORT..PORT+2*REPS-1), medians
+     \\  flashnext-attn-lanes-q  TF_FLASHNEXT_ATTN_LANES_ANY's quantized one-launch attention (fp8, nvfp4, fp8k_nvfp4v; whole and half heads) against the per-lane kernels, bit for bit
+     \\  flashnext-keep-late MODEL RANK PORT IDS_FILE [ROUNDS]  two-rank TF_FLASHNEXT_TP_KEEP_LATE (pending DeltaNet rows, `_h8` log kernels): 8 and 16 streams' greedy MTP decode, ROUNDS rounds (default 300), a save and restore halfway, off then on (ports PORT, PORT+1): every token and every round's window scores byte-equal; ms a round each
++    \\  flashnext-reply-keep MODEL RANK PORT IDS_FILE [REPLY] [CONTEXT]  two-rank TF_FLASHNEXT_REPLY_KEEP: four prompts (700 to 3000 tokens) each decode REPLY tokens (default 192) greedily in MTP windows, the finished lane settled and saved on both ranks; its follow-up (prompt, reply, an 8-token template tail, 300 new tokens) read from the kept state against the live lane (byte-equal or FAIL) and against today's re-read from the prompt's end: first-token logits equal, max |diff|, KL, top-1 and 64 greedy tokens each, and a verdict line (exact or relaxed); CONTEXT at least 262144 (default)
+     \\  flashnext-keep-late-bench MODEL RANK PORT IDS_FILE STREAMS ROUNDS REPS  two-rank ms a decode round with TF_FLASHNEXT_TP_KEEP_LATE off and on, REPS pairs of sessions (ports PORT to PORT+2*REPS-1), medians
+     \\  flashnext-prompt-frame MODEL RANK PORT IDS_FILE  two-rank TF_FLASHNEXT_TP_PROMPT_FRAME with TF_FLASHNEXT_GDN_CHUNKED=1 (both ranks): rank 1 takes the chunked chain, repeats, stays in bound of the fused chain; ms per 1536-row chunk-equivalent
+     \\  flashnext-tp-small MODEL RANK PORT IDS_FILE  two-rank TF_FLASHNEXT_TP_SEQPAR_MIN_ROWS / TF_FLASHNEXT_TP_PLE_PEER (both ranks, as given): 300 to 1500-row prompt passes after an 82k cached context (TF_TP_SMALL_TEST_CACHED) match the knobs-off bytes; ms a pass and per 1536-row chunk-equivalent each arm
+@@ -515,6 +516,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "flashnext-pshare")) return @import("flashnext_pshare_tests.zig").run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3));
+     if (std.mem.eql(u8, cmd, "flashnext-pshare-ride")) return @import("flashnext_pshare_ride_tests.zig").run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3));
+     if (std.mem.eql(u8, cmd, "flashnext-keep-late")) return @import("flashnext_keep_late_tests.zig").run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3), if (rest.len > 4) try std.fmt.parseInt(usize, rest[4], 10) else 300);
++    if (std.mem.eql(u8, cmd, "flashnext-reply-keep")) return @import("flashnext_reply_keep_tests.zig").run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3), if (rest.len > 4) try std.fmt.parseInt(usize, rest[4], 10) else 192, if (rest.len > 5) try std.fmt.parseInt(usize, rest[5], 10) else @import("flashnext_reply_keep_tests.zig").least_context);
+     if (std.mem.eql(u8, cmd, "flashnext-keep-late-bench")) return @import("flashnext_keep_late_tests.zig").bench(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3), try std.fmt.parseInt(usize, try arg(rest, 4), 10), try std.fmt.parseInt(usize, try arg(rest, 5), 10), try std.fmt.parseInt(usize, try arg(rest, 6), 10));
+     if (std.mem.eql(u8, cmd, "flashnext-prompt-pool")) return @import("flashnext_prompt_pool_tests.zig").run(gpu, if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else 8);
+     if (std.mem.eql(u8, cmd, "flashnext-seq-keep")) return flashnext_seq_keep_tests.run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3));

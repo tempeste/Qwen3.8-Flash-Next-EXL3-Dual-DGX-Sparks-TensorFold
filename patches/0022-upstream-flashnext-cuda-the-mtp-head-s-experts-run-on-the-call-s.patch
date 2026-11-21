@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=BCrgen=20Schmied?=
+ <600316+jschmied@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 18:51:22 +0000
+Subject: [PATCH 22/33] flashnext cuda: the MTP head's experts run on the
+ call's last row only
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Upstream TensorFold commit by Jürgen Schmied, ported onto this series (upstream main b5c96c53346c).
+
+forwardHead writes the head's cache for every row, but only the last row of a call reaches d.out:
+the attention and its write-back stay over all rows, and the experts, their write-back and the
+copy out run on that row alone, moved to row 0 as the scores path already does. Prompt chunks and
+absorbed rounds no longer run the head's MoE on rows nothing reads.
+
+On a GB10 (FP4-Local, --parallel 1, A B B A fresh servers): TTFT -0.8 % at 6k and -0.5 % at
+24k tokens (every new run below every old one); six greedy replies and their drafted and accepted
+counts are equal.
+
+(cherry picked from commit b5c96c53346c9efe6b828587d545093c1841cb09)
+---
+ zig/src/families/flashnext/cuda_mtp_ops.zig | 25 ++++++++++++---------
+ 1 file changed, 14 insertions(+), 11 deletions(-)
+
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index 9088cb1a4fa2775d7d88a81062755a6a268c4fda..0ff186b7b2392b5166a32c2941dfd35f1cb4dc2e 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -286,19 +286,22 @@ pub fn Ops(comptime Tri: type) type {
+                     continue;
+                 }
+                 try tri.hcWriteback(s.h, s.h, s.pss, s.part, "*fp32", s.inj, s.dummy, "*bf16", s.dummy, "*bf16", m * dims, m, dims, streams, 4, 1, 1, p.out_slices);
+-                try p.readout(h.layer.mlp_hc, 0, m);
+-                try p.moeBlock(&h.layer);
+-                p.pending = 0;
+-                try p.writeback(0, m);
+-                try p.copy(d.out.ptr, s.h + (m - 1) * wide * 2, wide * 2);
+                 d.len += m;
+                 at += m;
+-                if (at == next.len and scores) {
+-                    // the last row's streams and sums at row 0, where the captured kernels' pointers stay aligned
+-                    if (m > 1) {
+-                        try p.copy(s.h, s.h + (m - 1) * wide * 2, wide * 2);
+-                        try p.copy(s.pss, s.pss + (m - 1) * pss_n * 4, pss_n * 4);
+-                    }
++                // the cache is written; only the call's last row reaches d.out, so the experts run on it alone
++                if (at < next.len) continue;
++                if (m > 1) {
++                    try p.copy(s.h, s.h + (m - 1) * wide * 2, wide * 2);
++                    try p.copy(s.pss, s.pss + (m - 1) * pss_n * 4, pss_n * 4);
++                    p.rows = 1;
++                }
++                try p.readout(h.layer.mlp_hc, 0, 1);
++                try p.moeBlock(&h.layer);
++                p.pending = 0;
++                try p.writeback(0, 1);
++                try p.copy(d.out.ptr, s.h, wide * 2);
++                if (scores) {
++                    // the last row's streams and sums are at row 0, where the captured kernels' pointers stay aligned
+                     try p.readout(h.mixer, 0, 1);
+                     try h.project(&p, s.mixed, s.xsm, d.dlogits.ptr, 1);
+                 }

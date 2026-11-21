@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tempeste <tempeste@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 19:45:40 +0000
+Subject: [PATCH 27/33] prompt cache: the newest-state eviction order is opt-in
+ (TENSORFOLD_PCACHE_NEWEST=1)
+
+Keeps the previous eviction order unless TENSORFOLD_PCACHE_NEWEST=1, so the upstream port in the patch before this
+one changes nothing by default; cache tests run under both orders.
+
+Changes, in the order they were made:
+- tests: the pocket fake answers the staged download's device query; cache tests under both orders
+- prompt cache: serve the old eviction order unless TENSORFOLD_PCACHE_NEWEST=1
+---
+ zig/src/core/prompt_cache_keeping_test.zig    | 12 +++--
+ zig/src/core/prompt_cache_live_test.zig       | 47 ++++++++++---------
+ .../families/flashnext/cuda_pocket_test.zig   | 10 ++++
+ zig/src/native/cuda.zig                       |  2 +-
+ zig/src/native/cuda_snaps.zig                 |  2 +-
+ 5 files changed, 44 insertions(+), 29 deletions(-)
+
+diff --git a/zig/src/core/prompt_cache_keeping_test.zig b/zig/src/core/prompt_cache_keeping_test.zig
+index 1af31d7fc13976e39d0ee3c9488977cbfc542b82..db451650ba733df8d08aa6c90418a74f9a6cedf9 100644
+--- a/zig/src/core/prompt_cache_keeping_test.zig
++++ b/zig/src/core/prompt_cache_keeping_test.zig
+@@ -24,20 +24,21 @@ test "pcache keeping: one_copy evicts a request's shorter state beside its longe
+     const b = convo(&bufs[0], 2, 0);
+     const a = convo(&bufs[1], 1, 0);
+     const c = convo(&bufs[2], 3, 0);
+-    for ([_]bool{ false, true }) |on| {
++    for ([_]bool{ false, true }) |newest| for ([_]bool{ false, true }) |on| {
+         var f: Fake = .{ .gpa = gpa };
+         var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0, .lookahead = 1 }, (100 + 1500) + (100 + 1200) + (100 + 1500) + 50);
+         defer s.deinit();
++        s.newest = newest;
+         s.keeping.one_copy = on;
+         try std.testing.expect(keepBornAt(&f, &s, b, 1999, 1500));
+         try std.testing.expect(keepBornAt(&f, &s, a, 1999, 1200));
+         try std.testing.expect(keepBornAt(&f, &s, a, 1999, 1500));
+         try std.testing.expect(keepBornAt(&f, &s, c, 1999, 1100));
+-        try std.testing.expectEqual(on, has(&s, b, 1500));
+-        try std.testing.expectEqual(!on, has(&s, a, 1200));
++        try std.testing.expectEqual(on or newest, has(&s, b, 1500));
++        try std.testing.expectEqual(!(on or newest), has(&s, a, 1200));
+         try std.testing.expect(has(&s, a, 1500) and has(&s, c, 1100));
+-        try std.testing.expectEqual(@as(u64, if (on) 1 else 0), s.counts.evicted_shadowed);
+-    }
++        try std.testing.expectEqual(@as(u64, if (on and !newest) 1 else 0), s.counts.evicted_shadowed);
++    };
+ }
+ 
+ test "pcache keeping: a warm end that the next turns pass by is the copy one_copy drops, a warm end they resume keeps it" {
+@@ -51,6 +52,7 @@ test "pcache keeping: a warm end that the next turns pass by is the copy one_cop
+         var f: Fake = .{ .gpa = gpa };
+         var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0, .lookahead = 1 }, 1 << 30);
+         defer s.deinit();
++        s.newest = false;
+         s.keeping.one_copy = true;
+         try std.testing.expect(keepBornAt(&f, &s, a, 1600, 1500));
+         try std.testing.expect(keepBornAt(&f, &s, a, 1600, 2500));
+diff --git a/zig/src/core/prompt_cache_live_test.zig b/zig/src/core/prompt_cache_live_test.zig
+index bd1c53e9abc8d67f6cb742b643bde26aa6cda5a2..a845829b670487aec9a4a25d42c9b2d61c05b816 100644
+--- a/zig/src/core/prompt_cache_live_test.zig
++++ b/zig/src/core/prompt_cache_live_test.zig
+@@ -82,28 +82,31 @@ test "pcache live: superseded states go before idle ones, idle ones before live
+     const a = convo(&bufs[0], 1, 128);
+     const b = convo(&bufs[1], 2, 128);
+     const c = convo(&bufs[2], 3, 128);
+-    var f: Fake = .{ .gpa = gpa };
+-    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 200 + 160 + 200 + 180 + 60);
+-    defer s.deinit();
+-    s.live = true;
+-    try std.testing.expect(keepBornAt(&f, &s, a, 60, 60)); // A's first turn
+-    try std.testing.expect(keepAt(&f, &s, b, 100)); // B: idle
+-    try std.testing.expect(keepBornAt(&f, &s, a, 100, 100)); // A's next turn, live: A at 60 is superseded
+-    try std.testing.expect(keepBornAt(&f, &s, c, 80, 80)); // C, live
+-    s.pin(1, entry(&s, a, 100));
+-    s.pin(2, entry(&s, c, 80));
+-    try std.testing.expect(keepBornAt(&f, &s, c, 120, 120)); // C's pass keeps on: A at 60 goes first
+-    try std.testing.expect(!has(&s, a, 60) and has(&s, b, 100));
+-    try std.testing.expectEqual(@as(u64, 1), s.counts.evicted_superseded);
+-    s.pin(2, entry(&s, c, 120)); // one pin a request: its newest
+-    try std.testing.expectEqual(@as(u32, 0), entry(&s, c, 80).live);
+-    try std.testing.expectEqual(@as(usize, 2), s.pins.items.len);
+-    try std.testing.expect(keepAt(&f, &s, b, 110)); // C at 80 (superseded by C at 120), then B at 100 (idle)
+-    try std.testing.expect(!has(&s, c, 80) and !has(&s, b, 100));
+-    try std.testing.expect(has(&s, a, 100) and has(&s, c, 120) and has(&s, b, 110));
+-    try std.testing.expectEqual(@as(u64, 2), s.counts.evicted_superseded);
+-    try std.testing.expectEqual(@as(u64, 1), s.counts.evicted_idle);
+-    try std.testing.expectEqual(@as(u64, 0), s.counts.evicted_live);
++    for ([_]bool{ false, true }) |newest| {
++        var f: Fake = .{ .gpa = gpa };
++        var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0 }, 200 + 160 + 200 + 180 + 60);
++        defer s.deinit();
++        s.newest = newest;
++        s.live = true;
++        try std.testing.expect(keepBornAt(&f, &s, a, 60, 60)); // A's first turn
++        try std.testing.expect(keepAt(&f, &s, b, 100)); // B: idle
++        try std.testing.expect(keepBornAt(&f, &s, a, 100, 100)); // A's next turn, live: A at 60 is superseded
++        try std.testing.expect(keepBornAt(&f, &s, c, 80, 80)); // C, live
++        s.pin(1, entry(&s, a, 100));
++        s.pin(2, entry(&s, c, 80));
++        try std.testing.expect(keepBornAt(&f, &s, c, 120, 120)); // C's pass keeps on: A at 60 goes first
++        try std.testing.expect(!has(&s, a, 60) and has(&s, b, 100));
++        try std.testing.expectEqual(@as(u64, 1), s.counts.evicted_superseded);
++        s.pin(2, entry(&s, c, 120)); // one pin a request: its newest
++        try std.testing.expectEqual(@as(u32, 0), entry(&s, c, 80).live);
++        try std.testing.expectEqual(@as(usize, 2), s.pins.items.len);
++        try std.testing.expect(keepAt(&f, &s, b, 110)); // C at 80 (superseded by C at 120), then B at 100 (idle)
++        try std.testing.expect(!has(&s, c, 80) and !has(&s, b, 100));
++        try std.testing.expect(has(&s, a, 100) and has(&s, c, 120) and has(&s, b, 110));
++        try std.testing.expectEqual(@as(u64, if (newest) 3 else 2), s.counts.evicted_superseded);
++        try std.testing.expectEqual(@as(u64, if (newest) 0 else 1), s.counts.evicted_idle);
++        try std.testing.expectEqual(@as(u64, 0), s.counts.evicted_live);
++    }
+ }
+ 
+ test "pcache live: pinned states that alone fill the budget go in today's order, and the budget holds" {
+diff --git a/zig/src/families/flashnext/cuda_pocket_test.zig b/zig/src/families/flashnext/cuda_pocket_test.zig
+index ceaff03bac943c4d4b84f48460ba90f60cd13c7d..b66315596493b3c974dd2933bccc50d120fb7ef6 100644
+--- a/zig/src/families/flashnext/cuda_pocket_test.zig
++++ b/zig/src/families/flashnext/cuda_pocket_test.zig
+@@ -55,6 +55,14 @@ fn read(dst: ?*anyopaque, src: u64, n: usize) callconv(.c) abi.Result {
+ fn sync(_: abi.Stream) callconv(.c) abi.Result {
+     return if (fail_sync) abi.error_not_ready else 0;
+ }
++fn contextDevice(out: *abi.Device) callconv(.c) abi.Result {
++    out.* = 0;
++    return 0;
++}
++fn discrete(out: *c_int, _: abi.DeviceAttribute, _: abi.Device) callconv(.c) abi.Result {
++    out.* = 0;
++    return 0;
++}
+ fn driver() cuda.Driver {
+     var d: cuda.Driver = .{ .lib = undefined, .api = undefined };
+     d.api.cuMemAlloc_v2 = alloc;
+@@ -65,6 +73,8 @@ fn driver() cuda.Driver {
+     d.api.cuMemcpyHtoDAsync_v2 = asyncCopy;
+     d.api.cuMemcpyDtoH_v2 = read;
+     d.api.cuStreamSynchronize = sync;
++    d.api.cuCtxGetDevice = contextDevice;
++    d.api.cuDeviceGetAttribute = discrete;
+     return d;
+ }
+ test "Learning persistence: every failed pocket copy or wait leaves the entire live pocket unchanged" {
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 40f1a5f5d75a263f3aa667d98111cb3cf6ce44e6..fc940fc458febb4d4d7715379cb0c8727ec1cdb7 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -452,7 +452,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         try kv_pages.store(F, store, loaded.target, kept); // its snapshot slots, before a disk probe takes one
+         if (@hasDecl(F, "cache_live")) store.live = F.cache_live(); // TF_FLASHNEXT_PCACHE_LIVE: live requests' newest states go last
+         store.newest = try snaps.newest();
+-        if (!store.newest) std.log.info("prompt cache: TENSORFOLD_PCACHE_NEWEST=0, equal-born reply ends supersede nothing", .{});
++        if (store.newest) std.log.info("prompt cache: TENSORFOLD_PCACHE_NEWEST=1, each conversation's newest state outlives its redundant copies", .{});
+         if (@hasDecl(F, "cache_keeping")) {
+             const k = try F.cache_keeping();
+             store.keeping = .{ .explain = k.explain, .one_copy = k.one_copy, .value = k.value };
+diff --git a/zig/src/native/cuda_snaps.zig b/zig/src/native/cuda_snaps.zig
+index 9b1bf1845a083f297db2fab764d3820e2f542538..42a21513f0f6e925b343d906e00f7047d25653f8 100644
+--- a/zig/src/native/cuda_snaps.zig
++++ b/zig/src/native/cuda_snaps.zig
+@@ -33,7 +33,7 @@ fn sharedMin() u32 {
+ }
+ 
+ pub fn newest() !bool {
+-    const v = std.mem.span(std.c.getenv("TENSORFOLD_PCACHE_NEWEST") orelse return true);
++    const v = std.mem.span(std.c.getenv("TENSORFOLD_PCACHE_NEWEST") orelse return false);
+     if (std.mem.eql(u8, v, "1")) return true;
+     if (std.mem.eql(u8, v, "0")) return false;
+     std.log.err("TENSORFOLD_PCACHE_NEWEST={s}: 0 or 1", .{v});

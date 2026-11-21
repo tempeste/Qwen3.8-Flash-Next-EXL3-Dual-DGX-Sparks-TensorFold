@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shuuul <6903405+shuuul@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 14:03:58 +0000
+Subject: [PATCH 09/33] cuda: a fake driver pins the download staging path
+
+Upstream TensorFold commit by shuuul, ported onto this series (upstream main 36a87df7923d).
+
+The fake writes only pinned destinations; the test asserts the copy's
+destination is the thread's pinned buffer and the pageable caller gets the
+bytes, so a regression to the direct copy fails without needing the fault.
+
+(cherry picked from commit 36a87df7923d0011b64ee1b06785faea53137c39)
+---
+ zig/src/cuda/download_stage_test.zig | 46 ++++++++++++++++++++++++++++
+ zig/src/cuda/root.zig                |  1 +
+ 2 files changed, 47 insertions(+)
+ create mode 100644 zig/src/cuda/download_stage_test.zig
+
+diff --git a/zig/src/cuda/download_stage_test.zig b/zig/src/cuda/download_stage_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..188abb679503c176f2bc73a188564ee68cd70bae
+--- /dev/null
++++ b/zig/src/cuda/download_stage_test.zig
+@@ -0,0 +1,46 @@
++//! The synchronous download's staging path, with a driver that only writes pinned destinations.
++const std = @import("std");
++const abi = @import("abi.zig");
++const Driver = @import("driver.zig").Driver;
++const memory = @import("memory.zig");
++const stage = @import("download_stage.zig");
++
++var pinned: [64 << 10]u8 align(16) = undefined;
++var destination: usize = 0;
++
++fn pinnedRange(ptr: usize) bool {
++    const base = @intFromPtr(&pinned[0]);
++    return ptr >= base and ptr < base + pinned.len;
++}
++
++fn hostAlloc(out: ?*?*anyopaque, len: usize, _: c_uint) callconv(.c) abi.Result {
++    if (len > pinned.len) return 1;
++    out.?.* = &pinned[0];
++    return 0;
++}
++
++fn hostFree(_: ?*anyopaque) callconv(.c) abi.Result {
++    return 0;
++}
++
++/// Writes only a pinned destination, as the GB10 fault leaves pageable memory untouched.
++fn copyToHost(dst: ?*anyopaque, _: abi.DevicePtr, len: usize) callconv(.c) abi.Result {
++    destination = @intFromPtr(dst.?);
++    if (pinnedRange(destination)) @memset(@as([*]u8, @ptrCast(dst.?))[0..len], 0x5a);
++    return 0;
++}
++
++test "a synchronous download lands in pinned memory, not the caller's pageable slice" {
++    var d: Driver = undefined;
++    d.api.cuMemHostAlloc = hostAlloc;
++    d.api.cuMemFreeHost = hostFree;
++    d.api.cuMemcpyDtoH_v2 = copyToHost;
++    stage.drop();
++    defer stage.drop();
++    var out: [64]u8 = @splat(0xaa);
++    const src: memory.DeviceBuffer = .{ .d = &d, .ptr = 0x1000, .len = out.len, .borrowed = true };
++    try src.download(0, &out);
++    try std.testing.expect(std.mem.allEqual(u8, &out, 0x5a));
++    try std.testing.expect(pinnedRange(destination));
++    try std.testing.expect(destination != @intFromPtr(&out));
++}
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index 694ccb6abe2e409efaf6d5c08ace32baa927fa81..ce70f2a56b68fd0eeb8fd4c78c82c2bb41a27ec2 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -86,6 +86,7 @@ test {
+     _ = train_q4;
+     _ = train_attn;
+     _ = @import("memory.zig");
++    _ = @import("download_stage_test.zig");
+     _ = memory_receipt;
+     _ = @import("grouped.zig");
+     _ = @import("qlinear.zig");

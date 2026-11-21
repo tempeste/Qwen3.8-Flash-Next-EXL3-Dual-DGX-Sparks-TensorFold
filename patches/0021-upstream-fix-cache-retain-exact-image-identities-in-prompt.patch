@@ -1,0 +1,716 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: laudney <106273+laudney@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 01:47:52 +0000
+Subject: [PATCH 21/33] fix(cache): retain exact image identities in prompt
+ states
+
+Upstream TensorFold commit by laudney, ported onto this series (upstream main 1db545bd645e).
+
+Keep image prefix identities and family frames beside cache words
+so colliding one-row images cannot resume each other's state.
+
+(cherry picked from commit 1db545bd6)
+
+Adapted in this series: our Store keeps its own fields (live pins, keeping, anchors, share chains) and its
+share-aware byte count; the image identities and frame are added beside them. keepAnchor and shared-row
+entries carry no image identity, so an image prompt never resumes one (they are refused, not mixed up).
+---
+ zig/src/core/cache_images.zig       | 161 ++++++++++++++++++++++++++++
+ zig/src/core/lane_host_warm.zig     |   2 +-
+ zig/src/core/lane_job.zig           |   3 +-
+ zig/src/core/lane_stream.zig        |   3 +-
+ zig/src/core/prompt_cache.zig       |  34 +++---
+ zig/src/core/prompt_cache_index.zig |   2 +-
+ zig/src/core/prompt_interior.zig    |   8 +-
+ zig/src/core/prompt_learn.zig       |   1 +
+ zig/src/core/rows_read.zig          |   5 +-
+ zig/src/core/rows_write.zig         |   2 +-
+ zig/src/server/image_key.zig        |  80 +++++++++++++-
+ zig/src/server/image_reuse_test.zig |  62 +++++++++--
+ zig/src/server/images.zig           |   2 +-
+ 13 files changed, 331 insertions(+), 34 deletions(-)
+ create mode 100644 zig/src/core/cache_images.zig
+
+diff --git a/zig/src/core/cache_images.zig b/zig/src/core/cache_images.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..61a702f9090f56bf6c0ed4f7c9e77853584475b9
+--- /dev/null
++++ b/zig/src/core/cache_images.zig
+@@ -0,0 +1,161 @@
++//! Exact image identities beside cache words; one image row cannot hold a 62-bit identity in a u32.
++const std = @import("std");
++const pc = @import("prompt_cache.zig");
++const modes = @import("cache_modes.zig");
++const Image = @import("lanes").stream.Image;
++const Allocator = std.mem.Allocator;
++
++pub const Identity = struct { at: u32, tokens: u32, gh: u32, gw: u32, hash: u64 };
++
++fn identity(i: Image) Identity {
++    return .{ .at = i.at, .tokens = i.tokens, .gh = i.gh, .gw = i.gw, .hash = i.hash };
++}
++
++/// Include the image when its first row enters the keyed prefix, including any required lookahead.
++pub fn prefix(a: Allocator, images: []const Image, at: u32) ![]Identity {
++    var n: usize = 0;
++    for (images) |i| n += @intFromBool(i.at < at);
++    const out = try a.alloc(Identity, n);
++    n = 0;
++    for (images) |i| if (i.at < at) {
++        out[n] = identity(i);
++        n += 1;
++    };
++    return out;
++}
++
++pub fn equal(kept: []const Identity, images: []const Image, at: u32) bool {
++    var n: usize = 0;
++    for (images) |i| if (i.at < at) {
++        if (n == kept.len or !std.meta.eql(kept[n], identity(i))) return false;
++        n += 1;
++    };
++    return n == kept.len;
++}
++
++pub fn matches(s: *const pc.Store, e: *const pc.Entry) bool {
++    return e.image_frame == s.image_frame and equal(e.images, s.image_query orelse &.{}, @intCast(e.tokens.len));
++}
++
++/// Store operations run on one engine thread. A scoped query must not nest another image operation.
++pub fn lookupUser(s: *pc.Store, a: Allocator, prompt: []const u32, born: u32, history: u32, rewind: u32, user: u32, shared: []const u32, starts: []const u32, spans: []const modes.Span, images: []const Image) !pc.Lookup {
++    return lookupUserFrame(s, a, prompt, born, history, rewind, user, shared, starts, spans, images, 0);
++}
++
++pub fn lookupUserFrame(s: *pc.Store, a: Allocator, prompt: []const u32, born: u32, history: u32, rewind: u32, user: u32, shared: []const u32, starts: []const u32, spans: []const modes.Span, images: []const Image, frame: u32) !pc.Lookup {
++    std.debug.assert(s.image_query == null);
++    s.image_query = images;
++    s.image_frame = frame;
++    defer {
++        s.image_query = null;
++        s.image_frame = 0;
++    }
++    return s.lookupUser(a, prompt, born, history, rewind, user, shared, starts, spans);
++}
++
++pub fn keepBorn(s: *pc.Store, prompt: []const u32, born: u32, at: u32, owner: ?*anyopaque, starts: []const u32, spans: []const modes.Span, images: []const Image) bool {
++    return keepBornFrame(s, prompt, born, at, owner, starts, spans, images, 0);
++}
++
++pub fn keepBornFrame(s: *pc.Store, prompt: []const u32, born: u32, at: u32, owner: ?*anyopaque, starts: []const u32, spans: []const modes.Span, images: []const Image, frame: u32) bool {
++    std.debug.assert(s.image_query == null);
++    s.image_query = images;
++    s.image_frame = frame;
++    defer {
++        s.image_query = null;
++        s.image_frame = 0;
++    }
++    return s.keepBorn(prompt, born, at, owner, starts, spans);
++}
++
++/// Current disk formats have no image metadata. Their reserved image words cannot be read or published safely.
++pub fn diskSafe(tokens: []const u32) bool {
++    for (tokens) |word| if (word & 0x8000_0000 != 0) return false;
++    return true;
++}
++
++test "image prefix identity includes geometry, keeps text prefixes and ignores future images" {
++    const t = std.testing;
++    const original: Image = .{ .pixels = &.{}, .gh = 2, .gw = 2, .at = 4, .tokens = 1, .hash = 7 };
++    const kept = try prefix(t.allocator, &.{original}, 5);
++    defer t.allocator.free(kept);
++    try t.expect(equal(kept, &.{original}, 5));
++    try t.expect(equal(&.{}, &.{original}, 4));
++    try t.expect(!equal(kept, &.{}, 5));
++    var changed = original;
++    changed.hash += 1;
++    try t.expect(!equal(kept, &.{changed}, 5));
++    changed = original;
++    changed.tokens += 1;
++    try t.expect(!equal(kept, &.{changed}, 5));
++    changed = original;
++    changed.gh += 1;
++    try t.expect(!equal(kept, &.{changed}, 5));
++    changed = original;
++    changed.at += 2;
++    try t.expect(equal(kept, &.{ original, changed }, 5));
++    try t.expect(!diskSafe(&.{ 1, 0x8000_0000, 2 }));
++    try t.expect(diskSafe(&.{ 1, 2, 3 }));
++}
++
++test "image collision lookup checks rewind, reservation and interior cuts with the exact image prefix" {
++    const t = std.testing;
++    const Fake = struct {
++        var saved: u8 = 0;
++        fn bytes(_: *anyopaque, at: u32) u64 {
++            return 64 + @as(u64, at);
++        }
++        fn save(_: *anyopaque, _: ?*anyopaque, _: u32) anyerror!pc.Saved {
++            return &saved;
++        }
++        fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {}
++        fn drop(_: *anyopaque, _: pc.Saved) void {}
++    };
++    var s = pc.Store.init(t.allocator, .{ .ptr = &Fake.saved, .vtable = &.{ .bytes = Fake.bytes, .save = Fake.save, .restore = Fake.restore, .drop = Fake.drop } }, .{ .chunk = 128, .min_gap = 256 }, 1 << 20);
++    defer s.deinit();
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const words = try a.alloc(u32, 12000);
++    @memset(words, 11); // omitted row keys reproduce any compact-key collision
++    const first: Image = .{ .pixels = &.{}, .gh = 2, .gw = 2, .at = 2000, .tokens = 1, .hash = 7 };
++    var other = first;
++    other.hash = 8;
++    try t.expect(s.keepBornImages(words, 12000, 1024, null, &.{}, &.{}, &.{first}));
++    try t.expect(s.keepBornImages(words, 12000, 8960, null, &.{}, &.{}, &.{first}));
++    const l = try s.lookupUserImages(a, words, 12000, 11008, 1024, 11008, &.{}, &.{}, &.{}, &.{other});
++    try t.expectEqual(@as(u32, 1024), l.entry.?.at);
++    s.release(l.entry.?);
++    try t.expectEqual(@as(u32, 1024), s.active_rewind_at);
++    try t.expect(std.mem.indexOfScalar(u32, l.marks, 11008) != null);
++    try t.expect(std.mem.indexOfScalar(u32, l.marks, 8960) != null); // independent interior cut
++    const near = try s.lookupUserImages(a, words, 12000, 11008, 9088, 0, &.{}, &.{}, &.{}, &.{other});
++    try t.expectEqual(@as(u32, 1024), near.entry.?.at);
++    s.release(near.entry.?);
++    try t.expectEqual(@as(u32, 9088), s.active_rewind_at); // a nearby colliding image state is not the rewind state
++    try t.expect(s.keepBornImages(words, 12000, 8960, null, &.{}, &.{}, &.{other}));
++    try t.expectEqual(@as(usize, 3), s.entries.items.len);
++    const hit = try s.lookupUserImages(a, words, 12000, 11008, 1024, 11008, &.{}, &.{}, &.{}, &.{first});
++    try t.expectEqual(@as(u32, 8960), hit.entry.?.at);
++    s.release(hit.entry.?);
++    try t.expect(s.image_query == null);
++    s.clear();
++    s.rules.lookahead = 1;
++    var boundary = first;
++    boundary.at = 2;
++    var replacement = boundary;
++    replacement.hash += 1;
++    try t.expect(s.keepBornImages(words, 12000, 2, null, &.{}, &.{}, &.{boundary}));
++    const next = try s.lookupUserImages(a, words, 12000, 0, 0, 0, &.{}, &.{}, &.{}, &.{replacement});
++    try t.expect(next.entry == null); // the next image row is part of a lookahead-dependent state
++    s.clear();
++    s.rules.lookahead = 0;
++    try t.expect(s.keepBornFrame(words, 12000, 1, null, &.{}, &.{}, &.{boundary}, 42));
++    try t.expectEqual(@as(usize, 0), s.entries.items[0].images.len);
++    const frame_miss = try s.lookupUserFrame(a, words, 12000, 0, 0, 0, &.{}, &.{}, &.{}, &.{boundary}, 43);
++    try t.expect(frame_miss.entry == null); // equal compact words cannot hide a different pre-image frame
++    const frame_hit = try s.lookupUserFrame(a, words, 12000, 0, 0, 0, &.{}, &.{}, &.{}, &.{boundary}, 42);
++    try t.expectEqual(@as(u32, 1), frame_hit.entry.?.at);
++    s.release(frame_hit.entry.?);
++    try t.expect(s.image_query == null and s.image_frame == 0);
++}
+diff --git a/zig/src/core/lane_host_warm.zig b/zig/src/core/lane_host_warm.zig
+index 60428491376dc6174a58dd7271a28a05eae0d280..5cd8bd74bc057879756d08ce8f17821c440c66ff 100644
+--- a/zig/src/core/lane_host_warm.zig
++++ b/zig/src/core/lane_host_warm.zig
+@@ -14,7 +14,7 @@ pub fn pass(h: *LaneHost, job: *Job, began: i96) bool {
+         return h.cancel(job);
+     };
+     h.prefilled(job, began);
+-    if (h.cache) |store| _ = if (!job.request.untaught and store.rules.lookahead == 0) store.keepBorn(job.cacheKey(), job.request.bornLen(), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request)) else false;
++    if (h.cache) |store| _ = if (!job.request.untaught and store.rules.lookahead == 0) store.keepBornFrame(job.cacheKey(), job.request.bornLen(), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request), job.request.images, job.frame) else false;
+     be.release(&job.stream);
+     h.remove(job);
+     h.finish(job, .length, "");
+diff --git a/zig/src/core/lane_job.zig b/zig/src/core/lane_job.zig
+index ee0aa56a66d2c7dc4b686f651d9abc9d3ae48fd4..f69b2c130c91c78e5f9804d4d1b38863c5115381 100644
+--- a/zig/src/core/lane_job.zig
++++ b/zig/src/core/lane_job.zig
+@@ -34,6 +34,7 @@ pub const Job = struct {
+     prefilled: ?i96 = null,
+     entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
+     marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
++    frame: u32 = 0, // exact family frame, before its compact cache-word hash
+     key: []u32 = &.{}, // the request's cache key with its image frame in the first word (gpa-owned); empty: its own
+     kept0: u64 = 0, // the store's kept count when the job looked it up
+     seq: u64 = 0, // its admission's number
+@@ -57,7 +58,7 @@ pub const Job = struct {
+         const job: *Job = @ptrCast(@alignCast(ptr));
+         job.reached = @max(job.reached, at); // a request waiting for this cut goes on, whether the store keeps it or not
+         job.reported(); // before a keep can evict the entry the pass restored
+-        if (job.host.cache) |store| if (store.keepBorn(job.cacheKey(), job.request.bornLen(), at, s, job.request.chunks, job.host.spans(job.request))) {
++        if (job.host.cache) |store| if (store.keepBornFrame(job.cacheKey(), job.request.bornLen(), at, s, job.request.chunks, job.host.spans(job.request), job.request.images, job.frame)) {
+             if (store.last_kept) |e| store.pin(@intFromPtr(job), e); // Store.live: its newest state until it ends
+         };
+     }
+diff --git a/zig/src/core/lane_stream.zig b/zig/src/core/lane_stream.zig
+index 64bcaabc71d85c8cc9af582337eaa13a4c6bee10..92940e4da05f3624735010bdbe5f8d7175bd5e0a 100644
+--- a/zig/src/core/lane_stream.zig
++++ b/zig/src/core/lane_stream.zig
+@@ -19,12 +19,13 @@ pub fn open(h: *LaneHost, job: *Job) bool {
+     // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
+     if (h.frame_key) |frame| if (h.cache != null and r.images.len > 0 and r.cacheKey().len > 0) {
+         const f = frame(r.images);
++        job.frame = f;
+         if (f != 0) {
+             job.key = h.gpa.dupe(u32, r.cacheKey()) catch return !h.drop(job, "out of memory");
+             job.key[0] = 0x8000_0000 | @as(u32, @truncate(std.hash.Wyhash.hash(f, std.mem.asBytes(&job.key[0])) & 0x7fff_ffff));
+         }
+     };
+-    if (h.cache) |store| if (r.embedding == null and r.prompt_logprobs == null and !r.untaught) if (store.lookupUser(h.gpa, job.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.user_end, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
++    if (h.cache) |store| if (r.embedding == null and r.prompt_logprobs == null and !r.untaught) if (store.lookupUserFrame(h.gpa, job.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.user_end, r.shared_prefixes, r.chunks, h.spans(r), r.images, job.frame)) |l| {
+         job.entry = l.entry;
+         job.kept0 = store.counts.kept;
+         job.marks = l.marks;
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 05b9828f0448eb5362f39653a5a3998617994d98..9c755b9050d59ab5fd2a290ae4b0ff509e2425a9 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -3,6 +3,7 @@ const std = @import("std");
+ const Allocator = std.mem.Allocator;
+ const imprint = @import("prompt_imprint.zig");
+ const modes = @import("cache_modes.zig");
++const images = @import("cache_images.zig");
+ const learned = @import("prompt_learn.zig");
+ const lifetime = @import("prompt_cache_lifetime.zig");
+ const policy = @import("prompt_cache_policy.zig");
+@@ -22,15 +23,12 @@ const sharing = @import("prompt_cache_share.zig");
+ 
+ /// A family's copy of one state.
+ pub const Saved = *anyopaque;
+-
+ pub const singleReclaim = imprint.singleReclaim; // the learned-state file helpers, beside the Imprint that owns them
+ pub const singleForgetChecked = imprint.singleForgetChecked;
+-
+ /// What a family gives the cache: copies of its state while the prompt pass stands at a chunk end.
+ pub const Snapshots = struct {
+     ptr: *anyopaque,
+     vtable: *const VTable,
+-
+     pub const VTable = struct {
+         /// The most new storage `save` takes at `at` tokens (checked against the budget before any copy).
+         bytes: *const fn (ptr: *anyopaque, at: u32) u64,
+@@ -73,14 +71,12 @@ pub const Snapshots = struct {
+         orphans: ?*const fn (ptr: *anyopaque) u64 = null,
+     };
+ };
+-
+ /// What a paged store asks of the backend's pages: who holds each, and how many are free.
+ pub const Pages = struct {
+     ptr: *anyopaque,
+     vtable: *const VTable,
+     /// Bytes of one page, over every layer.
+     bytes: u64,
+-
+     pub const VTable = struct {
+         retain: *const fn (ptr: *anyopaque, id: u32) void,
+         release: *const fn (ptr: *anyopaque, id: u32) void,
+@@ -90,11 +86,12 @@ pub const Pages = struct {
+         available: *const fn (ptr: *anyopaque) usize,
+     };
+ };
+-
+ /// What a family's states depend on beyond their position.
+ pub const Rules = @import("prompt_rules.zig").Rules;
+ 
+ pub const Entry = struct {
++    image_frame: u32 = 0, // the family frame can affect text rows before the first image
++    images: []images.Identity = &.{}, // exact image identities through the keyed prefix, including lookahead
+     tokens: []u32, // the state's tokens and `lookahead` more
+     decode_spans: []modes.Span = &.{}, // canonical row arithmetic through at, excluding lookahead
+     at: u32,
+@@ -147,14 +144,13 @@ pub const Pin = struct { owner: usize, entry: *Entry };
+ 
+ pub const RestoreDetails = @import("prompt_cache_restore.zig").Details;
+ pub const RestoreLog = @import("prompt_cache_restore.zig").Log;
+-
+ /// Where a prompt pass starts and where it stops to keep its state (marks sorted, in `a`).
+ pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
+-
+ /// The borrowed entry a backend restores; the caller must report resumed or release it, even on cancellation.
+ pub const Lookup = struct { entry: ?*Entry = null, marks: []const u32 = &.{} };
+-
+ pub const Store = struct {
++    image_frame: u32 = 0,
++    image_query: ?[]const @import("lanes").stream.Image = null, // scoped to one serial lookup or keep
+     restore_log: ?RestoreLog = null,
+     gpa: Allocator,
+     family: Snapshots,
+@@ -189,6 +185,10 @@ pub const Store = struct {
+ 
+     repeat_log: @import("prompt_cache_repeat.zig").Log = .{},
+     const SHARED_KEYS = 64;
++    pub const lookupUserImages = images.lookupUser;
++    pub const keepBornImages = images.keepBorn;
++    pub const lookupUserFrame = images.lookupUserFrame;
++    pub const keepBornFrame = images.keepBornFrame;
+ 
+     pub fn init(gpa: Allocator, family: Snapshots, rules: Rules, budget: u64) Store {
+         return .{ .gpa = gpa, .family = family, .rules = rules, .budget = budget };
+@@ -213,6 +213,7 @@ pub const Store = struct {
+         s.gpa.free(if (e.own.len > 0) e.own else e.tokens);
+         s.gpa.free(e.decode_spans);
+         s.gpa.free(e.chain);
++        s.gpa.free(e.images);
+         if (e.own.len == 0 or e.last.ptr != e.own.ptr) s.gpa.free(e.last);
+         e.ext.deinit(s.gpa);
+         s.gpa.destroy(e);
+@@ -349,7 +350,7 @@ pub const Store = struct {
+         var best: ?u32 = null;
+         for (s.entries.items) |e| {
+             if (e.expired or e.at > at or at - e.at >= s.rules.min_gap or e.tokens.len > prompt.len or !s.usable(e.at, starts)) continue;
+-            if (!std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens) or !modes.equal(e.decode_spans, spans, e.at)) continue;
++            if (!std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens) or !modes.equal(e.decode_spans, spans, e.at) or !images.matches(s, e)) continue;
+             if (best == null or e.at > best.?) best = e.at;
+         }
+         return best;
+@@ -462,7 +463,7 @@ pub const Store = struct {
+         for (marks_) |at| {
+             const n = @as(usize, at) + s.rules.lookahead;
+             const exists = for (s.entries.items) |e| {
+-                if (!e.expired and e.at == at and e.tokens.len == n and n <= prompt.len and std.mem.eql(u32, e.tokens, prompt[0..n]) and modes.equal(e.decode_spans, spans, at)) break true;
++                if (!e.expired and e.at == at and e.tokens.len == n and n <= prompt.len and std.mem.eql(u32, e.tokens, prompt[0..n]) and modes.equal(e.decode_spans, spans, at) and images.matches(s, e)) break true;
+             } else false;
+             if (!exists) need += if (s.share) sharing.added(s, base, at) else s.family.vtable.bytes(s.family.ptr, at);
+             if (!exists) base = @max(base, at);
+@@ -486,7 +487,7 @@ pub const Store = struct {
+ 
+     /// Forget a failed peer state matching the token prefix and canonical spans through at.
+     pub fn forget(s: *Store, prompt: []const u32, at: u32, spans: []const modes.Span) void {
+-        for (s.entries.items) |e| if (!e.expired and e.at == at and e.tokens.len <= prompt.len and std.mem.eql(u32, e.tokens, prompt[0..e.tokens.len]) and modes.equal(e.decode_spans, spans, at)) {
++        for (s.entries.items) |e| if (!e.expired and e.at == at and e.tokens.len <= prompt.len and std.mem.eql(u32, e.tokens, prompt[0..e.tokens.len]) and modes.equal(e.decode_spans, spans, at) and images.matches(s, e)) {
+             s.counts.failed += 1;
+             e.expired = true;
+             return s.collectExpired();
+@@ -611,7 +612,7 @@ pub const Store = struct {
+         if (at == 0 or n > prompt.len or s.hold) return false;
+         s.clock += 1;
+         const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
+-        for (s.entries.items) |e| if (!e.expired and e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n]) and modes.equal(e.decode_spans, spans, at)) {
++        for (s.entries.items) |e| if (!e.expired and e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n]) and modes.equal(e.decode_spans, spans, at) and images.matches(s, e)) {
+             e.used = s.clock; // the same state again: no copy
+             e.shared = e.shared or shared;
+             if (s.keeping.any()) keeping.touched(s, e);
+@@ -619,6 +620,9 @@ pub const Store = struct {
+             s.last_kept = e;
+             return true;
+         };
++        const image_ids = images.prefix(s.gpa, s.image_query orelse &.{}, @intCast(n)) catch |err| return s.fail(at, err);
++        var owns_images = true;
++        defer if (owns_images) s.gpa.free(image_ids);
+         var bytes = if (s.share) sharing.addedFor(s, owner, at) else s.family.vtable.bytes(s.family.ptr, at);
+         if (bytes > s.budget or s.most == 0) {
+             s.counts.refused += 1;
+@@ -664,8 +668,9 @@ pub const Store = struct {
+             return s.fail(at, err);
+         };
+         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
+-        e.* = .{ .tokens = last[0..n], .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = born, .used = s.clock, .last = last, .shared = shared, .own = last, .anchor = anchor };
++        e.* = .{ .tokens = last[0..n], .images = image_ids, .image_frame = s.image_frame, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = born, .used = s.clock, .last = last, .shared = shared, .own = last, .anchor = anchor };
+         owns_decoded = false;
++        owns_images = false;
+         index.add(s, e) catch {
+             s.free(e);
+             return s.fail(at, error.OutOfMemory);
+@@ -697,6 +702,7 @@ pub const Store = struct {
+         const im = s.imprint orelse return have;
+         const read = s.family.vtable.read orelse return have;
+         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
++        if (s.image_frame != 0 or !images.diskSafe(m.tokens) or !images.equal(&.{}, s.image_query orelse &.{}, @intCast(m.tokens.len))) return have;
+         if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
+         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
+         while (bytes <= s.budget and (s.held + s.spare() + s.orphans() + bytes > s.budget or s.entries.items.len >= s.most)) {
+diff --git a/zig/src/core/prompt_cache_index.zig b/zig/src/core/prompt_cache_index.zig
+index c28acc847b3a911f42c8893e71fa0173336fe461..be5b5c2018abb839a20a2d94878d160140cc8aaf 100644
+--- a/zig/src/core/prompt_cache_index.zig
++++ b/zig/src/core/prompt_cache_index.zig
+@@ -10,7 +10,7 @@ pub fn find(s: *pc.Store, prompt: []const u32, starts: []const u32, spans: []con
+         if (e.expired or e.tokens.len > prompt.len or e.at >= prompt.len or !s.usable(e.at, starts)) continue;
+         const n = e.tokens.len;
+         if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
+-        if (!modes.equal(e.decode_spans, spans, e.at)) continue;
++        if (!modes.equal(e.decode_spans, spans, e.at) or !@import("cache_images.zig").matches(s, e)) continue;
+         return e;
+     }
+     return null;
+diff --git a/zig/src/core/prompt_interior.zig b/zig/src/core/prompt_interior.zig
+index f56c9d2aca4614fb959de900f4865b28ff085ab0..57ba741c373e6e5c5255896df7487231497daf59 100644
+--- a/zig/src/core/prompt_interior.zig
++++ b/zig/src/core/prompt_interior.zig
+@@ -29,10 +29,10 @@ pub fn cut(r: pc.Rules, len: usize, from: u32, end: u32, user: u32, starts: []co
+     return if (at > user and at > from and at < end and at <= limit) at else 0;
+ }
+ 
+-fn same(e: *const pc.Entry, prompt: []const u32, at: u32, lookahead: u32, spans: []const modes.Span) bool {
++fn same(s: *const pc.Store, e: *const pc.Entry, prompt: []const u32, at: u32, lookahead: u32, spans: []const modes.Span) bool {
+     return !e.expired and e.at == at and e.tokens.len == @as(usize, at) + lookahead and
+         e.tokens.len <= prompt.len and std.mem.eql(u32, e.tokens, prompt[0..e.tokens.len]) and
+-        modes.equal(e.decode_spans, spans, at);
++        modes.equal(e.decode_spans, spans, at) and @import("cache_images.zig").matches(s, e);
+ }
+ 
+ /// Takes ownership of marks only on success. Endpoint, rewind, other marks and outstanding borrows have priority.
+@@ -49,7 +49,7 @@ pub fn add(s: *pc.Store, a: std.mem.Allocator, prompt: []const u32, from: u32, e
+     var slots: usize = required.items.len;
+     for (required.items) |p| {
+         var bytes = s.family.vtable.bytes(s.family.ptr, p);
+-        for (s.entries.items) |e| if (same(e, prompt, p, s.rules.lookahead, spans)) {
++        for (s.entries.items) |e| if (same(s, e, prompt, p, s.rules.lookahead, spans)) {
+             bytes = @max(bytes, e.bytes);
+             break;
+         };
+@@ -58,7 +58,7 @@ pub fn add(s: *pc.Store, a: std.mem.Allocator, prompt: []const u32, from: u32, e
+     // Other in-flight restores cannot be evicted. The current restore has not been borrowed by lookup yet.
+     for (s.entries.items) |e| if (e.borrowers > 0 or e == restored) {
+         const included = for (required.items) |p| {
+-            if (same(e, prompt, p, s.rules.lookahead, spans)) break true;
++            if (same(s, e, prompt, p, s.rules.lookahead, spans)) break true;
+         } else false;
+         if (!included) {
+             used +|= e.bytes;
+diff --git a/zig/src/core/prompt_learn.zig b/zig/src/core/prompt_learn.zig
+index 184cd03dfc9701f2fe0a9161eb945bd732fade3b..c010b0b0fae3f108346193603708b76096ff27ca 100644
+--- a/zig/src/core/prompt_learn.zig
++++ b/zig/src/core/prompt_learn.zig
+@@ -8,6 +8,7 @@ const note = pc.note;
+ 
+ /// A shared cut's state written to disk once (--learn): later sessions read it back, after a restart too.
+ pub fn learn(s: *Store, e: *const Entry, starts: []const u32) void {
++    if (e.image_frame != 0 or e.images.len != 0 or !@import("cache_images.zig").diskSafe(e.tokens)) return;
+     const im = s.imprint orelse return;
+     if (e.decode_spans.len != 0) return; // learned states are prompt arithmetic only: their key holds no span map
+     const write = s.family.vtable.write orelse return;
+diff --git a/zig/src/core/rows_read.zig b/zig/src/core/rows_read.zig
+index f31d775c3fe7f69ff706ae643c91e0963e65e9a8..1ab225a17fa98f5e056fe58de87e412652646653 100644
+--- a/zig/src/core/rows_read.zig
++++ b/zig/src/core/rows_read.zig
+@@ -106,7 +106,10 @@ pub fn recall(s: *pc.Store, prompt: []const u32, born: u32, starts: []const u32,
+     const r = s.disk orelse return have;
+     write.reap(r);
+     const chosen = select.choose(s, prompt, starts, spans, have).restore orelse return have;
+-    const name = r.states.items[chosen].name;
++    const candidate = r.states.items[chosen];
++    if (s.image_frame != 0 or !@import("cache_images.zig").diskSafe(candidate.tokens) or
++        !@import("cache_images.zig").equal(&.{}, s.image_query orelse &.{}, @intCast(candidate.tokens.len))) return have;
++    const name = candidate.name;
+     const bytes = s.family.vtable.bytes(s.family.ptr, r.states.items[chosen].at);
+     if (bytes > s.budget or s.most == 0) return have;
+     if (!ready(s, bytes)) present(r, chosen) catch return have; // nothing goes to make room for a state whose file is gone
+diff --git a/zig/src/core/rows_write.zig b/zig/src/core/rows_write.zig
+index 0a924ae9f3a5ca623f167353ab6b61ff1cd935b5..33966ba7ed35c77f8a81a16a854d4dc832684c69 100644
+--- a/zig/src/core/rows_write.zig
++++ b/zig/src/core/rows_write.zig
+@@ -27,7 +27,7 @@ pub const Failures = struct {
+ };
+ 
+ pub fn queued(r: *Rows, e: *pc.Entry, starts: []const u32) void {
+-    if (r.stopped) return;
++    if (r.stopped or e.image_frame != 0 or e.images.len != 0 or !@import("cache_images.zig").diskSafe(e.tokens)) return;
+     sync.queued(r, e, starts);
+ }
+ 
+diff --git a/zig/src/server/image_key.zig b/zig/src/server/image_key.zig
+index 6444a263816d73126ef38f673b1939b1a5d1ecad..a20f2d6eaae10fe360d65694d0e8fb817b531ada 100644
+--- a/zig/src/server/image_key.zig
++++ b/zig/src/server/image_key.zig
+@@ -1,4 +1,4 @@
+-//! An image's words in a prompt's cache key: its markers carry its identity whole, its rows a hash of it.
++//! Cache words locate image rows; the core also compares each image's full identity before it reuses a state.
+ const std = @import("std");
+ const api = @import("engine_api");
+ const json = @import("json");
+@@ -16,7 +16,7 @@ pub fn close(hash: u64) u32 {
+     return 0x8000_0000 | @as(u32, @truncate((hash >> 31) & 0x7fff_ffff));
+ }
+ 
+-/// Row `j`'s word: 31 bits hashed from the identity and the row.
++/// Row `j`'s word is a compact index hint; exact prefix identity is checked by core/cache_images.zig.
+ pub fn row(hash: u64, j: usize) u32 {
+     return 0x8000_0000 | @as(u32, @truncate(std.hash.Wyhash.hash(hash, std.mem.asBytes(&j)) & 0x7fff_ffff));
+ }
+@@ -49,6 +49,82 @@ fn keyOf(a: std.mem.Allocator, id: u64) ![]const u32 {
+     return x.cache_key;
+ }
+ 
++fn markerFree(a: std.mem.Allocator, hashes: []const u64, tokens: []const u32) !images.Expanded {
++    var dummy: u8 = 0;
++    const v: api.Vision = .{ .ctx = &dummy, .prepare = named, .image_token = 9, .image_tokens = 64, .max_images = 4 };
++    var body: std.ArrayList(u8) = .empty;
++    try body.appendSlice(a, "[{\"role\":\"user\",\"content\":[");
++    for (hashes, 0..) |hash, i| {
++        if (i != 0) try body.append(a, ',');
++        try body.appendSlice(a, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:,%FF%D8%FF");
++        var encoded: [8]u8 = undefined;
++        std.mem.writeInt(u64, &encoded, hash, .little);
++        for (encoded) |b| try body.print(a, "%{X:0>2}", .{b});
++        try body.appendSlice(a, "\"}}");
++    }
++    try body.appendSlice(a, "]}]");
++    const msgs = switch (try json.parseText(a, body.items)) {
++        .ok => |m| m,
++        .err => return error.TestUnexpectedResult,
++    };
++    var cx: errors.Cx = .{ .a = a };
++    const out = (try images.expand(v, null, images.MarkText.text(), &cx, msgs, tokens, tokens.len)).?;
++    try std.testing.expectEqualSlices(u32, tokens, out.ids);
++    try std.testing.expectEqual(tokens.len, out.cache_key.len);
++    return out;
++}
++
++test "marker-free image row collisions cannot restore another image, including adjacent one-row images" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var seen: std.AutoHashMapUnmanaged(u32, u64) = .empty;
++    var pair: ?[2]u64 = null;
++    var n: u64 = 1;
++    while (pair == null and n < 1 << 22) : (n += 1) {
++        const hash = (n *% 0x9E3779B97F4A7C15) & ((1 << 62) - 1);
++        const got = try seen.getOrPut(a, row(hash, 0));
++        if (!got.found_existing) got.value_ptr.* = hash else if (got.value_ptr.* != hash) pair = .{ got.value_ptr.*, hash };
++    }
++    const hashes = pair orelse return error.NoCollision;
++    const Snaps = struct {
++        var state: u8 = 0;
++        fn bytes(_: *anyopaque, at: u32) u64 {
++            return 64 + @as(u64, at);
++        }
++        fn save(_: *anyopaque, _: ?*anyopaque, _: u32) anyerror!api.prompt_cache.Saved {
++            return &state;
++        }
++        fn restore(_: *anyopaque, _: ?*anyopaque, _: api.prompt_cache.Saved) anyerror!void {}
++        fn drop(_: *anyopaque, _: api.prompt_cache.Saved) void {}
++    };
++    var store = api.prompt_cache.Store.init(std.testing.allocator, .{ .ptr = &Snaps.state, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 1, .min_prompt = 0 }, 1 << 20);
++    defer store.deinit();
++    const first = try markerFree(a, &.{hashes[0]}, &.{ 1, 9, 2, 3 });
++    const other = try markerFree(a, &.{hashes[1]}, &.{ 1, 9, 2, 3 });
++    try std.testing.expectEqualSlices(u32, first.cache_key, other.cache_key);
++    try std.testing.expect(store.keepBornImages(first.cache_key, 4, 1, null, &.{}, &.{}, first.images));
++    try std.testing.expect(store.keepBornImages(first.cache_key, 4, 2, null, &.{}, &.{}, first.images));
++    const miss = try store.lookupUserImages(a, other.cache_key, 4, 0, 0, 0, &.{}, &.{}, &.{}, other.images);
++    try std.testing.expectEqual(@as(u32, 1), miss.entry.?.at); // text before the image remains reusable
++    store.release(miss.entry.?);
++    const later = try markerFree(a, &.{hashes[0]}, &.{ 1, 9, 2, 4 });
++    const hit = try store.lookupUserImages(a, later.cache_key, 4, 0, 0, 0, &.{}, &.{}, &.{}, later.images);
++    try std.testing.expectEqual(@as(u32, 2), hit.entry.?.at);
++    store.release(hit.entry.?);
++    try std.testing.expect(store.keepBornImages(other.cache_key, 4, 2, null, &.{}, &.{}, other.images));
++    try std.testing.expectEqual(@as(usize, 3), store.entries.items.len); // both identities keep independent states
++    const two = try markerFree(a, &.{ hashes[0], hashes[0] }, &.{ 9, 9, 2, 3 });
++    const changed = try markerFree(a, &.{ hashes[0], hashes[1] }, &.{ 9, 9, 2, 3 });
++    try std.testing.expectEqualSlices(u32, two.cache_key, changed.cache_key);
++    try std.testing.expect(store.keepBornImages(two.cache_key, 4, 1, null, &.{}, &.{}, two.images));
++    try std.testing.expect(store.keepBornImages(two.cache_key, 4, 2, null, &.{}, &.{}, two.images));
++    const partial = try store.lookupUserImages(a, changed.cache_key, 4, 0, 0, 0, &.{}, &.{}, &.{}, changed.images);
++    try std.testing.expectEqual(@as(u32, 1), partial.entry.?.at); // only the first, unchanged image resumes
++    store.release(partial.entry.?);
++    try std.testing.expect(store.image_query == null);
++}
++
+ test "one-token images whose row words collide share no kept state; the same image resumes it" {
+     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+     defer arena.deinit();
+diff --git a/zig/src/server/image_reuse_test.zig b/zig/src/server/image_reuse_test.zig
+index d66281acbf1842a9aa5a739a6bff255beaccb271..0948b86ab0b60826f4eb74aecb8f2e7dcb5254a9 100644
+--- a/zig/src/server/image_reuse_test.zig
++++ b/zig/src/server/image_reuse_test.zig
+@@ -65,7 +65,7 @@ const Gone = struct {
+ };
+ 
+ const Turn = struct { cached: usize, prompt: usize, rows: usize, tokens: []const u32, finish: []const u8 };
+-const Options = struct { image_tokens: u32 = 64, budget: u64 = 1 << 20, strip: bool = false };
++const Options = struct { image_tokens: u32 = 64, budget: u64 = 1 << 20, strip: bool = false, image_pad: bool = false };
+ 
+ /// A served model: the real server and lane host, the fake target (image rows named by their image) and a prompt cache.
+ const Harness = struct {
+@@ -94,10 +94,15 @@ const Harness = struct {
+         h.core = lanes.Engine.init(gpa, &h.cfg, h.target.backend(), h.clock.clock());
+         h.store = pc.Store.init(gpa, .{ .ptr = &h.target, .vtable = &.{ .bytes = bytes, .save = save, .restore = restore, .drop = drop } }, .{ .min_gap = 4, .min_prompt = 0 }, o.budget);
+         h.files = try fixture.Fixture.init(a, 0);
+-        try h.files.tmp.dir.writeFile(t.io, .{ .sub_path = "chat_template.jinja", .data = template });
++        if (o.image_pad) {
++            const tokenizer = try std.mem.replaceOwned(u8, a, @embedFile("fixtures/control_tokens/mini_tokenizer.json"), "<|image|>", "<|image_pad|>");
++            try h.files.tmp.dir.writeFile(t.io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
++        }
++        const source = if (o.image_pad) try std.mem.replaceOwned(u8, a, template, "<|image|>", "<|image_pad|>") else template;
++        try h.files.tmp.dir.writeFile(t.io, .{ .sub_path = "chat_template.jinja", .data = source });
+         var problem: []const u8 = "";
+         h.hf = try HfText.load(gpa, t.io, h.files.path, null, a, &problem);
+-        h.markers = .{h.hf.text().tokenId("<|image|>").?};
++        h.markers = .{h.hf.text().tokenId(if (o.image_pad) "<|image_pad|>" else "<|image|>").?};
+         const vision: api.Vision = .{ .ctx = &h.dummy, .prepare = prepare, .image_token = h.markers[0], .markers = &h.markers, .image_tokens = o.image_tokens, .max_images = 4 };
+         h.host = api.LaneHost.init(gpa, t.io, &h.core, .{ .lanes = 2, .vision = vision, .prompt_cache = true });
+         h.host.cache = &h.store;
+@@ -205,6 +210,49 @@ fn expectFresh(a: Allocator, o: Options, messages: []const u8, turn: Turn) !void
+     try t.expectEqualSlices(u32, (try fresh(a, o, messages)).tokens, turn.tokens);
+ }
+ 
++test "image guard: a sole image-pad marker protects typed spellings without adding model wrapper tokens" {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const h = try Harness.init(t.allocator, a, .{ .image_pad = true });
++    defer h.deinit();
++    const text = h.hf.text();
++    const vision = h.srv.info.vision.?;
++    const image = text.tokenId("<|image_pad|>").?;
++    try t.expectEqualSlices(u32, &.{image}, vision.markers);
++    try t.expect(vision.wrap == null);
++    const prefix = try text.encode(a, "<|im_start|>user\n", false);
++    const suffix = try text.encode(a, "<|im_end|>\n<|im_start|>assistant\n", false);
++    const pic = try picture(a, 'p', 2);
++    for ([_]struct { real: bool, content: []const u8 }{
++        .{ .real = true, .content = "read this" },
++        .{ .real = false, .content = "literal <|image_pad|> text" },
++        .{ .real = true, .content = "literal <|image_pad|> text" },
++    }) |case| {
++        const body = try conv(a, &.{try user(a, case.content, if (case.real) &.{pic} else &.{})});
++        const msgs = (try json.parse(a, body)).ok;
++        var cx: Cx = .{ .a = a };
++        const raw = try @import("prompt.zig").renderIds(h.srv, &cx, msgs, &.{}, false, null, true);
++        const literal = try text.encodePlain(a, case.content);
++        try t.expectEqual(@as(usize, 0), std.mem.countScalar(u32, literal, image));
++        const authored: []const u32 = if (case.real) &.{image} else &.{};
++        const reference = try std.mem.concat(a, u32, &.{ prefix, literal, authored, suffix });
++        try t.expectEqualSlices(u32, reference, raw);
++        const prepared = try @import("prompt.zig").prepare(h.srv, &cx, .{ .messages = msgs, .fields = .null }, false, null);
++        const rows: []const u32 = if (case.real) &.{ image, image } else &.{};
++        const expanded = try std.mem.concat(a, u32, &.{ prefix, literal, rows, suffix });
++        try t.expectEqualSlices(u32, expanded, prepared.ids);
++        try t.expectEqual(@as(usize, @intFromBool(case.real)), prepared.images.len);
++        if (case.real) {
++            try t.expectEqual(@as(u32, @intCast(prefix.len + literal.len)), prepared.images[0].at);
++            try t.expectEqual(@as(u32, 2), prepared.images[0].tokens);
++        }
++        const turn = try h.ask(a, body);
++        try t.expectEqual(expanded.len, turn.prompt);
++        try t.expectEqual(@as(usize, if (case.real) 2 else 0), turn.rows);
++    }
++}
++
+ test "image reuse: text turns after an image resume past it, feed no image rows and equal a fresh server" {
+     var arena = std.heap.ArenaAllocator.init(t.allocator);
+     defer arena.deinit();
+@@ -361,7 +409,7 @@ test "image reuse: a cancelled image pass and an evicting cache leave later turn
+     try expectFresh(a, small, a2, turn);
+ }
+ 
+-test "image reuse: the planted control without image keys resumes another picture's state and the check sees it" {
++test "image reuse: exact image metadata prevents a wrong restore even when row keys are omitted" {
+     var arena = std.heap.ArenaAllocator.init(t.allocator);
+     defer arena.deinit();
+     const a = arena.allocator();
+@@ -369,7 +417,7 @@ test "image reuse: the planted control without image keys resumes another pictur
+     defer h.deinit();
+     _ = try h.ask(a, try conv(a, &.{ system, try user(a, "Look at this.", &.{try picture(a, 'a', 12)}) }));
+     const other = try conv(a, &.{ system, try user(a, "Look at this.", &.{try picture(a, 'b', 12)}) });
+-    const wrong = try h.ask(a, other);
+-    try t.expectEqual(@as(usize, 0), wrong.rows); // resumed past the placeholders: picture a's rows stood in for b's
+-    try t.expect(!std.mem.eql(u32, (try fresh(a, .{}, other)).tokens, wrong.tokens));
++    const turn = try h.ask(a, other);
++    try t.expectEqual(@as(usize, 12), turn.rows);
++    try expectFresh(a, .{}, other, turn);
+ }
+diff --git a/zig/src/server/images.zig b/zig/src/server/images.zig
+index e3d89d6963138e26667fd88029407c211e713f13..ade355ce314c418e7001960bc5f823dd1671dc8e 100644
+--- a/zig/src/server/images.zig
++++ b/zig/src/server/images.zig
+@@ -25,7 +25,7 @@ pub const Expanded = struct {
+     ids: []const u32,
+     history_len: usize,
+     images: []const api.Image,
+-    cache_key: []const u32,
++    cache_key: []const u32, // one compact word per model row; the core also checks exact Image metadata
+ };
+ 
+ const Part = struct { video: bool = false, url: []const u8, low: bool = false };

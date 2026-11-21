@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shuuul <6903405+shuuul@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 04:13:09 +0000
+Subject: [PATCH 10/33] cuda: stage downloads only on integrated devices, and
+ count the bounce
+
+Upstream TensorFold commit by shuuul, ported onto this series (upstream main 194115d240a4).
+
+Discrete cards keep their direct DtoH copies and their speed. The bounce's
+pinned bytes now count in memory.usage and are released with it. Comments
+are one line each; tests cover both the integrated and discrete paths.
+
+(cherry picked from commit 194115d240a45ec4d511114f6b9b9ce0a044ac4d)
+---
+ zig/src/cuda/download_stage.zig      | 31 +++++++++++++-----
+ zig/src/cuda/download_stage_test.zig | 48 +++++++++++++++++++++++++---
+ zig/src/cuda/memory.zig              | 12 +++++--
+ 3 files changed, 77 insertions(+), 14 deletions(-)
+
+diff --git a/zig/src/cuda/download_stage.zig b/zig/src/cuda/download_stage.zig
+index 77a8f9efd87e80c5b0e82d9b8b3b2128cc54c389..532fbebd5a17e76566861aff0ca6e2b1cac02332 100644
+--- a/zig/src/cuda/download_stage.zig
++++ b/zig/src/cuda/download_stage.zig
+@@ -1,22 +1,30 @@
+-//! What every synchronous download lands in first: this thread's page-locked memory, at most `most`
+-//! bytes, copied on into the caller's by the CPU. On GB10 a `cuMemcpyDtoH` straight into pageable
+-//! memory (the host allocator's, freshly mapped) can miss pages with no CUDA error: some keep what
+-//! they held, the bytes land on other pages of the process. Calls to `DeviceBuffer.download` stage
+-//! through here; `downloadAsync` still needs pinned memory, as documented.
++//! A thread's page-locked bounce for synchronous downloads on integrated GPUs.
+ const std = @import("std");
+ const abi = @import("abi.zig");
+ const Driver = @import("driver.zig").Driver;
+ const Error = @import("driver.zig").Error;
++const memory = @import("memory.zig");
+ 
+ /// The largest piece one copy takes; larger downloads go through in pieces.
+ pub const most: usize = 4 << 20;
+ 
+ const Held = struct { d: *const Driver, bytes: []align(16) u8 };
++const Device = struct { d: *const Driver, integrated: bool };
+ threadlocal var held: ?Held = null;
++threadlocal var device: ?Device = null;
+ 
+-/// This thread's page-locked buffer of at least `len` bytes, reallocated when a larger piece is asked
+-/// for. The driver allocates it directly, so it is not counted in `memory.usage`: it is one per
+-/// thread, bounded by `most`, and kept for that thread's next download.
++/// Whether this thread's current device shares memory with the host; read once per driver.
++pub fn integrated(d: *const Driver) Error!bool {
++    if (device) |one| if (one.d == d) return one.integrated;
++    var dev: abi.Device = 0;
++    try d.check(d.api.cuCtxGetDevice(&dev), "cuCtxGetDevice");
++    var v: c_int = 0;
++    try d.check(d.api.cuDeviceGetAttribute(&v, .integrated, dev), "cuDeviceGetAttribute");
++    device = .{ .d = d, .integrated = v != 0 };
++    return v != 0;
++}
++
++/// This thread's page-locked buffer of at least `len` bytes; it counts in `memory.usage`.
+ pub fn take(d: *const Driver, len: usize) Error![]align(16) u8 {
+     if (held) |h| {
+         if (h.d == d and h.bytes.len >= len) return h.bytes[0..len];
+@@ -27,6 +35,7 @@ pub fn take(d: *const Driver, len: usize) Error![]align(16) u8 {
+     try d.check(d.api.cuMemHostAlloc(&p, size, abi.host_alloc_portable), "cuMemHostAlloc");
+     const base: [*]align(16) u8 = @ptrCast(@alignCast(p.?));
+     held = .{ .d = d, .bytes = base[0..size] };
++    memory.retainHost(size);
+     return held.?.bytes[0..len];
+ }
+ 
+@@ -34,6 +43,12 @@ pub fn take(d: *const Driver, len: usize) Error![]align(16) u8 {
+ pub fn drop() void {
+     if (held) |h| {
+         _ = h.d.api.cuMemFreeHost(h.bytes.ptr);
++        memory.releaseRetainedHost(h.bytes.len);
+         held = null;
+     }
+ }
++
++/// Forgets the cached device reading (tests use distinct drivers, but a fake may reuse one).
++pub fn forget() void {
++    device = null;
++}
+diff --git a/zig/src/cuda/download_stage_test.zig b/zig/src/cuda/download_stage_test.zig
+index 188abb679503c176f2bc73a188564ee68cd70bae..a0c493e9e0030d847444e5c4fa7d2ca5f6441720 100644
+--- a/zig/src/cuda/download_stage_test.zig
++++ b/zig/src/cuda/download_stage_test.zig
+@@ -1,4 +1,4 @@
+-//! The synchronous download's staging path, with a driver that only writes pinned destinations.
++//! The download staging path, with a fake driver that writes only pinned destinations.
+ const std = @import("std");
+ const abi = @import("abi.zig");
+ const Driver = @import("driver.zig").Driver;
+@@ -7,6 +7,8 @@ const stage = @import("download_stage.zig");
+ 
+ var pinned: [64 << 10]u8 align(16) = undefined;
+ var destination: usize = 0;
++var allocations: usize = 0;
++var integrated_flag: c_int = 1;
+ 
+ fn pinnedRange(ptr: usize) bool {
+     const base = @intFromPtr(&pinned[0]);
+@@ -15,6 +17,7 @@ fn pinnedRange(ptr: usize) bool {
+ 
+ fn hostAlloc(out: ?*?*anyopaque, len: usize, _: c_uint) callconv(.c) abi.Result {
+     if (len > pinned.len) return 1;
++    allocations += 1;
+     out.?.* = &pinned[0];
+     return 0;
+ }
+@@ -23,24 +26,61 @@ fn hostFree(_: ?*anyopaque) callconv(.c) abi.Result {
+     return 0;
+ }
+ 
+-/// Writes only a pinned destination, as the GB10 fault leaves pageable memory untouched.
++fn contextDevice(out: *abi.Device) callconv(.c) abi.Result {
++    out.* = 0;
++    return 0;
++}
++
++fn deviceAttribute(out: *c_int, attribute: abi.DeviceAttribute, _: abi.Device) callconv(.c) abi.Result {
++    out.* = if (attribute == .integrated) integrated_flag else 0;
++    return 0;
++}
++
+ fn copyToHost(dst: ?*anyopaque, _: abi.DevicePtr, len: usize) callconv(.c) abi.Result {
+     destination = @intFromPtr(dst.?);
+-    if (pinnedRange(destination)) @memset(@as([*]u8, @ptrCast(dst.?))[0..len], 0x5a);
++    if (pinnedRange(destination) or integrated_flag == 0) @memset(@as([*]u8, @ptrCast(dst.?))[0..len], 0x5a);
+     return 0;
+ }
+ 
+-test "a synchronous download lands in pinned memory, not the caller's pageable slice" {
++fn driver() Driver {
+     var d: Driver = undefined;
+     d.api.cuMemHostAlloc = hostAlloc;
+     d.api.cuMemFreeHost = hostFree;
++    d.api.cuCtxGetDevice = contextDevice;
++    d.api.cuDeviceGetAttribute = deviceAttribute;
+     d.api.cuMemcpyDtoH_v2 = copyToHost;
++    return d;
++}
++
++test "an integrated GPU's download lands in pinned memory, not the caller's pageable slice" {
++    integrated_flag = 1;
++    allocations = 0;
++    stage.forget();
+     stage.drop();
+     defer stage.drop();
++    const before = memory.usage(false).host;
++    var d = driver();
+     var out: [64]u8 = @splat(0xaa);
+     const src: memory.DeviceBuffer = .{ .d = &d, .ptr = 0x1000, .len = out.len, .borrowed = true };
+     try src.download(0, &out);
+     try std.testing.expect(std.mem.allEqual(u8, &out, 0x5a));
+     try std.testing.expect(pinnedRange(destination));
+     try std.testing.expect(destination != @intFromPtr(&out));
++    try std.testing.expectEqual(@as(usize, 1), allocations);
++    try std.testing.expect(memory.usage(false).host >= before + (64 << 10));
++}
++
++test "a discrete GPU's download copies straight into the caller's slice" {
++    integrated_flag = 0;
++    allocations = 0;
++    stage.forget();
++    stage.drop();
++    defer stage.drop();
++    var d = driver();
++    var out: [64]u8 = @splat(0xaa);
++    const src: memory.DeviceBuffer = .{ .d = &d, .ptr = 0x1000, .len = out.len, .borrowed = true };
++    try src.download(0, &out);
++    try std.testing.expect(std.mem.allEqual(u8, &out, 0x5a));
++    try std.testing.expectEqual(@intFromPtr(&out), destination);
++    try std.testing.expectEqual(@as(usize, 0), allocations);
+ }
+diff --git a/zig/src/cuda/memory.zig b/zig/src/cuda/memory.zig
+index 6e77c8dd88e7e4c60a7d6e6339af5657b65b30d1..2afea175b5045b877e085b6019f895a5ccbaf420 100644
+--- a/zig/src/cuda/memory.zig
++++ b/zig/src/cuda/memory.zig
+@@ -190,12 +190,15 @@ pub const DeviceBuffer = struct {
+         try @import("copy_source.zig").synchronousCopy(self.d, dst, bytes, std.heap.page_allocator);
+     }
+ 
+-    /// Returns once the bytes have landed; the copy stages through this thread's page-locked buffer, a
+-    /// piece of at most `download_stage.most` bytes at a time (see that module for why).
++    /// Returns once the bytes have landed; an integrated GPU stages through this thread's pinned bounce.
+     pub fn download(self: DeviceBuffer, offset: usize, out: []u8) Error!void {
+         const src = try self.span(offset, out.len);
+         if (out.len == 0) return;
+         const stage = @import("download_stage.zig");
++        if (!try stage.integrated(self.d)) {
++            try self.d.check(self.d.api.cuMemcpyDtoH_v2(out.ptr, src, out.len), "cuMemcpyDtoH");
++            return;
++        }
+         var done: usize = 0;
+         while (done < out.len) {
+             const n = @min(out.len - done, stage.most);
+@@ -554,6 +557,11 @@ pub fn releaseRetainedHost(bytes: usize) void {
+     freed(&host_bytes, bytes);
+ }
+ 
++/// Counts pinned bytes the driver allocated directly (a download's bounce), so `usage` and the limit see them.
++pub fn retainHost(bytes: usize) void {
++    held(&host_bytes, bytes);
++}
++
+ test "Failure boundaries: a buffer keeps its allocation hook when the installed hook changes" {
+     const Owner = struct {
+         freed: usize = 0,

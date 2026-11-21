@@ -1,0 +1,115 @@
+Qwen3.8-Flash-Next-EXL3-Dual-DGX-Sparks-TensorFold
+Copyright 2026 tempeste
+
+This project's own code, scripts and documentation are licensed under the Apache License, Version 2.0 (see LICENSE).
+If you redistribute this project or a modified version of it, keep this NOTICE file and state what you changed
+(Apache-2.0, section 4).
+
+This project builds on third-party work that keeps its own license:
+
+TensorFold
+  https://github.com/ashhart/TensorFold
+  Copyright 2026 TensorFold contributors. Apache License, Version 2.0 from 0.6.0; code written before 0.6.0 keeps its
+  MIT notice (below). TensorFold's NOTICE reads: "TensorFold / Copyright 2026 TensorFold contributors /
+  https://github.com/ashhart/TensorFold".
+  scripts/prepare.sh builds TensorFold's Zig engine from TensorFold's source at the commit pinned in scripts/config.sh;
+  the image carries that build in /opt/tensorfold and TensorFold's LICENSE, LICENSES/, NOTICE and
+  THIRD_PARTY_NOTICES.md in /opt/tensorfold/share/doc/tensorfold. The files in patches/ modify TensorFold's source and
+  are applied to it with git apply before the build. The changes in patches/ written for this project are offered
+  under Apache-2.0; the patches that carry upstream TensorFold commits (their authors in each patch's From: line) stay
+  those authors' contributions under TensorFold's license; the TensorFold code the patches modify, and quote as diff
+  context, stays under TensorFold's licenses: Apache-2.0, and for code written before 0.6.0 also its MIT notice
+  (TensorFold's LICENSES/MIT.txt), so keep TensorFold's NOTICE and this copyright and permission notice with any copy
+  of a patched tree:
+
+    Copyright (c) 2026 TensorFold contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold (MiaAI-Lab)
+  https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold
+  patches/0002 and patches/0003 port changes from its patches 0001-0017 (each change names its recipe patch). Those
+  changes are under its MIT License:
+
+    MIT License
+
+    Copyright (c) 2026 MiaAI-Lab
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold (MiaAI-Lab)
+  https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold
+  Copyright 2026 MiaAI-Lab. Apache License, Version 2.0. start.sh, stop.sh, scripts/config.sh, scripts/nodes.sh,
+  scripts/prepare.sh and scripts/local.sh.example are adapted from its files of the same names (Apache-2.0, section 4:
+  this project changed them; each file's header says so, CREDITS.md lists what was taken).
+
+pico-dgx-qwen38 (Picom-code)
+  https://github.com/Picom-code/pico-dgx-qwen38
+  Apache License, Version 2.0. The idea of its patch 0111 is reimplemented in patches/0031 (TF_FLASHNEXT_LATE_SKIP);
+  no code is copied.
+
+ExLlamaV3 (turboderp)
+  https://github.com/turboderp-org/exllamav3
+  MIT License, Copyright (c) 2025 Turboderp. TensorFold's EXL3 decoders and kernels implement its format separately
+  (TensorFold's THIRD_PARTY_NOTICES.md). tools/exl3_experts_pack.py reads only safetensors headers and copies byte
+  ranges of the EXL3 checkpoint.
+
+Zig
+  https://ziglang.org
+  Copyright (c) Zig contributors. The MIT License (Expat). The image build downloads Zig 0.17.0
+  (zig-aarch64-linux-0.17.0.tar.xz, checked against its sha256) to compile TensorFold's engine; the compiler is used in
+  the build stages only and is not part of the serving image.
+
+Model files (downloaded from Hugging Face by scripts/prepare.sh; not included in this repository or its image)
+  nvidia/Qwen3.8-Flash-Next-FP4-Local is NVIDIA's FP4 checkpoint of Qwen/Qwen3.8-Flash-Next. Per its model card, its
+  use is governed by the NVIDIA Open Model Agreement
+  (https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-agreement/), with the Qwen Community
+  License 1.0 (https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE) for the base model.
+  turboderp/Qwen3.8-Flash-Next-exl3 (branch 2.68bpw_h6_ng8) is turboderp's EXL3 quantization of Qwen3.8-Flash-Next,
+  under the Qwen Community License 1.0 per its model card and LICENSE file. Only its routed-expert tensors are used,
+  re-laid-out per rank, unmodified.
+
+Third-party software in the image
+  The image scripts/prepare.sh builds is based on NVIDIA's PyTorch container nvcr.io/nvidia/pytorch:26.07-py3. The
+  NVIDIA software in it is governed by the NVIDIA Software License Agreement
+  (https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/) and the
+  Product-Specific Terms for NVIDIA AI Products
+  (https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/), which the
+  container prints at every start. The image also contains libjpeg-turbo (IJG and BSD-3-Clause licenses), libwebp
+  (BSD-3-Clause), and the grammar library of TensorFold's v1.1.4 release with the xgrammar and dlpack license files
+  (Apache-2.0), copied into /opt/tensorfold/share/doc/tensorfold/LICENSES-grammar. This project's Apache License covers
+  its own work only, not the software in the image.
+
+See CREDITS.md for everyone this project builds on.

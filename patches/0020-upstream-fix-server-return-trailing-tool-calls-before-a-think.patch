@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ashhart <71890694+ashhart@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 18:44:19 +0000
+Subject: [PATCH 20/33] fix(server): return trailing tool calls before a think
+ close
+
+Upstream TensorFold commit by ashhart, ported onto this series (upstream main 84d242a96bde).
+
+Upstream 84d242a96 (#2310), the format-independent part. A reply that wrote whole tool-call envelopes just
+before its think close and then an empty answer had those calls kept as reasoning, so the client saw no
+call. splitThinkingAt now moves a suffix made only of whole call envelopes into the answer once the reply
+is finished (streamed, it waits). Calls followed by more reasoning or an answer stay where they were.
+Left out: MiniMax's close-offset remap (chat_generation.zig and tool_minimax.zig, which this fork does not
+split out) and upstream's multi-format test file; a Qwen-shaped test is added in reply_text.zig.
+
+(cherry picked from commit 84d242a96bde7e8e071813284a5d0dd9900d0bd7)
+---
+ zig/src/server/reply_text.zig      | 24 ++++++++++++++++++++++--
+ zig/src/server/reply_tool_tail.zig | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 50 insertions(+), 2 deletions(-)
+ create mode 100644 zig/src/server/reply_tool_tail.zig
+
+diff --git a/zig/src/server/reply_text.zig b/zig/src/server/reply_text.zig
+index 2c11f538e5171051c4c1c8a509eb1c414cd1581f..0a3783dd6c08f6b0357b925a23aebb454f3b96fb 100644
+--- a/zig/src/server/reply_text.zig
++++ b/zig/src/server/reply_text.zig
+@@ -40,7 +40,7 @@ pub fn openersOf(m: Markers) Openers {
+ }
+ 
+ /// Whether the text after an opener is a call's payload, may still become one, or is prose that names the opener.
+-fn payloadOf(rest: []const u8, o: Openers, which: usize, finished: bool) enum { call, wait, prose } {
++pub fn payloadOf(rest: []const u8, o: Openers, which: usize, finished: bool) enum { call, wait, prose } {
+     if (o.leads[which].len == 0) return .call;
+     const body = std.mem.trimStart(u8, rest, " \t\r\n");
+     for (o.leads[which]) |lead| if (std.mem.startsWith(u8, body, lead)) return .call;
+@@ -162,7 +162,11 @@ pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Marker
+     };
+     if (end) |at_end| {
+         if (at_end + m.close.len <= text.len and std.mem.startsWith(u8, text[at_end..], m.close)) {
+-            return .{ .reasoning = text[0..at_end], .answer = trimNewlines(text[at_end + m.close.len ..]) };
++            const reasoning = text[0..at_end];
++            const answer = trimNewlines(text[at_end + m.close.len ..]);
++            if (pyStrip(answer).len == 0) if (@import("reply_tool_tail.zig").start(reasoning, o)) |call_start|
++                return .{ .reasoning = reasoning[0..call_start], .answer = if (finished) reasoning[call_start..] else "" };
++            return .{ .reasoning = reasoning, .answer = answer };
+         }
+         // the close token's bytes are not where the text says: the whole text is reasoning
+     }
+@@ -567,3 +571,19 @@ test "reply text: MiniMax-M3's call opener is watched for only under MiniMax-M3'
+     try std.testing.expectEqualStrings("x = a[i", try hideInto(a, &out, "x = a[i]", false, false, mm));
+     try std.testing.expectEqualStrings("Checking. ", try hideInto(a, &out, "Checking. ]<]minimax[>[<tool_call>]<]minimax[>[<invoke", false, false, mm));
+ }
++
++test "thinking tail: a Qwen call written just before the close is the answer once the reply ends empty" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const call = "<tool_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"a.txt\"}}\n</tool_call>";
++    const full = "I should read the file.\n" ++ call ++ "\n</think>\n\n";
++    const whole = try splitThinkingAt(a, full, true, think_markers, .spelled);
++    try std.testing.expectEqualStrings("I should read the file.\n", whole.reasoning);
++    try std.testing.expectEqualStrings(call ++ "\n", whole.answer);
++    const streamed = try splitThinkingAt(a, full, false, think_markers, .spelled);
++    try std.testing.expectEqualStrings("I should read the file.\n", streamed.reasoning);
++    try std.testing.expectEqualStrings("", streamed.answer);
++    const answered = try splitThinkingAt(a, "I should read the file.\n" ++ call ++ "\n</think>\n\nDone.", true, think_markers, .spelled);
++    try std.testing.expectEqualStrings("Done.", answered.answer);
++}
+diff --git a/zig/src/server/reply_tool_tail.zig b/zig/src/server/reply_tool_tail.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e36a9ee95dce4e7984eefbe8dcda6718aec8612
+--- /dev/null
++++ b/zig/src/server/reply_tool_tail.zig
+@@ -0,0 +1,28 @@
++//! The first byte of a suffix made only of whole call envelopes and whitespace.
++const reply = @import("reply_text.zig");
++
++pub fn start(text: []const u8, openers: reply.Openers) ?usize {
++    var pos: usize = 0;
++    var tail: ?usize = null;
++    while (true) {
++        var next: ?usize = null;
++        var which: usize = 0;
++        for (openers.calls, 0..) |c, i| if (reply.findTag(text, pos, c[0])) |at| {
++            if (next == null or at < next.?) {
++                next = at;
++                which = i;
++            }
++        };
++        const at = next orelse return if (reply.pyStrip(text[pos..]).len == 0) tail else null;
++        const tags = openers.calls[which];
++        const payload = at + tags[0].len;
++        if (reply.payloadOf(text[payload..], openers, which, true) != .call) {
++            tail = null;
++            pos = payload;
++            continue;
++        }
++        const end = reply.findTag(text, payload, tags[1]) orelse return null;
++        if (tail == null or reply.pyStrip(text[pos..at]).len > 0) tail = at;
++        pos = end + tags[1].len;
++    }
++}

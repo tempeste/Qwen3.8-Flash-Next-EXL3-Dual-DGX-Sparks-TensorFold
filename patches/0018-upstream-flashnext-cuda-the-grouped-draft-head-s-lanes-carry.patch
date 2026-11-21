@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Armin <2369138+Arminova@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 18:43:28 +0000
+Subject: [PATCH 18/33] flashnext cuda: the grouped draft head's lanes carry
+ their page table
+
+Upstream TensorFold commit by Armin, ported onto this series (upstream main 4b2679bf9701).
+
+Upstream 4b2679bf9 (#2244), redone by hand on our grouped head (headGroup), which also sets the lane's KV
+format. On TF_FLASHNEXT_KV_PAGES a shared round's grouped MTP head pass built lanes without a page table, so
+the head read and wrote its rows as a contiguous cache from the first page, into other streams' pages. The
+lane is now built in headLane, which the TP=2 draft split's grouped pass uses too. Not reached in this series' default setup:
+KV pages are refused at --tp 2 and with NVFP4 KV caches. The host test is upstream's.
+
+(cherry picked from commit 4b2679bf9701dabad997486b58f029e0a97cdc88)
+---
+ .../families/flashnext/cuda_draft_split.zig    |  2 +-
+ zig/src/families/flashnext/cuda_mtp_ops.zig    | 18 +++++++++++++++++-
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/flashnext/cuda_draft_split.zig b/zig/src/families/flashnext/cuda_draft_split.zig
+index 9fb21722932627edc6b1b74df2850f14f6996c44..a9694b71b48d88caa82fe2c6931bf02dbda08355 100644
+--- a/zig/src/families/flashnext/cuda_draft_split.zig
++++ b/zig/src/families/flashnext/cuda_draft_split.zig
+@@ -258,7 +258,7 @@ pub const State = struct {
+         if ((own != null) != (st.rank == 0)) return error.BadRank;
+         var lane_buf: [max_lanes]batch.Lane = undefined;
+         if (own) |o| for (o.ds, lane_rows, 0..) |d, r, i| {
+-            lane_buf[i] = .{ .seq = .{ .media = null, .conv = &.{}, .state = &.{}, .kc = (&d.kc)[0..1], .vc = (&d.vc)[0..1], .ikc = (&d.ikc)[0..1], .pooled = (&d.pooled)[0..1], .tail = d.kc, .history = &d.unused_history, .cap = d.cap, .scores = o.score_rows, .kv = d.kv }, .pos = d.len, .rows = r };
++            lane_buf[i] = @import("cuda_mtp_ops.zig").headLane(d, r, o.score_rows);
+         };
+         var p: batch.Pass(Tri) = .{
+             .gpa = e.gpa,
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index d804ff64a4a434899ba33259811356c7fa055f88..9088cb1a4fa2775d7d88a81062755a6a268c4fda 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -66,6 +66,11 @@ fn cint(v: usize) c_int {
+     return @intCast(v);
+ }
+ 
++/// A lane of the head's grouped pass: its draft's cache and pages at its length, as the lone head's pass reads them.
++pub fn headLane(d: *Draft, rows: usize, score_rows: u64) batch.Lane {
++    return .{ .seq = .{ .media = null, .conv = &.{}, .state = &.{}, .kc = (&d.kc)[0..1], .vc = (&d.vc)[0..1], .ikc = (&d.ikc)[0..1], .pooled = (&d.pooled)[0..1], .pg = d.pg, .tail = d.kc, .history = &d.unused_history, .cap = d.cap, .scores = score_rows, .kv = d.kv }, .pos = d.len, .rows = rows };
++}
++
+ fn copyAsync(stream: cuda.Stream, dst: u64, src: u64, n: usize) !void {
+     if (n == 0) return;
+     const d = stream.d;
+@@ -408,7 +413,7 @@ pub fn Ops(comptime Tri: type) type {
+             var at: usize = 0;
+             for (ds, nexts, 0..) |d, nx, i| {
+                 total += nx.len;
+-                lane_buf[i] = .{ .seq = .{ .media = null, .conv = &.{}, .state = &.{}, .kc = (&d.kc)[0..1], .vc = (&d.vc)[0..1], .ikc = (&d.ikc)[0..1], .pooled = (&d.pooled)[0..1], .tail = d.kc, .history = &d.unused_history, .cap = d.cap, .scores = score_rows, .kv = d.kv }, .pos = d.len, .rows = nx.len };
++                lane_buf[i] = headLane(d, nx.len, score_rows);
+                 @memcpy(ids_buf[at..][0..nx.len], nx);
+                 at += nx.len;
+             }
+@@ -956,3 +961,14 @@ pub fn Ops(comptime Tri: type) type {
+         }
+     };
+ }
++
++test "a grouped head's lane carries its draft's page table" {
++    var d: Draft = undefined;
++    d.pg = .{ .pt = 0x7000, .ps = 4096, .ptok = 256 };
++    d.len = 300;
++    d.cap = 1024;
++    const l = headLane(&d, 3, 0);
++    try std.testing.expectEqual(d.pg, l.seq.pg);
++    try std.testing.expectEqual(@as(usize, 300), l.pos);
++    try std.testing.expectEqual(@as(usize, 3), l.rows);
++}

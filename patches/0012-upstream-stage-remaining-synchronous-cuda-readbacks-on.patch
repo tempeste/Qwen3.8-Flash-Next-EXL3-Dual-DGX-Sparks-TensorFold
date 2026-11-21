@@ -1,0 +1,865 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ashhart <71890694+ashhart@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 22:39:46 +0000
+Subject: [PATCH 12/33] Stage remaining synchronous CUDA readbacks on
+ integrated GPUs
+
+Upstream TensorFold commit by ashhart, ported onto this series (upstream main e9ee73834161).
+
+Refs #2102.
+
+Route unowned spans through DeviceBuffer.download so integrated devices use
+its pinned bounce and discrete devices retain their direct copy. Preserve
+each caller's source, destination and byte count, including developer checks.
+
+Release the current thread's bounce and device reading before its driver
+closes. Exercise every changed copy expression on both fake device classes,
+plus chunk offsets, tails and driver lifetime.
+
+(cherry picked from commit e9ee73834)
+
+Adapted in this series: the readback-site sweep (zig/build/cuda_readback_host.zig, cuda_readback_sites.zig,
+zig/tests/cuda/staged_copy_fake.zig) embeds upstream files this fork does not carry, so it is left out;
+test-staged-copies-host runs the staging lifetime tests instead. Our own raw synchronous readbacks on the
+Flash Next path go through cuda.memory.download too: the window and mixed-round host logits, the lone
+head logits row, the MTP ops idle copy and the routing-count capture.
+---
+ zig/build/cuda.zig                            |  3 +
+ zig/src/cuda/download_stage.zig               |  6 ++
+ zig/src/cuda/download_stage_test.zig          | 72 ++++++++++++++++++-
+ zig/src/cuda/driver.zig                       |  1 +
+ zig/src/cuda/memory.zig                       |  6 ++
+ zig/src/cuda/root.zig                         |  1 +
+ .../families/flashnext/cuda_batch_head.zig    |  7 +-
+ .../families/flashnext/cuda_learn_main.zig    |  2 +-
+ zig/src/families/flashnext/cuda_lend.zig      |  2 +-
+ zig/src/families/flashnext/cuda_mtp_ops.zig   |  4 +-
+ zig/src/families/flashnext/cuda_prompt.zig    |  2 +-
+ .../families/flashnext/cuda_prompt_mixed.zig  |  2 +-
+ .../flashnext/cuda_prompt_windows.zig         |  3 +-
+ zig/src/families/flashnext/cuda_train.zig     |  4 +-
+ zig/src/families/gemma4/cuda_assistant.zig    |  2 +-
+ zig/src/families/gemma4/cuda_backend.zig      |  2 +-
+ zig/src/families/gemma4/cuda_dflash.zig       |  2 +-
+ zig/src/families/glm/cuda_engine_pick.zig     |  3 +-
+ zig/src/families/glm/cuda_structured.zig      |  3 +-
+ zig/src/families/glm/cuda_tile.zig            |  2 +-
+ zig/src/families/glm/cuda_vision.zig          |  2 +-
+ zig/src/families/glm/dflash_block.zig         |  2 +-
+ zig/src/families/h3/cuda_packing.zig          |  7 +-
+ zig/src/families/lfm2/vision.zig              |  2 +-
+ .../families/minimax_m3/cuda_dump_main.zig    |  6 +-
+ zig/src/families/qwen3_5/cuda_train.zig       |  4 +-
+ zig/src/families/qwen3_5/cuda_train_load.zig  |  2 +-
+ zig/tests/bolt_vision_main.zig                |  2 +-
+ zig/tests/cuda/experts_rows_tests.zig         |  2 +-
+ zig/tests/cuda/flashnext_window_tests.zig     |  2 +-
+ zig/tests/cuda/flashnext_windows_tests.zig    |  8 +--
+ zig/tests/cuda/fn_pocket_tests.zig            |  2 +-
+ zig/tests/cuda/gemma4_states_tests.zig        |  3 +-
+ zig/tests/cuda/glm_lanes_tests.zig            |  4 +-
+ zig/tests/cuda/glm_paged_tests.zig            |  4 +-
+ zig/tests/cuda/glm_solo_tests.zig             |  2 +-
+ zig/tests/cuda/glm_split_tests.zig            |  2 +-
+ zig/tests/cuda/glue_rig.zig                   |  4 +-
+ zig/tests/cuda/lfm2_kernel_tests.zig          |  2 +-
+ zig/tests/cuda/lfm2_vision_tests.zig          |  2 +-
+ zig/tests/cuda/moe_live_tests.zig             |  2 +-
+ zig/tests/cuda/pocket_tests.zig               |  2 +-
+ zig/tests/cuda/radio_tests.zig                |  2 +-
+ zig/tests/cuda/spark25_pages_tests.zig        |  3 +-
+ 44 files changed, 148 insertions(+), 54 deletions(-)
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index e1c54bea3bba9e17789c76806cb91465569b43a2..bbef698654bac9419e975e897eef20988647293c 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -209,6 +209,9 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     if (host.result.os.tag != .windows) @import("h3_host.zig").targets(b, cuda, step);
+     b.step("test-gradient-host", "Gradient bounds through real wrappers with recorded CUDA launches").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{"train launch bounds:"} })).step);
+     b.step("test-tp-id-host", "Bounded NCCL-ID TP fanout and independent wire controls without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{"tp id coverage:"} })).step);
++    const staged = b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{ "an unowned device span", "an empty unowned readback", "closing a driver drops", "download" } }));
++    b.step("test-staged-copies-host", "Staged synchronous downloads on integrated and discrete fake drivers").dependOn(&staged.step);
++    step.dependOn(&staged.step);
+     const runtime_host = b.step("test-runtime-host", "Shared CUDA runtime and graph host regressions");
+     runtime_host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda })).step);
+     const mods = family(b, host, .debug, cuda, draft_ids);
+diff --git a/zig/src/cuda/download_stage.zig b/zig/src/cuda/download_stage.zig
+index 532fbebd5a17e76566861aff0ca6e2b1cac02332..8c9eb5fd570d5dd8c0422bcdb0ab2c6813e5fdd1 100644
+--- a/zig/src/cuda/download_stage.zig
++++ b/zig/src/cuda/download_stage.zig
+@@ -52,3 +52,9 @@ pub fn drop() void {
+ pub fn forget() void {
+     device = null;
+ }
++
++/// Releases this driver's current-thread bounce and cached device reading before its library closes.
++pub fn closeDriver(d: *const Driver) void {
++    if (held) |h| if (h.d == d) drop();
++    if (device) |one| if (one.d == d) forget();
++}
+diff --git a/zig/src/cuda/download_stage_test.zig b/zig/src/cuda/download_stage_test.zig
+index 0cdb01f4646009a555c365f238bd148b94c397e5..4090e58d2537e9f194b78a3fb271ee57076686de 100644
+--- a/zig/src/cuda/download_stage_test.zig
++++ b/zig/src/cuda/download_stage_test.zig
+@@ -5,7 +5,7 @@ const Driver = @import("driver.zig").Driver;
+ const memory = @import("memory.zig");
+ const stage = @import("download_stage.zig");
+ 
+-var pinned: [64 << 10]u8 align(16) = undefined;
++var pinned: [stage.most]u8 align(16) = undefined;
+ var destination: usize = 0;
+ var allocations: usize = 0;
+ var integrated_flag: c_int = 1;
+@@ -86,3 +86,73 @@ test "a discrete GPU's download copies straight into the caller's slice" {
+     try std.testing.expectEqual(@intFromPtr(&out), destination);
+     try std.testing.expectEqual(@as(usize, 0), allocations);
+ }
++
++fn copySequence(dst: ?*anyopaque, src: abi.DevicePtr, len: usize) callconv(.c) abi.Result {
++    if (!pinnedRange(@intFromPtr(dst.?))) return abi.error_not_ready;
++    const bytes = @as([*]u8, @ptrCast(dst.?))[0..len];
++    for (bytes, 0..) |*b, i| b.* = @truncate((src + i) ^ ((src + i) >> 21));
++    return 0;
++}
++
++test "an unowned device span retains chunk offsets, exact tails and destination guards" {
++    integrated_flag = 1;
++    allocations = 0;
++    stage.forget();
++    stage.drop();
++    defer stage.forget();
++    defer stage.drop();
++    var d = driver();
++    d.api.cuMemcpyDtoH_v2 = copySequence;
++    const n = stage.most + 257;
++    const bytes = try std.testing.allocator.alloc(u8, n + 32);
++    defer std.testing.allocator.free(bytes);
++    @memset(bytes, 0xaa);
++    const src: u64 = 0x103b;
++    try memory.download(&d, src, bytes[16..][0..n]);
++    for (bytes[16..][0..n], 0..) |b, i| try std.testing.expectEqual(@as(u8, @truncate((src + i) ^ ((src + i) >> 21))), b);
++    try std.testing.expect(std.mem.allEqual(u8, bytes[0..16], 0xaa));
++    try std.testing.expect(std.mem.allEqual(u8, bytes[n + 16 ..], 0xaa));
++    try std.testing.expectEqual(@as(usize, 1), allocations);
++}
++
++test "an empty unowned readback needs no driver or allocation" {
++    const d: Driver = undefined;
++    try memory.download(&d, 0, &.{});
++}
++
++test "closing a driver drops its thread's bounce and forgets its integrated reading" {
++    integrated_flag = 1;
++    allocations = 0;
++    stage.forget();
++    stage.drop();
++    defer stage.forget();
++    defer stage.drop();
++    const before = memory.usage(false).host;
++    var d = driver();
++    const library = switch (@import("builtin").os.tag) {
++        .macos => "/usr/lib/libSystem.B.dylib",
++        .windows => "kernel32.dll",
++        else => "libc.so.6",
++    };
++    d.lib = try std.DynLib.open(library);
++    var closed = false;
++    defer if (!closed) d.close();
++    var out: [64]u8 = @splat(0xaa);
++    try memory.download(&d, 0x1000, &out);
++    var other = driver();
++    other.lib = try std.DynLib.open(library);
++    other.close();
++    try std.testing.expectEqual(before + (64 << 10), memory.usage(false).host);
++    d.close();
++    closed = true;
++    try std.testing.expectEqual(before, memory.usage(false).host);
++    integrated_flag = 0;
++    d = driver();
++    d.lib = try std.DynLib.open(library);
++    closed = false;
++    @memset(&out, 0xaa);
++    try memory.download(&d, 0x1000, &out);
++    try std.testing.expectEqual(@intFromPtr(&out), destination);
++    try std.testing.expectEqual(@as(usize, 1), allocations);
++    try std.testing.expectEqual(before, memory.usage(false).host);
++}
+diff --git a/zig/src/cuda/driver.zig b/zig/src/cuda/driver.zig
+index c00901bd225c5d295d2080dcdc04cc98f665627a..afd47ccc82de7bc5e18ad9604d894fcd1150ba61 100644
+--- a/zig/src/cuda/driver.zig
++++ b/zig/src/cuda/driver.zig
+@@ -54,6 +54,7 @@ pub const Driver = struct {
+ 
+     pub fn close(self: *Driver) void {
+         if (@import("copy_source.zig").keepDriver(self)) return;
++        @import("download_stage.zig").closeDriver(self);
+         self.lib.close();
+     }
+ 
+diff --git a/zig/src/cuda/memory.zig b/zig/src/cuda/memory.zig
+index 2afea175b5045b877e085b6019f895a5ccbaf420..0363ac81eab867dcfb57acd38f6b3d70a07ee55b 100644
+--- a/zig/src/cuda/memory.zig
++++ b/zig/src/cuda/memory.zig
+@@ -119,6 +119,12 @@ pub fn currentHook() ?Hook {
+     return alloc_hook;
+ }
+ 
++/// Reads an unowned device span using the same integrated-device staging as DeviceBuffer.download.
++pub fn download(d: *const Driver, src: abi.DevicePtr, out: []u8) Error!void {
++    const view: DeviceBuffer = .{ .d = d, .ptr = src, .len = out.len, .borrowed = true };
++    try view.download(0, out);
++}
++
+ pub const DeviceBuffer = struct {
+     d: *const Driver,
+     ptr: abi.DevicePtr,
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index ce70f2a56b68fd0eeb8fd4c78c82c2bb41a27ec2..1907d999bf355dbd70ea67c29136177c47cd0be1 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -10,6 +10,7 @@ pub const Context = @import("context.zig").Context;
+ pub const DeviceBuffer = @import("memory.zig").DeviceBuffer;
+ pub const HostBuffer = @import("memory.zig").HostBuffer;
+ pub const memory = @import("memory.zig");
++pub const download_stage = @import("download_stage.zig");
+ pub const memory_receipt = @import("memory_receipt.zig");
+ pub const setAllocationLimit = @import("memory.zig").setAllocationLimit;
+ pub const usage = @import("memory.zig").usage;
+diff --git a/zig/src/families/flashnext/cuda_batch_head.zig b/zig/src/families/flashnext/cuda_batch_head.zig
+index fbea7b9933d85ed3c14b4d4a5dc2522f44631c43..8a058e0ea411c6f68bd683882ed414e9f15537b3 100644
+--- a/zig/src/families/flashnext/cuda_batch_head.zig
++++ b/zig/src/families/flashnext/cuda_batch_head.zig
+@@ -1,6 +1,7 @@
+ //! The shared batched head and last-row write-back, split without changing launch arguments.
+ const knobs = @import("cuda_knobs.zig");
+ const std = @import("std");
++const cuda = @import("cuda");
+ const wt = @import("cuda_prompt_wt.zig");
+ const batch = @import("cuda_batch.zig");
+ const HcKeep = batch.HcKeep;
+@@ -43,7 +44,7 @@ pub fn head(self: anytype, logits_host: ?[]u8) !void {
+             if (logits_host) |lh| {
+                 try self.complete();
+                 const d = self.stream.d;
+-                try d.check(d.api.cuMemcpyDtoH_v2(lh.ptr, out + (n - 1) * vocab * 2, vocab * 2), "cuMemcpyDtoH");
++                try cuda.memory.download(d, out + (n - 1) * vocab * 2, std.mem.sliceAsBytes(lh)[0 .. vocab * 2]);
+             }
+         },
+         .last => {
+@@ -71,7 +72,7 @@ pub fn head(self: anytype, logits_host: ?[]u8) !void {
+             if (logits_host) |lh| {
+                 try self.complete();
+                 const d = self.stream.d;
+-                try d.check(d.api.cuMemcpyDtoH_v2(lh.ptr, s.logits, vocab * 2), "cuMemcpyDtoH");
++                try cuda.memory.download(d, s.logits, std.mem.sliceAsBytes(lh)[0 .. vocab * 2]);
+             }
+         },
+     }
+@@ -108,7 +109,7 @@ fn promptLanes(self: anytype) !void {
+         if (l.logits_host) |lh| {
+             try self.complete();
+             const d = self.stream.d;
+-            try d.check(d.api.cuMemcpyDtoH_v2(lh.ptr, s.logits, vocab * 2), "cuMemcpyDtoH");
++            try cuda.memory.download(d, s.logits, std.mem.sliceAsBytes(lh)[0 .. vocab * 2]);
+         }
+     }
+ }
+diff --git a/zig/src/families/flashnext/cuda_learn_main.zig b/zig/src/families/flashnext/cuda_learn_main.zig
+index f32c47661efc1b76ac57c40086b20a6fdfdecfda..9c6dcd5c89c37f83fd4502ee90ff970c97033f4c 100644
+--- a/zig/src/families/flashnext/cuda_learn_main.zig
++++ b/zig/src/families/flashnext/cuda_learn_main.zig
+@@ -14,7 +14,7 @@ const slots = 11;
+ fn fetch(d: *const cuda.Driver, gpa: std.mem.Allocator, ptr: u64, n: usize) ![]u8 {
+     const out = try gpa.alloc(u8, n);
+     errdefer gpa.free(out);
+-    try d.check(d.api.cuMemcpyDtoH_v2(out.ptr, ptr, n), "cuMemcpyDtoH");
++    try cuda.memory.download(d, ptr, std.mem.sliceAsBytes(out)[0..n]);
+     return out;
+ }
+ 
+diff --git a/zig/src/families/flashnext/cuda_lend.zig b/zig/src/families/flashnext/cuda_lend.zig
+index 34101938b143add5ff95f231fa739c85d9c09624..5b1ed25dac4c7dfff93b662819b48a6aeb72383b 100644
+--- a/zig/src/families/flashnext/cuda_lend.zig
++++ b/zig/src/families/flashnext/cuda_lend.zig
+@@ -384,7 +384,7 @@ pub const Capture = struct {
+         const n = try a.alloc(u64, cp.layers * experts_n);
+         defer a.free(n);
+         try stream.synchronize();
+-        try stream.d.check(stream.d.api.cuMemcpyDtoH_v2(std.mem.sliceAsBytes(n).ptr, b.ptr, n.len * 8), "cuMemcpyDtoH");
++        try cuda.memory.download(stream.d, b.ptr, std.mem.sliceAsBytes(n)[0 .. n.len * 8]);
+         const text = try formatCounts(a, cp.layers, cp.passes, n);
+         defer a.free(text);
+         const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{path});
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index dc077ad6caaabedcade34b9e22a4a19412bb91fa..d804ff64a4a434899ba33259811356c7fa055f88 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -75,13 +75,13 @@ fn copyAsync(stream: cuda.Stream, dst: u64, src: u64, n: usize) !void {
+ fn download(stream: cuda.Stream, dst: []u8, src: u64) !void {
+     const d = stream.d;
+     try stream.synchronize();
+-    try d.check(d.api.cuMemcpyDtoH_v2(dst.ptr, src, dst.len), "cuMemcpyDtoH");
++    try cuda.memory.download(d, src, std.mem.sliceAsBytes(dst)[0..dst.len]);
+ }
+ 
+ /// A copy to the host with no wait: the caller has synchronised the stream and queued nothing since.
+ fn copyIdle(stream: cuda.Stream, dst: []u8, src: u64) !void {
+     const d = stream.d;
+-    try d.check(d.api.cuMemcpyDtoH_v2(dst.ptr, src, dst.len), "cuMemcpyDtoH");
++    try cuda.memory.download(d, src, dst);
+ }
+ 
+ /// An owner can mirror main-model mutations to a peer without exposing device pointers on the control wire.
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index a36e265855bd54a61bad5a9a3d590c96f79293d8..1144ae81976fff8be965644566be2fe9e55f6237 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -550,7 +550,7 @@ pub const Engine = struct {
+         try e.complete();
+         const d = e.stream.d;
+         for (seqs, 0..) |q, r| {
+-            try d.check(d.api.cuMemcpyDtoH_v2(q.logits.ptr, out + r * vocab * 2, vocab * 2), "cuMemcpyDtoH");
++            try cuda.memory.download(d, out + r * vocab * 2, std.mem.sliceAsBytes(q.logits)[0 .. vocab * 2]);
+             q.fed += 1;
+         }
+     }
+diff --git a/zig/src/families/flashnext/cuda_prompt_mixed.zig b/zig/src/families/flashnext/cuda_prompt_mixed.zig
+index 8b466dca2cfc6566d91c8301ec9b4e1ae28bfbf9..8a2f557456149a6642c7049528fb917142bf4899 100644
+--- a/zig/src/families/flashnext/cuda_prompt_mixed.zig
++++ b/zig/src/families/flashnext/cuda_prompt_mixed.zig
+@@ -221,7 +221,7 @@ pub fn mixed(e: *Engine, comptime Tri: type, tri: Tri, piece: Piece, wins: []con
+     at = 0;
+     for (wins) |w| {
+         at += w.ids.len;
+-        try dv.check(dv.api.cuMemcpyDtoH_v2(w.seq.logits.ptr, out + (at - 1) * vocab * 2, vocab * 2), "cuMemcpyDtoH");
++        try cuda.memory.download(dv, out + (at - 1) * vocab * 2, std.mem.sliceAsBytes(w.seq.logits)[0 .. vocab * 2]);
+         w.seq.fed += w.ids.len;
+     }
+     piece.seq.fed += np;
+diff --git a/zig/src/families/flashnext/cuda_prompt_windows.zig b/zig/src/families/flashnext/cuda_prompt_windows.zig
+index 0f04a3f590394de1aa80d48221cee1412e3f9b1b..d56c471cb732968ec811fad99e7055da611a57d9 100644
+--- a/zig/src/families/flashnext/cuda_prompt_windows.zig
++++ b/zig/src/families/flashnext/cuda_prompt_windows.zig
+@@ -1,5 +1,6 @@
+ //! Several streams' drafted windows in one batched pass (Engine.windows), each row's bits its lone pass's.
+ const std = @import("std");
++const cuda = @import("cuda");
+ const prompt = @import("cuda_prompt.zig");
+ const batch = prompt.batch;
+ const pocket = @import("cuda_pocket.zig");
+@@ -61,7 +62,7 @@ pub fn windows(e: *Engine, comptime Tri: type, tri: Tri, wins: []const Window, o
+     at = 0;
+     for (wins) |w| {
+         at += w.ids.len;
+-        try d.check(d.api.cuMemcpyDtoH_v2(w.seq.logits.ptr, out + (at - 1) * vocab * 2, vocab * 2), "cuMemcpyDtoH");
++        try cuda.memory.download(d, out + (at - 1) * vocab * 2, std.mem.sliceAsBytes(w.seq.logits)[0 .. vocab * 2]);
+         w.seq.fed += w.ids.len;
+     }
+ }
+diff --git a/zig/src/families/flashnext/cuda_train.zig b/zig/src/families/flashnext/cuda_train.zig
+index 779a187489ac97e7e5d2b2c4ac390737904099d7..a39c42089a3ee23ec412f42883a21c6b2850f1b5 100644
+--- a/zig/src/families/flashnext/cuda_train.zig
++++ b/zig/src/families/flashnext/cuda_train.zig
+@@ -178,8 +178,8 @@ pub fn Trainer(comptime Tri: type) type {
+             var inj: [streams]u16 = undefined;
+             const d = t.e.driver;
+             t.e.stream.synchronize() catch return &t.resid;
+-            d.check(d.api.cuMemcpyDtoH_v2(&h, h_at + row * wide * 2, wide * 2), "cuMemcpyDtoH") catch return &t.resid;
+-            d.check(d.api.cuMemcpyDtoH_v2(&inj, kp.layers[l - 1].mlp_hc.inject + row * streams * 2, streams * 2), "cuMemcpyDtoH") catch return &t.resid;
++            cuda.memory.download(d, h_at + row * wide * 2, std.mem.asBytes(&h)[0 .. wide * 2]) catch return &t.resid;
++            cuda.memory.download(d, kp.layers[l - 1].mlp_hc.inject + row * streams * 2, std.mem.asBytes(&inj)[0 .. streams * 2]) catch return &t.resid;
+             var a: [streams]f32 = undefined;
+             var norm: f32 = 0;
+             for (&a, inj) |*x, b| {
+diff --git a/zig/src/families/gemma4/cuda_assistant.zig b/zig/src/families/gemma4/cuda_assistant.zig
+index db894e2c542dbe611b6b24814a9ffb25c56d230c..88b88a39b3ab8b5bd2716554338e47f2919c8408 100644
+--- a/zig/src/families/gemma4/cuda_assistant.zig
++++ b/zig/src/families/gemma4/cuda_assistant.zig
+@@ -367,7 +367,7 @@ pub const Drafter = struct {
+         try x.chain(items[0..holds.len], steps);
+         var picks: [depth * max_items]Pick = undefined;
+         try x.s.synchronize();
+-        try x.d.check(x.d.api.cuMemcpyDtoH_v2(&picks, x.x.picks, steps * max_items * @sizeOf(Pick)), "cuMemcpyDtoH");
++        try cuda.memory.download(x.d, x.x.picks, std.mem.asBytes(&picks)[0 .. steps * max_items * @sizeOf(Pick)]);
+         for (items[0..holds.len], 0..) |it, r| {
+             for (it.lane.held[0..it.depth], 0..) |*tok, step| {
+                 const p = picks[step * max_items + r];
+diff --git a/zig/src/families/gemma4/cuda_backend.zig b/zig/src/families/gemma4/cuda_backend.zig
+index 70f2b19a3db86c58d6b628c2302b1d7d199e60a7..df657a22b73be7d7ce6985c6d6dafbafed64d980 100644
+--- a/zig/src/families/gemma4/cuda_backend.zig
++++ b/zig/src/families/gemma4/cuda_backend.zig
+@@ -235,7 +235,7 @@ pub const Gemma = struct {
+         if (rows > max_window) return error.WindowTooWide;
+         try x.s.synchronize(); // the forward wrote the rows
+         for (0..rows) |r| {
+-            try x.d.check(x.d.api.cuMemcpyDtoH_v2(row.ptr, src + r * cfg.vocab * 2, cfg.vocab * 2), "cuMemcpyDtoH");
++            try cuda.memory.download(x.d, src + r * cfg.vocab * 2, std.mem.sliceAsBytes(row)[0 .. cfg.vocab * 2]);
+             picked[r] = try pickAllowed(row, masks[r * words ..][0..words]);
+         }
+         try x.upload(x.tok.ptr + at * 4, std.mem.sliceAsBytes(picked[0..rows]));
+diff --git a/zig/src/families/gemma4/cuda_dflash.zig b/zig/src/families/gemma4/cuda_dflash.zig
+index 134abc6c94861713b3830436eaca4a9c6354f8cf..702d54c5bbf14a152ad886dc383a291d1836dac4 100644
+--- a/zig/src/families/gemma4/cuda_dflash.zig
++++ b/zig/src/families/gemma4/cuda_dflash.zig
+@@ -494,7 +494,7 @@ pub const Drafter = struct {
+             try x.blocks(bs[0..n], width);
+             var picks: [rows_most]Pick = undefined;
+             try x.s.synchronize();
+-            try x.d.check(x.d.api.cuMemcpyDtoH_v2(&picks, x.x.picks, n * width * @sizeOf(Pick)), "cuMemcpyDtoH");
++            try cuda.memory.download(x.d, x.x.picks, std.mem.asBytes(&picks)[0 .. n * width * @sizeOf(Pick)]);
+             for (bs[0..n], 0..) |b, j| {
+                 for (picks[j * width + 1 ..][0..b.depth], 0..) |p, i| {
+                     if (p.nonfinite != 0 or p.token >= cfg.vocab) return error.DraftNonfinite;
+diff --git a/zig/src/families/glm/cuda_engine_pick.zig b/zig/src/families/glm/cuda_engine_pick.zig
+index e489d13422b456d6a36fb10bd18a0b12d39b047c..f4b668624362e5877dee46d99fb5de3b44cd8015 100644
+--- a/zig/src/families/glm/cuda_engine_pick.zig
++++ b/zig/src/families/glm/cuda_engine_pick.zig
+@@ -1,5 +1,6 @@
+ //! The existing rank-gathered greedy pick, kept separate from engine lifetime and prompt diagnostics.
+ const cuda = @import("cuda");
++const std = @import("std");
+ const ranks = @import("cuda_ranks.zig");
+ const chance = @import("cuda_mtp_chance.zig");
+ const Engine = @import("cuda_engine.zig").Engine;
+@@ -28,6 +29,6 @@ fn pick(e: *Engine, logits: u64, sums: bool) !chance.Pick {
+     try e.stream.synchronize();
+     try e.checkGathers();
+     var all: [ranks.max_world][4]u32 = undefined; // Engine.init refuses a larger world
+-    try e.d.check(e.d.api.cuMemcpyDtoH_v2(&all, e.pairs.ptr, world * pair_bytes), "cuMemcpyDtoH");
++    try cuda.memory.download(e.d, e.pairs.ptr, std.mem.asBytes(&all)[0 .. world * pair_bytes]);
+     return chance.pick(all[0..world], sums);
+ }
+diff --git a/zig/src/families/glm/cuda_structured.zig b/zig/src/families/glm/cuda_structured.zig
+index b155320732febef96a3c5d6341585beea4970717..38cebeaeee7c2097408c0aa75d95fce1f8a36387 100644
+--- a/zig/src/families/glm/cuda_structured.zig
++++ b/zig/src/families/glm/cuda_structured.zig
+@@ -1,5 +1,6 @@
+ //! Whole-vocabulary grammar draws and prompt redraws.
+ const cuda = @import("cuda");
++const std = @import("std");
+ const sampler = @import("cuda_sampler.zig");
+ const projection = @import("cuda_proj.zig");
+ const prompt_lp = @import("cuda_prompt_logprobs.zig");
+@@ -27,7 +28,7 @@ pub fn drawWhole(e: anytype, logits: u64, rows: usize, first: u64, bits: u64, ou
+         var pick: [2]u32 = undefined;
+         try e.stream.synchronize();
+         try e.checkGathers();
+-        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&pick, e.pairs.ptr, 8), "cuMemcpyDtoH");
++        try cuda.memory.download(e.d, e.pairs.ptr, std.mem.asBytes(&pick)[0..8]);
+         out[r] = pick[1];
+     }
+ }
+diff --git a/zig/src/families/glm/cuda_tile.zig b/zig/src/families/glm/cuda_tile.zig
+index afd9f58104c565e9ac91d7adb19a12105666d24a..538e18aa7940d7d90b24df87a0e68bcec8afb02c 100644
+--- a/zig/src/families/glm/cuda_tile.zig
++++ b/zig/src/families/glm/cuda_tile.zig
+@@ -125,7 +125,7 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
+         }
+         try host.resize(gpa, n * k);
+         try s.synchronize();
+-        try d.check(d.api.cuMemcpyDtoH_v2(@ptrCast(host.items.ptr), ptr, n * k * 2), "cuMemcpyDtoH");
++        try cuda.memory.download(d, ptr, std.mem.sliceAsBytes(host.items)[0 .. n * k * 2]);
+         try words.resize(gpa, n * k * bits / 32);
+         try scales.resize(gpa, n * (k / 64));
+         qpack.quantize(bits, host.items, n, k, words.items, scales.items);
+diff --git a/zig/src/families/glm/cuda_vision.zig b/zig/src/families/glm/cuda_vision.zig
+index e776caeb41da1a5304ad37ded6c8e81629ccc722..f4e999863317f41b4a2ce31607464779f5c1f204 100644
+--- a/zig/src/families/glm/cuda_vision.zig
++++ b/zig/src/families/glm/cuda_vision.zig
+@@ -264,7 +264,7 @@ pub const Tower = struct {
+         const n: usize = @intCast(N * H);
+         if ((i + 1) * n > dst.len) return;
+         try ru.stream.synchronize();
+-        try t.d.check(t.d.api.cuMemcpyDtoH_v2(@ptrCast(dst[i * n ..].ptr), x32, n * 4), "vision stage");
++        try cuda.memory.download(t.d, x32, std.mem.sliceAsBytes(dst[i * n ..])[0 .. n * 4]);
+     }
+ 
+     /// D[m, n] = X[m, k] . W[n, k]^T (fp32 or bf16 out), a plan per shape kept for the next image.
+diff --git a/zig/src/families/glm/dflash_block.zig b/zig/src/families/glm/dflash_block.zig
+index c9ceb9442d17fdc82abcca1e94b8acb5d9f8ff4a..4d2366f6f7f3a4265f697fcd20174342225918c1 100644
+--- a/zig/src/families/glm/dflash_block.zig
++++ b/zig/src/families/glm/dflash_block.zig
+@@ -56,7 +56,7 @@ pub fn download(dr: *const Drafter, e: anytype, dst: []u8, src: u64) !void {
+     _ = dr;
+     try e.stream.synchronize();
+     if (e.group) |g| try g.check();
+-    try e.d.check(e.d.api.cuMemcpyDtoH_v2(dst.ptr, src, dst.len), "cuMemcpyDtoH");
++    try cuda.memory.download(e.d, src, std.mem.sliceAsBytes(dst)[0..dst.len]);
+ }
+ 
+ /// Every rank's `bytes` at buf + rank * bytes into every rank's buf, rank order (the engine's gathers' route).
+diff --git a/zig/src/families/h3/cuda_packing.zig b/zig/src/families/h3/cuda_packing.zig
+index 8c7c005b17ae1d9c417e463f74558d8ca4c7e3d4..4e7aaa6587100332ea2c4127fdb74645f7dbd6f7 100644
+--- a/zig/src/families/h3/cuda_packing.zig
++++ b/zig/src/families/h3/cuda_packing.zig
+@@ -1,5 +1,6 @@
+ //! A packing's inverse map is refreshed on every call, including equal dimensions and reused slot addresses.
+ const std = @import("std");
++const cuda = @import("cuda");
+ pub fn read(m: anytype, in: anytype, p: anytype) ![]i32 {
+     const map = try m.gpa.alloc(i32, @as(usize, in.tiles) * 64);
+     errdefer m.gpa.free(map);
+@@ -10,9 +11,9 @@ pub fn read(m: anytype, in: anytype, p: anytype) ![]i32 {
+     defer m.gpa.free(sizes);
+     const lines = try m.gpa.alloc(i32, in.rows);
+     defer m.gpa.free(lines);
+-    try m.driver.check(m.driver.api.cuMemcpyDtoH_v2(slots.ptr, in.slot, p.input[5]), "cuMemcpyDtoH slots");
+-    try m.driver.check(m.driver.api.cuMemcpyDtoH_v2(sizes.ptr, in.sizes, p.input[6]), "cuMemcpyDtoH sizes");
+-    try m.driver.check(m.driver.api.cuMemcpyDtoH_v2(lines.ptr, in.line, p.input[2]), "cuMemcpyDtoH lines");
++    try cuda.memory.download(&m.driver, in.slot, std.mem.sliceAsBytes(slots)[0..p.input[5]]);
++    try cuda.memory.download(&m.driver, in.sizes, std.mem.sliceAsBytes(sizes)[0..p.input[6]]);
++    try cuda.memory.download(&m.driver, in.line, std.mem.sliceAsBytes(lines)[0..p.input[2]]);
+     for (sizes) |n| if (n <= 0 or n > 64) return error.BadH3Packing;
+     var total: usize = 0;
+     for (sizes[p.own0..p.own1]) |n| total += @intCast(n);
+diff --git a/zig/src/families/lfm2/vision.zig b/zig/src/families/lfm2/vision.zig
+index 45736f02bceb72800bfb9e9b0dd930ff9e69bba4..6096cd630815d09ab6881d8f7040482931602c9f 100644
+--- a/zig/src/families/lfm2/vision.zig
++++ b/zig/src/families/lfm2/vision.zig
+@@ -53,7 +53,7 @@ pub const Vision = struct {
+         errdefer gpa.free(position);
+         const table = try gpa.alloc(u16, position.len);
+         defer gpa.free(table);
+-        try d.check(d.api.cuMemcpyDtoH_v2(table.ptr, w.position, 2 * table.len), "cuMemcpyDtoH");
++        try cuda.memory.download(d, w.position, std.mem.sliceAsBytes(table)[0 .. 2 * table.len]);
+         for (position, table) |*p, t| p.* = @bitCast(@as(u32, t) << 16);
+         if (!finite(position)) {
+             std.log.err("the vision tower's position embedding holds a non-finite value, which its resize cannot carry", .{});
+diff --git a/zig/src/families/minimax_m3/cuda_dump_main.zig b/zig/src/families/minimax_m3/cuda_dump_main.zig
+index cabd2de9174309d778e8a3b62fe45ba9aeb8fd91..92b4fbecf1f85a0bf50908cf1c8532542298e642 100644
+--- a/zig/src/families/minimax_m3/cuda_dump_main.zig
++++ b/zig/src/families/minimax_m3/cuda_dump_main.zig
+@@ -20,7 +20,7 @@ const Dump = struct {
+         try self.stream.synchronize();
+         const bytes = try self.gpa.alloc(u8, rows * self.hidden * 4);
+         defer self.gpa.free(bytes);
+-        try self.d.check(self.d.api.cuMemcpyDtoH_v2(bytes.ptr, resid, bytes.len), "cuMemcpyDtoH");
++        try cuda.memory.download(self.d, resid, std.mem.sliceAsBytes(bytes)[0..bytes.len]);
+         var name: [32]u8 = undefined;
+         try self.dir.writeFile(self.io, .{ .sub_path = try std.fmt.bufPrint(&name, "r{d}.c{d}.f32", .{ layer, self.chunk }), .data = bytes });
+     }
+@@ -97,7 +97,7 @@ pub fn main(init: std.process.Init) !u8 {
+     std.debug.print("forward of {d} rows in {d:.2} s\n", .{ ids.len, @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) * 1e-9 });
+     const logits = try gpa.alloc(u8, share.vocab.len() * 2);
+     defer gpa.free(logits);
+-    try driver.check(driver.api.cuMemcpyDtoH_v2(logits.ptr, b.logits, logits.len), "cuMemcpyDtoH");
++    try cuda.memory.download(&driver, b.logits, std.mem.sliceAsBytes(logits)[0..logits.len]);
+     try out.writeFile(io, .{ .sub_path = "logits.bf16", .data = logits });
+     var best: f32 = -std.math.inf(f32);
+     var bid: usize = 0;
+@@ -154,7 +154,7 @@ fn everyRow(gpa: std.mem.Allocator, io: std.Io, driver: *const cuda.Driver, stre
+         try f.run(ids[start..][0..n], &seg);
+         try mm3.forward.Forward.commit(&seg, &.{n});
+         try stream.synchronize();
+-        try driver.check(driver.api.cuMemcpyDtoH_v2(all[start * nv * 2 ..].ptr, b.logits, n * nv * 2), "cuMemcpyDtoH");
++        try cuda.memory.download(driver, b.logits, std.mem.sliceAsBytes(all[start * nv * 2 ..])[0 .. n * nv * 2]);
+     }
+     try std.Io.Dir.cwd().createDirPath(io, out_dir);
+     var out = try std.Io.Dir.cwd().openDir(io, out_dir, .{});
+diff --git a/zig/src/families/qwen3_5/cuda_train.zig b/zig/src/families/qwen3_5/cuda_train.zig
+index 6c33fcb4ca28ac68c3f3f9994fe8b6e57e910d88..8844e195865cc0f75366565710f33c11f0e89b84 100644
+--- a/zig/src/families/qwen3_5/cuda_train.zig
++++ b/zig/src/families/qwen3_5/cuda_train.zig
+@@ -317,7 +317,7 @@ pub const Trainer = struct {
+         defer t.gpa.free(raw);
+         const d = t.e.d;
+         try t.e.stream.synchronize();
+-        try d.check(d.api.cuMemcpyDtoH_v2(raw.ptr, t.e.layers[l].post_norm, out.len * 2), "cuMemcpyDtoH");
++        try cuda.memory.download(d, t.e.layers[l].post_norm, std.mem.sliceAsBytes(raw)[0 .. out.len * 2]);
+         for (out, raw) |*o, b| o.* = @bitCast(@as(u32, b) << 16);
+     }
+ 
+@@ -329,7 +329,7 @@ pub const Trainer = struct {
+         if (at == 0) return t.resid;
+         const d = t.e.d;
+         t.e.stream.synchronize() catch return t.resid;
+-        d.check(d.api.cuMemcpyDtoH_v2(t.resid.ptr, at + row * t.g.hidden * 2, t.g.hidden * 2), "cuMemcpyDtoH") catch return t.resid;
++        cuda.memory.download(d, at + row * t.g.hidden * 2, std.mem.sliceAsBytes(t.resid)[0 .. t.g.hidden * 2]) catch return t.resid;
+         return t.resid;
+     }
+ 
+diff --git a/zig/src/families/qwen3_5/cuda_train_load.zig b/zig/src/families/qwen3_5/cuda_train_load.zig
+index 24a3a7a16c86db15d4cca3e661f2fde8a1e1fc77..cc3c0ac026242176098b9b40712e62dabf373a0e 100644
+--- a/zig/src/families/qwen3_5/cuda_train_load.zig
++++ b/zig/src/families/qwen3_5/cuda_train_load.zig
+@@ -139,7 +139,7 @@ fn widen(t: *Trainer, ptr: u64, n: usize) !u64 {
+     defer t.gpa.free(raw);
+     try t.e.stream.synchronize();
+     const d = t.e.d;
+-    try d.check(d.api.cuMemcpyDtoH_v2(raw.ptr, ptr, n * 2), "cuMemcpyDtoH");
++    try cuda.memory.download(d, ptr, std.mem.sliceAsBytes(raw)[0 .. n * 2]);
+     const out = try t.gpa.alloc(f32, n);
+     defer t.gpa.free(out);
+     for (out, raw) |*o, b| o.* = @bitCast(@as(u32, b) << 16);
+diff --git a/zig/tests/bolt_vision_main.zig b/zig/tests/bolt_vision_main.zig
+index d64e3900be12d1a29b9f74002070059ea5689238..26c124258fda0359ad9d5075e00e533ce799acd9 100644
+--- a/zig/tests/bolt_vision_main.zig
++++ b/zig/tests/bolt_vision_main.zig
+@@ -161,7 +161,7 @@ fn f32Slice(b: []const u8) []const f32 {
+ }
+ 
+ fn dl(d: *const cuda.Driver, src: u64, out: []u8) !void {
+-    try d.check(d.api.cuMemcpyDtoH_v2(out.ptr, src, out.len), "cuMemcpyDtoH");
++    try cuda.memory.download(d, src, std.mem.sliceAsBytes(out)[0..out.len]);
+ }
+ 
+ fn now(io: std.Io) i96 {
+diff --git a/zig/tests/cuda/experts_rows_tests.zig b/zig/tests/cuda/experts_rows_tests.zig
+index 2b53d3c56fbb85f45649c9977e8ea542625643d9..0dbeafd6ca789fcafa3d1d7579689a8bff4b3b82 100644
+--- a/zig/tests/cuda/experts_rows_tests.zig
++++ b/zig/tests/cuda/experts_rows_tests.zig
+@@ -39,7 +39,7 @@ const Rig = struct {
+     fn get(r: *Rig, ptr: u64, n: usize) ![]u8 {
+         try r.s.synchronize();
+         const out = try r.gpu.gpa.alloc(u8, n);
+-        try r.gpu.d.check(r.gpu.d.api.cuMemcpyDtoH_v2(out.ptr, ptr, n), "cuMemcpyDtoH");
++        try cuda.memory.download(r.gpu.d, ptr, std.mem.sliceAsBytes(out)[0..n]);
+         return out;
+     }
+ 
+diff --git a/zig/tests/cuda/flashnext_window_tests.zig b/zig/tests/cuda/flashnext_window_tests.zig
+index 6eea62a2210d1f5da7de9972037329e090c3905b..f15c3fc0f7454cb09b625fabaa5b72541cc6602a 100644
+--- a/zig/tests/cuda/flashnext_window_tests.zig
++++ b/zig/tests/cuda/flashnext_window_tests.zig
+@@ -65,7 +65,7 @@ pub fn run(gpu: check.Gpu, dir: []const u8, rank: usize, port: u16, ids_path: []
+         try session.restore(&window, null, base);
+         try session.verify(flash.Tri, tri, &window, &draft, &forced);
+         try stream.synchronize();
+-        try e.driver.check(e.driver.api.cuMemcpyDtoH_v2(rows.ptr, draft.logits.ptr, rows.len), "cuMemcpyDtoH");
++        try cuda.memory.download(e.driver, draft.logits.ptr, std.mem.sliceAsBytes(rows)[0..rows.len]);
+         try check.sameBytes("each two-rank window row equals its serial teacher-forced row", rows, expected);
+         try session.keep(flash.Tri, tri, &window, &draft, keep);
+         try check.expect(window.fed == ids.items.len + keep, "kept prefix position is exact", .{});
+diff --git a/zig/tests/cuda/flashnext_windows_tests.zig b/zig/tests/cuda/flashnext_windows_tests.zig
+index ea15d52ef41c407c77f26592fe5337dc9df81441..4cff5ff6b9b05fe2867bababa4f3f8d26f138dfc 100644
+--- a/zig/tests/cuda/flashnext_windows_tests.zig
++++ b/zig/tests/cuda/flashnext_windows_tests.zig
+@@ -85,8 +85,8 @@ fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cu
+     for (widths, 0..) |w, i| {
+         try ops.verify(&alone.seqs[i], &alone.drafts[i], windows[i][0..w]);
+         try stream.synchronize();
+-        try e.driver.check(e.driver.api.cuMemcpyDtoH_v2(want_logits[row0 * row_bytes ..].ptr, alone.drafts[i].logits.ptr, w * row_bytes), "cuMemcpyDtoH");
+-        try e.driver.check(e.driver.api.cuMemcpyDtoH_v2(want_hidden[row0 * hidden ..].ptr, alone.drafts[i].streams.ptr, w * hidden), "cuMemcpyDtoH");
++        try cuda.memory.download(e.driver, alone.drafts[i].logits.ptr, std.mem.sliceAsBytes(want_logits[row0 * row_bytes ..])[0 .. w * row_bytes]);
++        try cuda.memory.download(e.driver, alone.drafts[i].streams.ptr, std.mem.sliceAsBytes(want_hidden[row0 * hidden ..])[0 .. w * hidden]);
+         row0 += w;
+     }
+     // the same windows in one shared pass
+@@ -105,9 +105,9 @@ fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cu
+     defer gpa.free(got);
+     row0 = 0;
+     for (widths, 0..) |w, i| {
+-        try e.driver.check(e.driver.api.cuMemcpyDtoH_v2(got.ptr, together.drafts[i].logits.ptr, w * row_bytes), "cuMemcpyDtoH");
++        try cuda.memory.download(e.driver, together.drafts[i].logits.ptr, std.mem.sliceAsBytes(got)[0 .. w * row_bytes]);
+         try check.sameBytes("a shared window's scores equal its lone pass's", got[0 .. w * row_bytes], want_logits[row0 * row_bytes ..][0 .. w * row_bytes]);
+-        try e.driver.check(e.driver.api.cuMemcpyDtoH_v2(got.ptr, together.drafts[i].streams.ptr, w * hidden), "cuMemcpyDtoH");
++        try cuda.memory.download(e.driver, together.drafts[i].streams.ptr, std.mem.sliceAsBytes(got)[0 .. w * hidden]);
+         try check.sameBytes("a shared window's hidden rows equal its lone pass's", got[0 .. w * hidden], want_hidden[row0 * hidden ..][0 .. w * hidden]);
+         try check.sameBytes("a shared window's last host row equals its lone pass's", together.seqs[i].logits, alone.seqs[i].logits);
+         row0 += w;
+diff --git a/zig/tests/cuda/fn_pocket_tests.zig b/zig/tests/cuda/fn_pocket_tests.zig
+index c5df11d8d536c83c9891efb33f43027982e1b161..da55783e4041c71b8b003b887fcccaca6fc42c4e 100644
+--- a/zig/tests/cuda/fn_pocket_tests.zig
++++ b/zig/tests/cuda/fn_pocket_tests.zig
+@@ -48,7 +48,7 @@ const Rig = struct {
+     fn get(r: *Rig, ptr: u64, n: usize) ![]u8 {
+         try r.o.s.synchronize();
+         const out = try r.a.alloc(u8, n);
+-        try r.gpu.d.check(r.gpu.d.api.cuMemcpyDtoH_v2(out.ptr, ptr, n), "cuMemcpyDtoH");
++        try cuda.memory.download(r.gpu.d, ptr, std.mem.sliceAsBytes(out)[0..n]);
+         return out;
+     }
+ 
+diff --git a/zig/tests/cuda/gemma4_states_tests.zig b/zig/tests/cuda/gemma4_states_tests.zig
+index 65a4506606330296c34061df1e744a6f7c637953..35f44391bae318848571bedc1e6d8aa7760869dc 100644
+--- a/zig/tests/cuda/gemma4_states_tests.zig
++++ b/zig/tests/cuda/gemma4_states_tests.zig
+@@ -1,5 +1,6 @@
+ //! Gemma 4 + DFlash: states kept by stepped passes carry the drafter context, resumed == fresh.
+ const std = @import("std");
++const cuda = @import("cuda");
+ const core = @import("core");
+ const lanes = @import("lanes");
+ const g4 = @import("gemma4_cuda");
+@@ -37,7 +38,7 @@ fn run(gpu: Gpu, engine: *lanes.Engine, gb: *g4.backend.Gemma, c: Case, count: u
+     errdefer gpa.free(logits);
+     try gb.s.synchronize();
+     const l = gb.lanes.get(&s) orelse return error.UnknownStream;
+-    try gb.d.check(gb.d.api.cuMemcpyDtoH_v2(logits.ptr, l.last, logits.len), "cuMemcpyDtoH");
++    try cuda.memory.download(gb.d, l.last, std.mem.sliceAsBytes(logits)[0..logits.len]);
+     while (engine.activeCount() > 0) try engine.step();
+     return .{ .ids = try gpa.dupe(u32, s.emitted()), .logits = logits, .cached = if (s.reuse_failed) 0 else s.cached };
+ }
+diff --git a/zig/tests/cuda/glm_lanes_tests.zig b/zig/tests/cuda/glm_lanes_tests.zig
+index dda400fa1c54748ee842e73ab06b9a3cca271fd1..d2e5f44f8dbd2cb355b6d34e38ad5b47da19877e 100644
+--- a/zig/tests/cuda/glm_lanes_tests.zig
++++ b/zig/tests/cuda/glm_lanes_tests.zig
+@@ -280,10 +280,10 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank:
+         var row0: usize = 0;
+         for (0..n) |i| { // each stream's rows of the shared forward against its twin's lone round (verify, keep, draft)
+             const rows = parts[i].ids.len;
+-            try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(mine.ptr, e.bs.?.logits + row0 * V * 2, rows * V * 2), "cuMemcpyDtoH");
++            try cuda.memory.download(gpu.d, e.bs.?.logits + row0 * V * 2, std.mem.sliceAsBytes(mine)[0 .. rows * V * 2]);
+             try x.bind(@intCast(S + i));
+             try x.verify(parts[i].ids, twin[i][0..rows], 0);
+-            try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(lone.ptr, e.bd.logits, rows * V * 2), "cuMemcpyDtoH");
++            try cuda.memory.download(gpu.d, e.bd.logits, std.mem.sliceAsBytes(lone)[0 .. rows * V * 2]);
+             if (!std.mem.eql(u16, mine[0 .. rows * V], lone[0 .. rows * V]) or !std.mem.eql(u32, outs[i][0..rows], twin[i][0..rows])) {
+                 std.debug.print("FAIL shared: round {d}, stream {d} ({d} rows from row {d} of the shared window): logits or tokens differ from its twin's\n", .{ round, i, rows, row0 });
+                 failed = true;
+diff --git a/zig/tests/cuda/glm_paged_tests.zig b/zig/tests/cuda/glm_paged_tests.zig
+index bfdc8b02aef4de5f8c76de176423a48f70e04cf4..34d82c371741dcc9d1e11fdc4972e3dd2af7597b 100644
+--- a/zig/tests/cuda/glm_paged_tests.zig
++++ b/zig/tests/cuda/glm_paged_tests.zig
+@@ -68,7 +68,7 @@ pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
+             try x.bind(slot);
+             if (slot == paged_slot) try x.beginOn(null, held, 0) else try x.begin(null);
+             first[j] = try x.prefill(ids, null, null, null);
+-            try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(if (j == 0) mine.ptr else twin.ptr, e.bp.logits, V * 2), "cuMemcpyDtoH");
++            try cuda.memory.download(gpu.d, e.bp.logits, std.mem.sliceAsBytes(if (j == 0) mine else twin)[0 .. V * 2]);
+             try x.draft(true, &.{first[j]}, 2, &drafts[j], null);
+         }
+         if (first[0] != first[1] or !std.mem.eql(u16, mine[0..V], twin[0..V]) or !std.mem.eql(u32, drafts[0][0..2], drafts[1][0..2])) {
+@@ -83,7 +83,7 @@ pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
+             for ([_]u32{ paged_slot, twin_slot }, 0..) |slot, j| {
+                 try x.bind(slot);
+                 try x.verify(w[0..rows], outs[j][0..rows], 0);
+-                try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(if (j == 0) mine.ptr else twin.ptr, e.bd.logits, rows * V * 2), "cuMemcpyDtoH");
++                try cuda.memory.download(gpu.d, e.bd.logits, std.mem.sliceAsBytes(if (j == 0) mine else twin)[0 .. rows * V * 2]);
+                 const keep = 1 + (round + k) % rows;
+                 try x.keep(keep);
+                 try x.draft(false, outs[j][0..keep], 2, &drafts[j], null);
+diff --git a/zig/tests/cuda/glm_solo_tests.zig b/zig/tests/cuda/glm_solo_tests.zig
+index f34b4296d58deb4ff0b5ec8f2fedac9eb8529f99..300cd96b9ae13e8c1946a7ac8838099ad067c216 100644
+--- a/zig/tests/cuda/glm_solo_tests.zig
++++ b/zig/tests/cuda/glm_solo_tests.zig
+@@ -88,7 +88,7 @@ pub fn soloCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_
+             const win = [_]u32{ t, 101, 202, 303 };
+             try x.verify(&win, &outs[twin], 0);
+             logits[twin] = try a.alloc(u16, win.len * V);
+-            try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(logits[twin].ptr, e.bd.logits, win.len * V * 2), "cuMemcpyDtoH");
++            try cuda.memory.download(gpu.d, e.bd.logits, std.mem.sliceAsBytes(logits[twin])[0 .. win.len * V * 2]);
+         }
+         const st = &e.seqs.items[2 * i].?.st;
+         const tw = &e.seqs.items[2 * i + 1].?.st;
+diff --git a/zig/tests/cuda/glm_split_tests.zig b/zig/tests/cuda/glm_split_tests.zig
+index 6aeb206763ad599ee5c70a77e92b8f3e2f376d87..4e0e90d45cccf5f5f8c0b85fad0134729ba6ae83 100644
+--- a/zig/tests/cuda/glm_split_tests.zig
++++ b/zig/tests/cuda/glm_split_tests.zig
+@@ -65,7 +65,7 @@ pub fn splitCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c
+             const win = [_]u32{ t, 101, 202, 303 };
+             try x.verify(&win, &outs[twin], 0);
+             logits[twin] = try a.alloc(u16, win.len * V);
+-            try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(logits[twin].ptr, e.bd.logits, win.len * V * 2), "cuMemcpyDtoH");
++            try cuda.memory.download(gpu.d, e.bd.logits, std.mem.sliceAsBytes(logits[twin])[0 .. win.len * V * 2]);
+         }
+         e.settings.index_split = 0;
+         var want: u64 = 0; // the chunks glm.sparse.splitAt splits over this prompt
+diff --git a/zig/tests/cuda/glue_rig.zig b/zig/tests/cuda/glue_rig.zig
+index 7ad15f8087e56f161377fcfe7402e70da647e12f..aaf02d0c42e54290411636b2f32a0bbce99b0392 100644
+--- a/zig/tests/cuda/glue_rig.zig
++++ b/zig/tests/cuda/glue_rig.zig
+@@ -66,7 +66,7 @@ pub const Rig = struct {
+     pub fn same(r: *Rig, what: []const u8, comptime T: type, ptr: u64, want: []const T) !void {
+         try r.s.synchronize();
+         const got = try r.a.alloc(T, want.len);
+-        try r.gpu.d.check(r.gpu.d.api.cuMemcpyDtoH_v2(got.ptr, ptr, want.len * @sizeOf(T)), "cuMemcpyDtoH");
++        try cuda.memory.download(r.gpu.d, ptr, std.mem.sliceAsBytes(got)[0 .. want.len * @sizeOf(T)]);
+         r.cases += 1;
+         var live: usize = 0;
+         for (want) |w| live += @intFromBool(!std.mem.allEqual(u8, std.mem.asBytes(&w), 0));
+@@ -86,7 +86,7 @@ pub const Rig = struct {
+     pub fn get(r: *Rig, comptime T: type, ptr: u64, n: usize) ![]T {
+         try r.s.synchronize();
+         const out = try r.a.alloc(T, n);
+-        try r.gpu.d.check(r.gpu.d.api.cuMemcpyDtoH_v2(out.ptr, ptr, n * @sizeOf(T)), "cuMemcpyDtoH");
++        try cuda.memory.download(r.gpu.d, ptr, std.mem.sliceAsBytes(out)[0 .. n * @sizeOf(T)]);
+         return out;
+     }
+ };
+diff --git a/zig/tests/cuda/lfm2_kernel_tests.zig b/zig/tests/cuda/lfm2_kernel_tests.zig
+index cae253d7dbbaf9138853537f5c0c08baa1ca3573..cf902806f198d58f4c569048dc0fcf12591bfe01 100644
+--- a/zig/tests/cuda/lfm2_kernel_tests.zig
++++ b/zig/tests/cuda/lfm2_kernel_tests.zig
+@@ -191,7 +191,7 @@ const Rig = struct {
+     fn same(r: *Rig, what: []const u8, rows: usize, comptime T: type, ptr: u64, want: []const T) !void {
+         try r.s.synchronize();
+         const got = try r.a.alloc(T, want.len);
+-        try r.gpu.d.check(r.gpu.d.api.cuMemcpyDtoH_v2(got.ptr, ptr, want.len * @sizeOf(T)), "cuMemcpyDtoH");
++        try cuda.memory.download(r.gpu.d, ptr, std.mem.sliceAsBytes(got)[0 .. want.len * @sizeOf(T)]);
+         r.cases += 1;
+         var worst: f64 = 0;
+         var differ: usize = 0;
+diff --git a/zig/tests/cuda/lfm2_vision_tests.zig b/zig/tests/cuda/lfm2_vision_tests.zig
+index b1c7487717d92967186dcac514e6a3d9efe7a997..c32fb82851417f434f440965f306c1360f9ec639 100644
+--- a/zig/tests/cuda/lfm2_vision_tests.zig
++++ b/zig/tests/cuda/lfm2_vision_tests.zig
+@@ -168,7 +168,7 @@ const Rig = struct {
+     fn get(r: *Rig, comptime T: type, ptr: u64, n: usize) ![]T {
+         try r.s.synchronize();
+         const out = try r.a.alloc(T, n);
+-        try r.gpu.d.check(r.gpu.d.api.cuMemcpyDtoH_v2(out.ptr, ptr, n * @sizeOf(T)), "cuMemcpyDtoH");
++        try cuda.memory.download(r.gpu.d, ptr, std.mem.sliceAsBytes(out)[0 .. n * @sizeOf(T)]);
+         return out;
+     }
+ 
+diff --git a/zig/tests/cuda/moe_live_tests.zig b/zig/tests/cuda/moe_live_tests.zig
+index 8a421830fa0e7743ca385fb748107d47eda96f00..ab15cd4c9a58b8652bb27915e81761e07b674bb4 100644
+--- a/zig/tests/cuda/moe_live_tests.zig
++++ b/zig/tests/cuda/moe_live_tests.zig
+@@ -47,7 +47,7 @@ const Chain = struct {
+ 
+     fn get(c: *Chain, ptr: u64, out: []u8) !void {
+         try c.s.synchronize();
+-        try c.gpu.d.check(c.gpu.d.api.cuMemcpyDtoH_v2(out.ptr, ptr, out.len), "cuMemcpyDtoH");
++        try cuda.memory.download(c.gpu.d, ptr, std.mem.sliceAsBytes(out)[0..out.len]);
+     }
+ 
+     fn set(c: *Chain, ptr: u64, bytes: []const u8) !void {
+diff --git a/zig/tests/cuda/pocket_tests.zig b/zig/tests/cuda/pocket_tests.zig
+index d46da97518a6f71e34aa807fe276be15f7cb1ef1..f17af32c1013c4b4ff038f2b130b6a5716a5d0ac 100644
+--- a/zig/tests/cuda/pocket_tests.zig
++++ b/zig/tests/cuda/pocket_tests.zig
+@@ -42,7 +42,7 @@ const Rig = struct {
+     fn get(r: *Rig, ptr: u64, n: usize) ![]u8 {
+         try r.o.s.synchronize();
+         const out = try r.a.alloc(u8, n);
+-        try r.gpu.d.check(r.gpu.d.api.cuMemcpyDtoH_v2(out.ptr, ptr, n), "cuMemcpyDtoH");
++        try cuda.memory.download(r.gpu.d, ptr, std.mem.sliceAsBytes(out)[0..n]);
+         return out;
+     }
+ 
+diff --git a/zig/tests/cuda/radio_tests.zig b/zig/tests/cuda/radio_tests.zig
+index 01fd4b4b1e010bc2c34f07253c80b24679d835f2..75ee0578fe1ce688b0a8d8fdf522554667f5aea3 100644
+--- a/zig/tests/cuda/radio_tests.zig
++++ b/zig/tests/cuda/radio_tests.zig
+@@ -66,7 +66,7 @@ fn int(v: std.json.Value, key: []const u8) usize {
+ fn back(gpu: Gpu, a: std.mem.Allocator, s: cuda.Stream, at: u64, len: usize) ![]f32 {
+     try s.synchronize();
+     const raw = try a.alloc(u16, len);
+-    try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(raw.ptr, at, 2 * len), "cuMemcpyDtoH");
++    try cuda.memory.download(gpu.d, at, std.mem.sliceAsBytes(raw)[0 .. 2 * len]);
+     const out = try a.alloc(f32, len);
+     for (out, raw) |*o, v| o.* = @bitCast(@as(u32, v) << 16);
+     return out;
+diff --git a/zig/tests/cuda/spark25_pages_tests.zig b/zig/tests/cuda/spark25_pages_tests.zig
+index 0b1839ccb520954fa3918ab1423de8cad2838953..499fcea6828db8ad6405a6fc5e23c234f908f6a5 100644
+--- a/zig/tests/cuda/spark25_pages_tests.zig
++++ b/zig/tests/cuda/spark25_pages_tests.zig
+@@ -1,5 +1,6 @@
+ //! Spark2.5's full-attention caches as pool pages against linear ones: replies and last-row logits byte-equal.
+ const std = @import("std");
++const cuda = @import("cuda");
+ const core = @import("core");
+ const lanes = @import("lanes");
+ const spark = @import("spark25");
+@@ -43,7 +44,7 @@ fn run(gpu: Gpu, engine: *lanes.Engine, gb: *be.Spark, c: Case, count: u32) !Out
+     errdefer gpa.free(logits);
+     try gb.s.synchronize();
+     const l = gb.lanes.get(&s) orelse return error.UnknownStream;
+-    try gb.d.check(gb.d.api.cuMemcpyDtoH_v2(logits.ptr, l.last, logits.len), "cuMemcpyDtoH");
++    try cuda.memory.download(gb.d, l.last, std.mem.sliceAsBytes(logits)[0..logits.len]);
+     while (engine.activeCount() > 0) try engine.step();
+     try idle(gb);
+     return .{ .ids = try gpa.dupe(u32, s.emitted()), .logits = logits, .cached = if (s.reuse_failed) 0 else s.cached };

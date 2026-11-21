@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ashhart <71890694+ashhart@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 00:04:55 +0000
+Subject: [PATCH 13/33] cuda: the staging test opens its library through sys,
+ as its sibling test does, so Windows builds it
+
+Upstream TensorFold commit by ashhart, ported onto this series (upstream main 9cab48d7ee0b).
+
+(cherry picked from commit 9cab48d7ee0bc98edf597f51215d6c78742238fb)
+---
+ zig/src/cuda/download_stage_test.zig | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/cuda/download_stage_test.zig b/zig/src/cuda/download_stage_test.zig
+index 4090e58d2537e9f194b78a3fb271ee57076686de..eb0214b07e28617509c2e4ba5c9ed336b5d0b453 100644
+--- a/zig/src/cuda/download_stage_test.zig
++++ b/zig/src/cuda/download_stage_test.zig
+@@ -134,13 +134,13 @@ test "closing a driver drops its thread's bounce and forgets its integrated read
+         .windows => "kernel32.dll",
+         else => "libc.so.6",
+     };
+-    d.lib = try std.DynLib.open(library);
++    d.lib = try @import("sys").DynLib.open(library);
+     var closed = false;
+     defer if (!closed) d.close();
+     var out: [64]u8 = @splat(0xaa);
+     try memory.download(&d, 0x1000, &out);
+     var other = driver();
+-    other.lib = try std.DynLib.open(library);
++    other.lib = try @import("sys").DynLib.open(library);
+     other.close();
+     try std.testing.expectEqual(before + (64 << 10), memory.usage(false).host);
+     d.close();
+@@ -148,7 +148,7 @@ test "closing a driver drops its thread's bounce and forgets its integrated read
+     try std.testing.expectEqual(before, memory.usage(false).host);
+     integrated_flag = 0;
+     d = driver();
+-    d.lib = try std.DynLib.open(library);
++    d.lib = try @import("sys").DynLib.open(library);
+     closed = false;
+     @memset(&out, 0xaa);
+     try memory.download(&d, 0x1000, &out);

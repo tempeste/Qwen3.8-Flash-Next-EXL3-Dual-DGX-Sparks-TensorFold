@@ -1,0 +1,3064 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tempeste <tempeste@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 18:32:53 +0000
+Subject: [PATCH 04/33] flashnext: routed experts from an EXL3 checkpoint
+ (TF_FLASHNEXT_EXPERTS_EXL3=DIR)
+
+Loads Flash Next's routed experts from an EXL3 folder (such as turboderp's Qwen3.8-Flash-Next-exl3) and serves them
+with grouped decode and prompt kernels. Off unless TF_FLASHNEXT_EXPERTS_EXL3 names a folder; the TF_EXL3_* knobs only
+matter when it does.
+
+Changes, in the order they were made:
+- feat(flashnext): EXL3 routed experts' device image layout (Layout, rankLayerBytes)
+- feat(flashnext): TF_FLASHNEXT_EXPERTS_EXL3=DIR loads routed experts from an EXL3 folder
+- fix(flashnext): flashnext-exl3-experts no longer spins forever; both EXL3 GPU checks take PACK RANK
+- perf(flashnext): EXL3 grouped experts route 16-pair items at every row count; TF_EXL3_GROUPED_PF=2 keeps two k tiles
+  in flight
+- perf(flashnext): EXL3 grouped experts load each k tile's A fragment with its words, ahead of its mma
+  (TF_EXL3_GROUPED_XA, on)
+- perf(flashnext): EXL3 grouped experts' lean (4 an SM) and narrow (6 an SM) programs, TF_EXL3_GROUPED_FIT, same bits
+- perf(flashnext): EXL3 grouped experts through a cp.async ring (TF_EXL3_GROUPED_FIT=cp3|cp4, same bits); bench
+  roofline probes
+- perf(flashnext): EXL3 experts' prompt passes through x3gm v2's 64-pair items (TF_EXL3_PROMPT_ROWS, default 256)
+- perf(flashnext): EXL3 grouped experts serve the 4-stage cp.async ring (TF_EXL3_GROUPED_FIT unset is cp4)
+
+Flags this patch adds (a flag's default is its unset value; unset leaves the engine as it was
+before the flag, and a knob named under another flag only matters when that flag is on):
+- TF_EXL3_GROUPED_FIT: cp4 (unset: the 4-stage cp.async ring, 0.69x NVFP4's time at 84 rows), base, lean, narrow or
+  cp3 grouped programs (exl3_grouped.Fit), all the same bits.
+- TF_EXL3_GROUPED_PF: k tiles of words a warp of the grouped kernels keeps in flight, 1 (unset) or 2.
+- TF_EXL3_GROUPED_XA: 1 (unset) loads each k tile's A fragment with its words, ahead of its mma.
+- TF_EXL3_PROMPT_DN: v3 (unset) or dn0.
+- TF_EXL3_PROMPT_ROWS=n: TF_FLASHNEXT_EXPERTS_EXL3's routed experts on passes of n rows or more through x3gm v2's
+  64-member items (exl3_fnx_prompt.cuh): each item decodes its expert's 128-column block once for up to 64 pairs and
+  runs one fp32 mma chain an out...
+- TF_FLASHNEXT_EXPERTS_EXL3=DIR: the routed experts from an experts-only EXL3 folder (mul1 trellises under the EXL3
+  checkpoint's names, model.safetensors.index.json beside them).
+- TF_FLASHNEXT_EXPERTS_EXL3_LAYERS=all (default) | main (the 48 decoder layers) | mtp (the MTP head's layer only).
+---
+ zig/kernels/cuda/exl3_experts.cu              | 105 +++
+ zig/kernels/cuda/exl3_fnx_prompt.cuh          | 265 +++++++
+ zig/kernels/cuda/exl3_grouped.cuh             | 251 +++++-
+ zig/src/cuda/exl3_experts.zig                 |  61 ++
+ zig/src/cuda/exl3_grouped.zig                 |  62 +-
+ .../families/flashnext/cuda_batch_kernels.zig |   7 +
+ .../families/flashnext/cuda_exl3_experts.zig  | 345 ++++++++
+ .../flashnext/cuda_exl3_experts_test.zig      | 295 +++++++
+ .../families/flashnext/cuda_exl3_prompt.zig   | 154 ++++
+ .../families/flashnext/cuda_exl3_routed.zig   | 189 +++++
+ .../families/flashnext/cuda_lanes_bytes.zig   |  20 +
+ zig/src/families/flashnext/cuda_launch.zig    |   8 +
+ .../families/flashnext/cuda_mixed_experts.zig |   3 +-
+ .../flashnext/cuda_modelopt_experts.zig       |  10 +-
+ .../families/flashnext/cuda_moe_native.zig    |  26 +
+ zig/src/families/flashnext/cuda_mtp.zig       |  11 +-
+ zig/src/families/flashnext/cuda_prompt.zig    |   3 +
+ zig/src/families/flashnext/cuda_prompt_wt.zig |   8 +
+ .../families/flashnext/cuda_rank_memory.zig   |  14 +-
+ zig/tests/cuda/flashnext_exl3_tests.zig       | 737 ++++++++++++++++++
+ zig/tests/cuda/main.zig                       |   5 +
+ 21 files changed, 2549 insertions(+), 30 deletions(-)
+ create mode 100644 zig/kernels/cuda/exl3_fnx_prompt.cuh
+ create mode 100644 zig/src/families/flashnext/cuda_exl3_experts.zig
+ create mode 100644 zig/src/families/flashnext/cuda_exl3_experts_test.zig
+ create mode 100644 zig/src/families/flashnext/cuda_exl3_prompt.zig
+ create mode 100644 zig/src/families/flashnext/cuda_exl3_routed.zig
+ create mode 100644 zig/tests/cuda/flashnext_exl3_tests.zig
+
+diff --git a/zig/kernels/cuda/exl3_experts.cu b/zig/kernels/cuda/exl3_experts.cu
+index d6c8a6751a1456410467862c2ad805db11ae7584..bfe8ce190c6df2c45b69269368b4f57303c6bff1 100644
+--- a/zig/kernels/cuda/exl3_experts.cu
++++ b/zig/kernels/cuda/exl3_experts.cu
+@@ -29,6 +29,108 @@ extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1,
+     tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+ }
+ 
++// The same three with two k tiles of words in flight a warp (TF_EXL3_GROUPED_PF=2): same bits as tf_exl3_grouped_*.
++extern "C" __global__ void tf_exl3_grouped_pf2_0(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<0, 8, 4, GROUPED_LOAD, 2>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void tf_exl3_grouped_pf2_1(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<1, 8, 4, GROUPED_LOAD, 2>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void tf_exl3_grouped_pf2_2(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD, 2>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++// The A fragments ride in the stages too (TF_EXL3_GROUPED_XA, the served default): one or two k tiles ahead, same bits.
++extern "C" __global__ void tf_exl3_grouped_xa1_0(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<0, 8, 4, GROUPED_LOAD, 1, true>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void tf_exl3_grouped_xa1_1(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<1, 8, 4, GROUPED_LOAD, 1, true>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void tf_exl3_grouped_xa1_2(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD, 1, true>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void tf_exl3_grouped_xa2_0(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<0, 8, 4, GROUPED_LOAD, 2, true>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void tf_exl3_grouped_xa2_1(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<1, 8, 4, GROUPED_LOAD, 2, true>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void tf_exl3_grouped_xa2_2(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD, 2, true>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++// xa1 with half the reduction smem and 128 registers, four programs an SM (TF_EXL3_GROUPED_FIT=lean): same bits.
++extern "C" __global__ void __launch_bounds__(128, 4) tf_exl3_grouped_lean_0(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<0, 8, 4, GROUPED_LOAD, 1, true, true>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void __launch_bounds__(128, 4) tf_exl3_grouped_lean_1(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<1, 8, 4, GROUPED_LOAD, 1, true, true>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void __launch_bounds__(128, 4) tf_exl3_grouped_lean_2(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD, 1, true, true>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++// The lean programs over 64 columns (4 n tiles) in 80 registers, six programs an SM (TF_EXL3_GROUPED_FIT=narrow): same bits.
++extern "C" __global__ void __launch_bounds__(128, 6) tf_exl3_grouped_narrow_0(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<0, 4, 4, GROUPED_LOAD, 1, true, true>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void __launch_bounds__(128, 6) tf_exl3_grouped_narrow_1(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<1, 4, 4, GROUPED_LOAD, 1, true, true>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void __launch_bounds__(128, 6) tf_exl3_grouped_narrow_2(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<2, 4, 4, GROUPED_LOAD, 1, true, true>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++// The words through a 3-stage cp.async ring a warp (2 k tiles ahead, 16-byte copies, L1 bypassed) in lean's smem,
++// four programs an SM (TF_EXL3_GROUPED_FIT=cp3); K2 above 8 keeps xa1's loads: same bits.
++extern "C" __global__ void __launch_bounds__(128, 4) tf_exl3_grouped_cp3_0(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<0, 8, 4, GROUPED_LOAD, 0, false, true, 3>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void __launch_bounds__(128, 4) tf_exl3_grouped_cp3_1(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<1, 8, 4, GROUPED_LOAD, 0, false, true, 3>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void __launch_bounds__(128, 4) tf_exl3_grouped_cp3_2(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD, 0, false, true, 3>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++
++// The words through a 4-stage cp.async ring a warp (3 k tiles ahead, 16-byte copies, L1 bypassed) in lean's smem,
++// four programs an SM (TF_EXL3_GROUPED_FIT=cp4); K2 above 8 keeps xa1's loads: same bits.
++extern "C" __global__ void __launch_bounds__(128, 4) tf_exl3_grouped_cp4_0(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<0, 8, 4, GROUPED_LOAD, 0, false, true, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void __launch_bounds__(128, 4) tf_exl3_grouped_cp4_1(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<1, 8, 4, GROUPED_LOAD, 0, false, true, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void __launch_bounds__(128, 4) tf_exl3_grouped_cp4_2(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD, 0, false, true, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++// flashnext-exl3-bench's roofline probes: lean's programs reading the same words with no decode (not the projection).
++extern "C" __global__ void tf_exl3_grouped_roof_v4(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD, 0, false, true, 0, tf_exl3::ROOF_V4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
++extern "C" __global__ void tf_exl3_grouped_roof_lane(tf_exl3::GroupedArgs a) {
++    tf_exl3::grouped_body<2, 8, 4, GROUPED_LOAD, 0, false, true, 0, tf_exl3::ROOF_LANE>(a, blockIdx.x, blockIdx.y, blockIdx.z);
++}
++
+ namespace tf_exl3 {
+ 
+ // Grouping in one block: distinct experts (< E) in id order, members row * 32 + slot in row order, -1 after the last.
+@@ -328,3 +430,6 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const h
+         }
+     }
+ }
++
++// Flash Next's prompt experts on x3gm v2's items (TF_EXL3_PROMPT_ROWS): tf_exl3_fnx_rotate, tf_exl3_fnx_gu, tf_exl3_fnx_dn(0).
++#include "exl3_fnx_prompt.cuh"
+diff --git a/zig/kernels/cuda/exl3_fnx_prompt.cuh b/zig/kernels/cuda/exl3_fnx_prompt.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..d4885009a4bd2c2c9d61aa3d11c9567566edca0d
+--- /dev/null
++++ b/zig/kernels/cuda/exl3_fnx_prompt.cuh
+@@ -0,0 +1,265 @@
++// Flash Next's EXL3 prompt experts (TF_EXL3_PROMPT_ROWS, cuda_exl3_prompt.zig): x3gm v2's items (DeepSeek-V4.1's
++// prefill experts, exl3_block/x3gm.cu) on the Grouped plan's 64-member items, every width of an item in one launch.
++// Each item decodes its expert's 128-column block once for up to 64 pairs and keeps one fp32 mma chain an output over
++// ascending k (no split-K partials); the epilogues are fused:
++//   rotate: x0 / x1 [P, D] = plan_rotate's gate and up inputs of every routed pair (fp16), one warp a 128-value block;
++//   gate/up: act [P, I] = plan_finish's bf16 silu(gate) * up (act_mode 1, no clamp), and xd [P, I] = plan_rotate's down
++//            input from those bf16 values (bf16 act * suh_d, Hadamard, fp16), so the down call needs no rotation;
++//   down: y [P, D] fp32 = x3gm's down epilogue (Hadamard, * svh_d), plan_finish's arithmetic.
++// Pairs routed to `skip` (another rank's, the shared slot) are neither read nor written.
++#pragma once
++
++#define DSV41_X3GM_NO_INSTANCES
++#include "exl3_block/x3gm.cu"
++#undef DSV41_X3GM_NO_INSTANCES
++
++namespace tf_exl3_fnx {
++
++using dsv41_x3gm::Args;
++using dsv41_x3gm::Cfg;
++using dsv41_x3gm::NB;
++using dsv41_x3gm::cp_async16;
++using dsv41_x3gm::swz;
++using dsv41_x3gm::kloop2;
++using dsv41_x3gm::Ring2;
++using dsv41_x3gm::Smem2;
++using tf_common::cp_commit;
++using tf_common::cp_wait;
++
++// The tiles (x3gm's MTL, NG, KS, NSA, NGR): gate/up GM_GU1 (two inputs; v3's default for them), down v3's default
++// (1, 8, 4, 4, 8: 8-warp CTAs) and GM_DN0. Each has 64 members a pass (NG 8), the Grouped plan's prompt tile.
++#define TF_FNX_GU 2, 8, 2, 4, 4
++#define TF_FNX_DN 1, 8, 4, 4, 8
++#define TF_FNX_DN0 2, 8, 4, 4, 8
++constexpr int MEMBERS = 64;
++// The dynamic shared memory every instance is launched with (Smem2's for each tile: the 4-bit ring's 4 stages); the
++// host passes it (exl3_experts.zig fnx_smem) and each block checks it got at least its own.
++constexpr unsigned SMEM = 49152;
++
++struct FnxArgs {
++    Args g;                      // x0 / x1, tp0 / tp1 (pointer tables), k2e (widths), sv0 / sv1 / sd, xd, y, K, N, limit
++    const int* items;            // the Grouped plan's (expert, first, count) an item, at most MEMBERS members
++    const int* counts;           // [0]: items
++    const int* members;          // pair indices
++    const int* k2u;              // gate/up: up's widths (each equal to gate's in k2e)
++    __nv_bfloat16* act;          // gate/up: bf16 silu(gate) * up [P, N]
++    int skip;                    // the plan entry of pairs this rank does not hold
++};
++static_assert(sizeof(Args) == 160 && sizeof(FnxArgs) == 208 && offsetof(FnxArgs, items) == 160 &&
++                  offsetof(FnxArgs, skip) == 200,
++              "cuda_exl3_prompt.zig's FnxArgs");
++
++__device__ __forceinline__ unsigned dynamic_smem() {
++    unsigned v;
++    asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(v));
++    return v;
++}
++
++// gm2_item with Flash Next's gate/up epilogue (MATS 2, XM 2): x3gm's loads and K loop, then act and xd as above.
++template <int K2, int MTL, int NG, int KS, int NSA, int NGR>
++__device__ __forceinline__ void gu_item(const FnxArgs& f, unsigned char* smem, const int* rows_sh, int e, int cnt,
++                                        int nb) {
++    constexpr int MATS = 2, XM = 2;
++    using C = Cfg<MATS, XM, K2, MTL, NG, KS, NSA, NGR>;
++    constexpr int THREADS = C::THREADS, BM = C::BM, LDE = C::LDE, ER = C::ER, CPR = C::CPR, TW = C::TW, W = C::W;
++    constexpr int ACH = XM * BM * CPR, WCH = MATS * KS * NB * K2;
++    constexpr int APT = (ACH + THREADS - 1) / THREADS, WPT = (WCH + THREADS - 1) / THREADS;
++    const Args& a = f.g;
++    float* ep = reinterpret_cast<float*>(smem);
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int mat = warp / C::WPM, slice = warp % C::WPM;
++    const int K = a.K, N = a.N, KT = K >> 4, NTILES = N >> 4, S = KT / KS;
++    const int lr = (lane & 7) + ((lane >> 4) << 3), lc = (lane >> 3) & 1;
++    const tf_exl3x::LaneMap<K2> map(lane);
++    const uint32_t* te0 = reinterpret_cast<const uint32_t*>(a.tp0[e]);
++    const uint32_t* te1 = reinterpret_cast<const uint32_t*>(a.tp1[e]);
++    const int cnt16 = (cnt + 15) & ~15;
++
++    int a_src[APT], w_src[WPT];
++#pragma unroll
++    for (int j = 0; j < APT; ++j) {
++        const int i = threadIdx.x + j * THREADS, r = (i / CPR) % BM, c = i % CPR;
++        int v = -1;
++        if (i < ACH && r < cnt16) v = rows_sh[r] < 0 ? -2 : rows_sh[r] * K + c * 8;
++        a_src[j] = v;
++    }
++#pragma unroll
++    for (int j = 0; j < WPT; ++j) {
++        const int i = threadIdx.x + j * THREADS, q = i % K2, n = (i / K2) % NB, kk = (i / (K2 * NB)) % KS;
++        w_src[j] = (kk * NTILES + nb * NB + n) * TW + q * 4;
++    }
++    auto load_stage = [&](int s) {
++        unsigned char* st = smem + (size_t)(s % NSA) * C::STAGE;
++        half* ra = reinterpret_cast<half*>(st);
++        uint32_t* rw = reinterpret_cast<uint32_t*>(st + C::A_BYTES);
++        const int k0 = s * KS * 16;
++#pragma unroll
++        for (int j = 0; j < APT; ++j) {
++            const int i = threadIdx.x + j * THREADS, v = a_src[j];
++            if (v != -1) {
++                const int m = i / (BM * CPR), r = (i / CPR) % BM, c = i % CPR;
++                cp_async16(ra + ((size_t)m * BM + r) * C::LDA + swz<CPR>(r, c) * 8,
++                           (m ? a.x1 : a.x0) + (v < 0 ? 0 : v + k0), v >= 0);
++            }
++        }
++        const size_t ws = (size_t)s * KS * NTILES * TW;
++#pragma unroll
++        for (int j = 0; j < WPT; ++j) {
++            const int i = threadIdx.x + j * THREADS;
++            if (WCH % THREADS == 0 || i < WCH) {
++                const int q = i % K2, n = (i / K2) % NB, kk = (i / (K2 * NB)) % KS, m = i / (K2 * NB * KS);
++                cp_async16(rw + ((m * KS + kk) * NB + n) * TW + q * 4, (m ? te1 : te0) + ws + w_src[j], true);
++            }
++        }
++    };
++
++    float acc[MTL][NG][4];
++#pragma unroll
++    for (int l = 0; l < MTL; ++l)
++#pragma unroll
++        for (int n = 0; n < NG; ++n)
++#pragma unroll
++            for (int c = 0; c < 4; ++c) acc[l][n][c] = 0.f;
++
++    static_assert(NG == 8, "64-member passes");
++    const int n8 = (cnt + 7) >> 3;
++#define FNX_K(G) kloop2<G, MATS, XM, K2, MTL, NG, KS, NSA, NGR>(acc, smem, S, mat, mat, slice, lr, lc, map, load_stage)
++    switch (n8) {
++        case 1: FNX_K(1); break;
++        case 2: FNX_K(2); break;
++        case 3: FNX_K(3); break;
++        case 4: FNX_K(4); break;
++        case 5: FNX_K(5); break;
++        case 6: FNX_K(6); break;
++        case 7: FNX_K(7); break;
++        default: FNX_K(8); break;
++    }
++#undef FNX_K
++
++    const int g = lane >> 2, t = lane & 3;
++#pragma unroll
++    for (int rd = 0; rd < C::ROUNDS; ++rd) {
++        if (rd) __syncthreads();
++        if (ER * rd < cnt) {
++#pragma unroll
++            for (int n = 0; n < NGR; ++n) {
++                const int ng = rd * NGR + n;
++                float* E = ep + ((size_t)mat * ER + 8 * n + 2 * t) * LDE + slice * 16 * MTL + g;
++#pragma unroll
++                for (int l = 0; l < MTL; ++l) {
++                    E[l * 16] = acc[l][ng][0];
++                    E[LDE + l * 16] = acc[l][ng][1];
++                    E[l * 16 + 8] = acc[l][ng][2];
++                    E[LDE + l * 16 + 8] = acc[l][ng][3];
++                }
++            }
++        }
++        __syncthreads();
++        for (int r = warp; r < ER && ER * rd + r < cnt; r += W) {
++            const int row = rows_sh[ER * rd + r];
++            const int c0 = 4 * lane;
++            const size_t col = (size_t)e * N + nb * 128 + c0;
++            float v[4], u[4];
++            *reinterpret_cast<float4*>(v) = *reinterpret_cast<const float4*>(ep + (size_t)r * LDE + c0);
++            *reinterpret_cast<float4*>(u) = *reinterpret_cast<const float4*>(ep + ((size_t)ER + r) * LDE + c0);
++            tf_exl3::fwht128(v, lane);
++            tf_exl3::fwht128(u, lane);
++            float xv[4];
++            __nv_bfloat16* ao = f.act + (size_t)row * N + nb * 128 + c0;
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                float gv = v[j] * tf_exl3::HAD_SCALE * __half2float(a.sv0[col + j]);
++                const float up = u[j] * tf_exl3::HAD_SCALE * __half2float(a.sv1[col + j]);
++                gv = gv / (1.f + expf(-gv));
++                gv *= up;
++                const __nv_bfloat16 b = __float2bfloat16_rn(gv);
++                ao[j] = b;
++                xv[j] = __bfloat162float(b) * __half2float(a.sd[col + j]);
++            }
++            tf_exl3::fwht128(xv, lane);
++            half2* o = reinterpret_cast<half2*>(a.xd + (size_t)row * N + nb * 128 + c0);
++            o[0] = __halves2half2(__float2half_rn(xv[0] * tf_exl3::HAD_SCALE), __float2half_rn(xv[1] * tf_exl3::HAD_SCALE));
++            o[1] = __halves2half2(__float2half_rn(xv[2] * tf_exl3::HAD_SCALE), __float2half_rn(xv[3] * tf_exl3::HAD_SCALE));
++        }
++    }
++}
++
++// One item a block: blockIdx.x = item * (N / 128) + 128-column block; blocks past the plan's items return.
++template <bool GU, int MTL, int NG, int KS, int NSA, int NGR>
++__device__ __forceinline__ void body(const FnxArgs& f) {
++    constexpr int MATS = GU ? 2 : 1, XM = MATS, BM = NG * 8;
++    static_assert(BM == MEMBERS, "the plan's prompt tile");
++    static_assert(Smem2<MATS, XM, MTL, NG, KS, NSA, NGR>::SMEM <= SMEM, "the launch's dynamic shared memory");
++    extern __shared__ __align__(16) unsigned char smem[];
++    __shared__ int rows_sh[BM];
++    const int NBLK = f.g.N >> 7;
++    const int tt = blockIdx.x / NBLK, nb = blockIdx.x % NBLK;
++    if (tt >= f.counts[0]) return;
++    const int e = f.items[3 * tt], first = f.items[3 * tt + 1], cnt = f.items[3 * tt + 2];
++    if (e == f.skip || cnt <= 0) return;
++    if (cnt > BM || dynamic_smem() < SMEM) __trap();
++    for (int i = threadIdx.x; i < BM; i += blockDim.x) rows_sh[i] = i < cnt ? f.members[first + i] : -1;
++    __syncthreads();
++    const int k2 = f.g.k2e[e];
++    if (GU && f.k2u[e] != k2) __trap();
++    switch (k2) {
++#define FNX_CASE(K)                                                                                                  \
++    case K:                                                                                                          \
++        if constexpr (GU)                                                                                            \
++            gu_item<K, MTL, NG, KS, Ring2<2, 2, K, MTL, NG, KS, NSA, NGR>::value, NGR>(f, smem, rows_sh, e, cnt, nb); \
++        else                                                                                                         \
++            dsv41_x3gm::gm2_item<1, 1, K, MTL, NG, KS, Ring2<1, 1, K, MTL, NG, KS, NSA, NGR>::value, NGR>(          \
++                f.g, smem, rows_sh, e, cnt, nb);                                                                     \
++        break;
++        FNX_CASE(4)
++        FNX_CASE(5)
++        FNX_CASE(6)
++        FNX_CASE(8)
++#undef FNX_CASE
++        default: __trap();   // the host takes this path only when every width is one of these (fnx_widths)
++    }
++}
++
++}  // namespace tf_exl3_fnx
++
++// x0 / x1 [P, K]: gate and up inputs of every pair routed here, plan_rotate's arithmetic; one warp a 128-value block.
++extern "C" __global__ void __launch_bounds__(256) tf_exl3_fnx_rotate(const __nv_bfloat16* __restrict__ x, int x_stride,
++        const int* __restrict__ picks, const half* __restrict__ suh_g, const half* __restrict__ suh_u, half* __restrict__ x0,
++        half* __restrict__ x1, int K, int slots, int pairs, int skip) {
++    const int item = blockIdx.x * 8 + (threadIdx.x >> 5);
++    const int KB = K >> 7;
++    if (item >= pairs * KB) return;
++    const int p = item / KB, blk = item % KB, lane = threadIdx.x & 31;
++    const int e = picks[p];
++    if (e < 0 || e >= skip) return;
++    const __nv_bfloat16* xr = x + (size_t)(p / slots) * x_stride + blk * 128 + 4 * lane;
++    float xv[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) xv[j] = __bfloat162float(xr[j]);
++#pragma unroll
++    for (int m = 0; m < 2; ++m) {
++        const half* su = (m ? suh_u : suh_g) + (size_t)e * K + blk * 128 + 4 * lane;
++        float v[4];
++#pragma unroll
++        for (int j = 0; j < 4; ++j) v[j] = xv[j] * __half2float(su[j]);
++        tf_exl3::fwht128(v, lane);
++        half* o = (m ? x1 : x0) + (size_t)p * K + blk * 128 + 4 * lane;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * tf_exl3::HAD_SCALE);
++    }
++}
++
++extern "C" __global__ void __launch_bounds__(dsv41_x3gm::Smem2<2, 2, TF_FNX_GU>::THREADS, dsv41_x3gm::Smem2<2, 2, TF_FNX_GU>::MINB)
++    tf_exl3_fnx_gu(const tf_exl3_fnx::FnxArgs f) {
++    tf_exl3_fnx::body<true, TF_FNX_GU>(f);
++}
++
++extern "C" __global__ void __launch_bounds__(dsv41_x3gm::Smem2<1, 1, TF_FNX_DN>::THREADS, dsv41_x3gm::Smem2<1, 1, TF_FNX_DN>::MINB)
++    tf_exl3_fnx_dn(const tf_exl3_fnx::FnxArgs f) {
++    tf_exl3_fnx::body<false, TF_FNX_DN>(f);
++}
++
++extern "C" __global__ void __launch_bounds__(dsv41_x3gm::Smem2<1, 1, TF_FNX_DN0>::THREADS, dsv41_x3gm::Smem2<1, 1, TF_FNX_DN0>::MINB)
++    tf_exl3_fnx_dn0(const tf_exl3_fnx::FnxArgs f) {
++    tf_exl3_fnx::body<false, TF_FNX_DN0>(f);
++}
+diff --git a/zig/kernels/cuda/exl3_grouped.cuh b/zig/kernels/cuda/exl3_grouped.cuh
+index 930700d964cf526217803619983a7a86136550ed..169b84ab4d2d4807979ca7818f42a38476a21194 100644
+--- a/zig/kernels/cuda/exl3_grouped.cuh
++++ b/zig/kernels/cuda/exl3_grouped.cuh
+@@ -5,6 +5,7 @@
+ #include <cuda_fp16.h>
+ 
+ #include "exl3_decode.cuh"
++#include "common/cp_async.cuh"
+ 
+ namespace tf_exl3 {
+ 
+@@ -69,8 +70,175 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt
+     }
+ }
+ 
++// warp_tiles' loads, decode and mma order with PF k tiles of words in flight (a ring of PF register stages): same bits.
++// XA: each stage also holds its k tile's A fragment, loaded with the words, so no mma waits on an activation load.
++template <int CB, int K2, int NT, int PF, bool XA = false>
++__device__ __forceinline__ void warp_tiles_pf(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* x0,
++                                              const half* x1, bool ok0, bool ok1, int lane, float (&acc)[NT][2][4]) {
++    constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
++    const size_t kstride = (size_t)ntiles * TW;
++    const uint32_t* tb = T + (size_t)kt0 * kstride + (size_t)nt0 * TW;
++    uint32_t pf[PF][NT][LW];
++    uint32_t pa[PF][4];
++    const auto load_a = [&](int i, uint32_t (&dst)[4]) {
++        const int k = (kt0 + i) * 16;
++        dst[0] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u;
++        dst[1] = ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u;
++        dst[2] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u;
++        dst[3] = ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k + 8) : 0u;
++    };
++#pragma unroll
++    for (int d = 0; d < PF; ++d)
++        if (d < nkt) {
++#pragma unroll
++            for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(tb + (size_t)d * kstride + j * TW, lane, pf[d][j]);
++            if constexpr (XA) load_a(d, pa[d]);
++        }
++    for (int ib = 0; ib < nkt; ib += PF) {
++#pragma unroll
++        for (int d = 0; d < PF; ++d) {
++            const int i = ib + d;
++            if (i < nkt) {
++                uint32_t w[NT][LW];
++#pragma unroll
++                for (int j = 0; j < NT; ++j)
++#pragma unroll
++                    for (int l = 0; l < LW; ++l) w[j][l] = pf[d][j][l];
++                uint32_t a[4];
++                if constexpr (XA) {
++#pragma unroll
++                    for (int q = 0; q < 4; ++q) a[q] = pa[d][q];
++                }
++                if (i + PF < nkt) {
++#pragma unroll
++                    for (int j = 0; j < NT; ++j)
++                        ldg_lane_words<K2>(tb + (size_t)(i + PF) * kstride + j * TW, lane, pf[d][j]);
++                    if constexpr (XA) load_a(i + PF, pa[d]);
++                }
++                if constexpr (!XA) load_a(i, a);
++#pragma unroll
++                for (int j = 0; j < NT; ++j) {
++                    uint32_t b0[2], b1[2];
++                    decode_lane<K2, CB>(w[j], lane, b0, b1);
++                    mma16816(acc[j][0], a, b0);
++                    mma16816(acc[j][1], a, b1);
++                }
++            }
++        }
++    }
++}
++
++__device__ __forceinline__ void cp_async16(uint32_t* smem, const uint32_t* gmem) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
++}
++
++// Words of one k tile's NT tiles in a cp ring stage, sized for K2 up to CP_K2 (wider K2 keeps warp_tiles_pf's path).
++constexpr int CP_K2 = 8;
++template <int NT>
++__host__ __device__ constexpr int cp_stage_words() {
++    return NT * tile_words<CP_K2>();
++}
++
++// warp_tiles_pf<.., 1, true>'s decode, mma and A fragment order with the words copied (cp.async, 16 bytes a lane, L1
++// bypassed) ST - 1 k tiles ahead into the warp's ring of ST shared stages, then read per lane from there: same bits.
++template <int CB, int K2, int NT, int ST>
++__device__ __forceinline__ void warp_tiles_cp(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* x0,
++                                              const half* x1, bool ok0, bool ok1, int lane, uint32_t* ring,
++                                              float (&acc)[NT][2][4]) {
++    static_assert(ST >= 2 && K2 <= CP_K2, "a ring of 2+ stages of words up to CP_K2");
++    constexpr int TW = tile_words<K2>(), LW = lane_words<K2>(), SW = NT * TW, CH = SW / 4, RW = cp_stage_words<NT>();
++    static_assert(SW % 4 == 0, "whole 16-byte chunks a stage");
++    const size_t kstride = (size_t)ntiles * TW;
++    const uint32_t* tb = T + (size_t)kt0 * kstride + (size_t)nt0 * TW;
++    const auto fill = [&](int i) {
++        if (i < nkt) {
++            const uint32_t* src = tb + (size_t)i * kstride;
++            uint32_t* dst = ring + (i % ST) * RW;
++#pragma unroll
++            for (int c = lane; c < CH; c += 32) cp_async16(dst + 4 * c, src + 4 * c);
++        }
++        tf_common::cp_commit();
++    };
++    const auto load_a = [&](int i, uint32_t (&dst)[4]) {
++        const int k = (kt0 + i) * 16;
++        dst[0] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u;
++        dst[1] = ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u;
++        dst[2] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u;
++        dst[3] = ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k + 8) : 0u;
++    };
++#pragma unroll
++    for (int d = 0; d < ST - 1; ++d) fill(d);
++    uint32_t pa[4] = {0u, 0u, 0u, 0u};
++    if (nkt > 0) load_a(0, pa);
++    for (int i = 0; i < nkt; ++i) {
++        tf_common::cp_wait<ST - 2>();
++        __syncwarp();
++        uint32_t w[NT][LW];
++#pragma unroll
++        for (int j = 0; j < NT; ++j) load_lane_words<K2>(ring + (i % ST) * RW + j * TW, lane, w[j]);
++        uint32_t a[4];
++#pragma unroll
++        for (int q = 0; q < 4; ++q) a[q] = pa[q];
++        fill(i + ST - 1);
++        if (i + 1 < nkt) load_a(i + 1, pa);
++#pragma unroll
++        for (int j = 0; j < NT; ++j) {
++            uint32_t b0[2], b1[2];
++            decode_lane<K2, CB>(w[j], lane, b0, b1);
++            mma16816(acc[j][0], a, b0);
++            mma16816(acc[j][1], a, b1);
++        }
++    }
++    tf_common::cp_wait<0>();
++}
++
++// Bench-only roofline probes (not the projection's bits): a warp reads the same k tiles' words and only xors them.
++// ROOF_V4: 16-byte loads of the k tile's contiguous NT tiles; ROOF_LANE: warp_tiles' per-lane 4-byte words.
++enum Roof : int { ROOF_NONE = 0, ROOF_V4 = 1, ROOF_LANE = 2 };
++
++__device__ __forceinline__ uint4 ldg_stream_v4(const uint32_t* p) {
++    uint4 v;
++    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
++                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
++                 : "l"(p));
++    return v;
++}
++
++template <int K2, int NT, int ROOF>
++__device__ __forceinline__ uint32_t roof_tiles(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, int lane) {
++    constexpr int TW = tile_words<K2>(), LW = lane_words<K2>(), CH = NT * TW / 4;
++    const size_t kstride = (size_t)ntiles * TW;
++    const uint32_t* tb = T + (size_t)kt0 * kstride + (size_t)nt0 * TW;
++    uint32_t x = 0;
++#pragma unroll 4
++    for (int i = 0; i < nkt; ++i) {
++        const uint32_t* t = tb + (size_t)i * kstride;
++        if constexpr (ROOF == ROOF_V4) {
++#pragma unroll
++            for (int c = lane; c < CH; c += 32) {
++                const uint4 v = ldg_stream_v4(t + 4 * c);
++                x ^= v.x ^ v.y ^ v.z ^ v.w;
++            }
++        } else {
++#pragma unroll
++            for (int j = 0; j < NT; ++j) {
++                uint32_t w[LW];
++                ldg_lane_words<K2>(t + j * TW, lane, w);
++#pragma unroll
++                for (int l = 0; l < LW; ++l) x ^= w[l];
++            }
++        }
++    }
++    return x;
++}
++
+ // Program (expert u, n block, split, member tile): 16 members times W_q over the split's K range, summed in warp order.
+-template <int CB, int NT, int W, int LOAD>
++// PF > 0: warp_tiles_pf's PF stages (XA: A fragments in them too) instead of LOAD's loop.
++// LEAN: half the reduction smem (warps 0-1, then 2-3, summed in the same warp order) so 4+ programs fit an SM.
++// CP > 0: warp_tiles_cp's CP-stage ring (LEAN's smem, before the reduction) for K2 up to CP_K2.
++// ROOF: roof_tiles' probe in place of the projection (bench only).
++template <int CB, int NT, int W, int LOAD, int PF = 0, bool XA = false, bool LEAN = false, int CP = 0, int ROOF = ROOF_NONE>
+ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nblock, int zz) {
+     if (u >= a.ucount[0]) return;
+     const int MT = (a.maxm + 15) / 16;
+@@ -111,11 +279,24 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
+ #pragma unroll
+             for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+ 
+-    __shared__ __align__(16) float red[W][16][NT * 16];
++    static_assert(!LEAN || W == 4, "LEAN reduces four warps in two halves");
++    __shared__ __align__(16) float red[LEAN ? 2 : W][16][NT * 16];
++    static_assert(CP == 0 || (LEAN && sizeof(red) >= sizeof(uint32_t) * W * CP * cp_stage_words<NT>()),
++                  "the cp ring lives in LEAN's reduction smem");
++    uint32_t* const ring = reinterpret_cast<uint32_t*>(&red[0][0][0]) + warp * CP * cp_stage_words<NT>();
+     switch (k2) {
+ #define TF_EXL3X_CASE(K2_)                                                                                   \
+     case K2_:                                                                                                \
+-        warp_tiles<CB, K2_, NT, LOAD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);          \
++        if constexpr (ROOF != ROOF_NONE)                                                                     \
++            acc[0][0][0] = roof_tiles<K2_, NT, ROOF>(T, NTILES, kt0, per_warp, nt0, lane) == 0x9e3779b9u;   \
++        else if constexpr (CP > 0 && K2_ <= CP_K2)                                                           \
++            warp_tiles_cp<CB, K2_, NT, CP>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, ring, acc); \
++        else if constexpr (CP > 0)                                                                           \
++            warp_tiles_pf<CB, K2_, NT, 1, true>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); \
++        else if constexpr (PF > 0)                                                                           \
++            warp_tiles_pf<CB, K2_, NT, PF, XA>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); \
++        else                                                                                                 \
++            warp_tiles<CB, K2_, NT, LOAD>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);  \
+         break;
+         TF_EXL3X_CASE(2)
+         TF_EXL3X_CASE(3)
+@@ -137,25 +318,57 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
+             __trap();
+     }
+ 
++    const auto put = [&](int slot) {
+ #pragma unroll
+-    for (int i = 0; i < NT; ++i)
++        for (int i = 0; i < NT; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int col = i * 16 + h * 8 + 2 * t;
++                red[slot][g][col] = acc[i][h][0];
++                red[slot][g][col + 1] = acc[i][h][1];
++                red[slot][g + 8][col] = acc[i][h][2];
++                red[slot][g + 8][col + 1] = acc[i][h][3];
++            }
++    };
++    if constexpr (CP > 0) __syncthreads();
++    if constexpr (LEAN) {
++        constexpr int PER = 16 * NT * 16 / (W * 32);
++        static_assert(PER * W * 32 == 16 * NT * 16, "whole rows of the reduction per thread");
++        float s[PER];
++        if (warp < 2) put(warp);
++        __syncthreads();
+ #pragma unroll
+-        for (int h = 0; h < 2; ++h) {
+-            const int col = i * 16 + h * 8 + 2 * t;
+-            red[warp][g][col] = acc[i][h][0];
+-            red[warp][g][col + 1] = acc[i][h][1];
+-            red[warp][g + 8][col] = acc[i][h][2];
+-            red[warp][g + 8][col + 1] = acc[i][h][3];
++        for (int q = 0; q < PER; ++q) {
++            const int idx = threadIdx.x + q * W * 32;
++            const int row = idx / (NT * 16), col = idx % (NT * 16);
++            s[q] = red[0][row][col] + red[1][row][col];
++        }
++        __syncthreads();
++        if (warp >= 2) put(warp - 2);
++        __syncthreads();
++#pragma unroll
++        for (int q = 0; q < PER; ++q) {
++            const int idx = threadIdx.x + q * W * 32;
++            const int row = idx / (NT * 16), col = idx % (NT * 16);
++            const int r = rows_sh[row];
++            if (r < 0) continue;
++            float v = s[q];
++            v += red[0][row][col];
++            v += red[1][row][col];
++            a.z[(((size_t)mat * a.sk + split) * a.p + r) * a.n + nt0 * 16 + col] = v;
++        }
++    } else {
++        put(warp);
++        __syncthreads();
++        for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
++            const int row = idx / (NT * 16), col = idx % (NT * 16);
++            const int r = rows_sh[row];
++            if (r < 0) continue;
++            float s = red[0][row][col];
++#pragma unroll
++            for (int w = 1; w < W; ++w) s += red[w][row][col];
++            a.z[(((size_t)mat * a.sk + split) * a.p + r) * a.n + nt0 * 16 + col] = s;
+         }
+-    __syncthreads();
+-    for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
+-        const int row = idx / (NT * 16), col = idx % (NT * 16);
+-        const int r = rows_sh[row];
+-        if (r < 0) continue;
+-        float s = red[0][row][col];
+-#pragma unroll
+-        for (int w = 1; w < W; ++w) s += red[w][row][col];
+-        a.z[(((size_t)mat * a.sk + split) * a.p + r) * a.n + nt0 * 16 + col] = s;
+     }
+ }
+ 
+diff --git a/zig/src/cuda/exl3_experts.zig b/zig/src/cuda/exl3_experts.zig
+index 733eae5761ea3edc7eb2ba8e1ebb52616c164bfe..22b351b7ccabda87294563c2d647ec4560c7b34c 100644
+--- a/zig/src/cuda/exl3_experts.zig
++++ b/zig/src/cuda/exl3_experts.zig
+@@ -104,17 +104,36 @@ pub fn scratch(base: u64, l: Layer, rows: usize, slots: usize) !Scratch {
+     return .{ .xg = xg, .xu = xu, .xd = xd, .z = z, .y = y, .ids = ids, .count = count, .members = members, .rows = rows, .slots = slots };
+ }
+ 
++/// The dynamic shared memory the fnx_gu / fnx_dn kernels are launched with (exl3_fnx_prompt.cuh's SMEM; each block
++/// traps when it gets less).
++pub const fnx_smem: u32 = 49152;
++
+ /// The loaded kernels.
+ pub const Experts = struct {
+     mod: Module,
+     group: Function,
+     rot_in: Function,
+     grouped: [3]Function, // one per codebook
++    grouped_pf2: [3]Function = undefined, // the same with two k tiles of words in flight a warp, same bits
++    grouped_xa1: [3]Function = undefined, // one k tile of words and A fragments in flight a warp, same bits
++    grouped_xa2: [3]Function = undefined, // two of them
++    grouped_lean: [3]Function = undefined, // xa1 in 128 registers and half the reduction smem, four programs an SM
++    grouped_narrow: [3]Function = undefined, // lean over 64 columns in 80 registers, six programs an SM
++    grouped_cp3: [3]Function = undefined, // lean with the words through a 3-stage cp.async ring a warp, same bits
++    grouped_cp4: [3]Function = undefined, // a 4-stage ring
++    grouped_roof_v4: Function = undefined, // bench probe: the same words in 16-byte loads, no decode (not the bits)
++    grouped_roof_lane: Function = undefined, // bench probe: the same words in the per-lane loads, no decode
+     gateup: Function,
+     down_combine: Function,
+     prompt: prompt.Kernels = undefined,
+     plan_rotate: Function = undefined,
+     plan_finish: Function = undefined,
++    /// Flash Next's prompt experts on x3gm v2's 64-member items (exl3_fnx_prompt.cuh, flashnext/cuda_exl3_prompt.zig):
++    /// the gate and up inputs' rotation, gate/up, down at x3gm v3's default tile (8 warps) and at GM_DN0 (4 warps).
++    fnx_rotate: Function = undefined,
++    fnx_gu: Function = undefined,
++    fnx_dn: Function = undefined,
++    fnx_dn0: Function = undefined,
+ 
+     pub fn load(d: *const Driver) !Experts {
+         if (!kernels.available) return error.BuiltWithoutKernels;
+@@ -130,6 +149,11 @@ pub const Experts = struct {
+         e.prompt = try prompt.Kernels.resolve(e.mod);
+         e.plan_rotate = try e.mod.function("tf_exl3_plan_rotate");
+         e.plan_finish = try e.mod.function("tf_exl3_plan_finish");
++        e.fnx_rotate = try e.mod.function("tf_exl3_fnx_rotate");
++        e.fnx_gu = try e.mod.function("tf_exl3_fnx_gu");
++        e.fnx_dn = try e.mod.function("tf_exl3_fnx_dn");
++        e.fnx_dn0 = try e.mod.function("tf_exl3_fnx_dn0");
++        for ([_]Function{ e.fnx_gu, e.fnx_dn, e.fnx_dn0 }) |f| try f.allowDynamicShared(fnx_smem);
+         e.group = try e.mod.function("tf_exl3_group");
+         try e.group.allowDynamicShared(64 * 1024);
+         e.rot_in = try e.mod.function("tf_exl3_experts_rot_in");
+@@ -138,6 +162,43 @@ pub const Experts = struct {
+             try e.mod.function("tf_exl3_grouped_1"),
+             try e.mod.function("tf_exl3_grouped_2"),
+         };
++        e.grouped_pf2 = .{
++            try e.mod.function("tf_exl3_grouped_pf2_0"),
++            try e.mod.function("tf_exl3_grouped_pf2_1"),
++            try e.mod.function("tf_exl3_grouped_pf2_2"),
++        };
++        e.grouped_xa1 = .{
++            try e.mod.function("tf_exl3_grouped_xa1_0"),
++            try e.mod.function("tf_exl3_grouped_xa1_1"),
++            try e.mod.function("tf_exl3_grouped_xa1_2"),
++        };
++        e.grouped_xa2 = .{
++            try e.mod.function("tf_exl3_grouped_xa2_0"),
++            try e.mod.function("tf_exl3_grouped_xa2_1"),
++            try e.mod.function("tf_exl3_grouped_xa2_2"),
++        };
++        e.grouped_lean = .{
++            try e.mod.function("tf_exl3_grouped_lean_0"),
++            try e.mod.function("tf_exl3_grouped_lean_1"),
++            try e.mod.function("tf_exl3_grouped_lean_2"),
++        };
++        e.grouped_narrow = .{
++            try e.mod.function("tf_exl3_grouped_narrow_0"),
++            try e.mod.function("tf_exl3_grouped_narrow_1"),
++            try e.mod.function("tf_exl3_grouped_narrow_2"),
++        };
++        e.grouped_cp3 = .{
++            try e.mod.function("tf_exl3_grouped_cp3_0"),
++            try e.mod.function("tf_exl3_grouped_cp3_1"),
++            try e.mod.function("tf_exl3_grouped_cp3_2"),
++        };
++        e.grouped_cp4 = .{
++            try e.mod.function("tf_exl3_grouped_cp4_0"),
++            try e.mod.function("tf_exl3_grouped_cp4_1"),
++            try e.mod.function("tf_exl3_grouped_cp4_2"),
++        };
++        e.grouped_roof_v4 = try e.mod.function("tf_exl3_grouped_roof_v4");
++        e.grouped_roof_lane = try e.mod.function("tf_exl3_grouped_roof_lane");
+         e.gateup = try e.mod.function("tf_exl3_gateup_epilogue");
+         e.down_combine = try e.mod.function("tf_exl3_down_combine");
+         return e;
+diff --git a/zig/src/cuda/exl3_grouped.zig b/zig/src/cuda/exl3_grouped.zig
+index 79e7a621e9597ce90683f4079611448349f84271..4c612d4702a69b954382d47fa53a058049da927d 100644
+--- a/zig/src/cuda/exl3_grouped.zig
++++ b/zig/src/cuda/exl3_grouped.zig
+@@ -37,11 +37,27 @@ pub const Stage = extern struct {
+ 
+ pub const UpContract = enum { bf16, combined_fp32 };
+ 
++/// Which grouped programs run (A fragments ahead, depth 1, same bits): base (xa1, 3 an SM), lean (4: 128 registers,
++/// half the reduction smem), narrow (6: lean over 64 columns, 80 registers), cp3/cp4 (lean with the words through a
++/// 3- or 4-stage cp.async ring a warp). roof_v4 and roof_lane are flashnext-exl3-bench's roofline probes: they read
++/// the same words with no decode and write meaningless partials.
++pub const Fit = enum { base, lean, narrow, cp3, cp4, roof_v4, roof_lane };
++
+ pub const Grouped = struct {
+     up_contract: UpContract = .bf16,
+     d: *const Driver,
+     kernels: *const ex.Experts,
+     storage: ?memory.DeviceBuffer = null,
++    /// Pairs any call routes at most (reserve's): bounds the scratch's pair rows below items * 64; 0 keeps items * 64.
++    pair_cap: usize = 0,
++    /// Members an item holds at most (the router's tile, 16 or 64): one 16-member program a tile of them, none past it.
++    tile: usize = 64,
++    /// k tiles of words a warp keeps in flight: 1 (tf_exl3_grouped_*) or 2 (tf_exl3_grouped_pf2_*); same bits.
++    depth: u8 = 1,
++    /// Each k tile's A fragment loaded with its words, `depth` tiles ahead (tf_exl3_grouped_xa*); same bits.
++    x_ahead: bool = false,
++    /// lean and narrow need x_ahead at depth 1.
++    fit: Fit = .base,
+ 
+     pub fn deinit(g: *Grouped) void {
+         if (g.storage) |*b| b.free();
+@@ -49,7 +65,11 @@ pub const Grouped = struct {
+     }
+ 
+     pub fn bytes(k: usize, n: usize, items: usize, sk: usize, mats: usize) !usize {
+-        const p = try std.math.mul(usize, items, 64);
++        return pairBytes(k, n, try std.math.mul(usize, items, 64), sk, mats);
++    }
++
++    /// Scratch bytes for `p` pair rows: the rotated inputs and the split-K partials of every pair a call routes.
++    pub fn pairBytes(k: usize, n: usize, p: usize, sk: usize, mats: usize) !usize {
+         if (p > std.math.maxInt(i32) or k > std.math.maxInt(i32) or n > std.math.maxInt(i32))
+             return error.Exl3Shape;
+         const x = try std.math.mul(usize, k, 4);
+@@ -59,6 +79,8 @@ pub const Grouped = struct {
+ 
+     pub fn run(g: *Grouped, s: Stream, epi: experts.Epi, in: experts.Rows, l: experts.Layer, p: grouped.Plan, out: u64, items: usize, skip: i32, _: bool) !void {
+         if (epi == .up and g.up_contract != .bf16) return error.UnsupportedEpilogue;
++        if ((g.tile != 16 and g.tile != 64) or g.depth < 1 or g.depth > 2) return error.BadExperts;
++        if (g.fit != .base and (!g.x_ahead or g.depth != 1)) return error.BadExperts;
+         const w = l.exl3 orelse return error.BadExperts;
+         if (w.dims != l.dims or w.width != l.width or w.experts != l.experts or l.relu2 or
+             in.stride > std.math.maxInt(i32) or in.slots > std.math.maxInt(i32)) return error.BadExperts;
+@@ -69,14 +91,14 @@ pub const Grouped = struct {
+         if (k == 0 or n == 0 or k % 128 != 0 or n % 128 != 0 or in.stride < k) return error.Exl3Shape;
+         const sk = try ex.plan(k, n, up);
+         const mats: usize = if (up) 2 else 1;
+-        const size = try bytes(k, n, items, sk, mats);
++        const pairs = try g.pairRows(items);
++        const size = try pairBytes(k, n, pairs, sk, mats);
+         if (items == 0) return;
+         if (g.storage == null or g.storage.?.len < size) {
+             const replacement = try memory.DeviceBuffer.alloc(g.d, size);
+             if (g.storage) |*old| old.free();
+             g.storage = replacement;
+         }
+-        const pairs = items * 64;
+         const x0 = g.storage.?.ptr;
+         const x1 = x0 + pairs * k * 2;
+         const z = x1 + pairs * k * 2;
+@@ -90,14 +112,44 @@ pub const Grouped = struct {
+         try launch.launch(g.kernels.plan_rotate, .{ .grid = .{ .x = @intCast(items), .y = @intCast(k / 128), .z = @intCast(mats) }, .block = .{ .x = 32 } }, s, &rot);
+         var args: launch.Args = .{};
+         for ([_]u64{ x0, x1, if (up) w.gate else w.down, if (up) w.up else w.down, if (up) w.gate_k2 else w.down_k2, if (up) w.up_k2 else w.down_k2, p.items, p.counts, p.members, z }) |v| args.add(v);
+-        for ([_]usize{ k, n, pairs, sk, 64, in.slots, items, mats, if (up) w.gu_stride else 0, 1 }) |v|
++        for ([_]usize{ k, n, pairs, sk, g.tile, in.slots, items, mats, if (up) w.gu_stride else 0, 1 }) |v|
+             args.add(@as(i32, @intCast(v)));
+         args.add(skip);
+-        try launch.launch(g.kernels.grouped[@backingInt(w.codebook)], .{ .grid = .{ .x = @intCast(items), .y = @intCast(n / 128), .z = @intCast(mats * sk * 4) }, .block = .{ .x = 128 } }, s, &args);
++        const F = @TypeOf(g.kernels.grouped_roof_v4);
++        const fns = switch (g.fit) {
++            .lean => g.kernels.grouped_lean,
++            .narrow => g.kernels.grouped_narrow,
++            .cp3 => g.kernels.grouped_cp3,
++            .cp4 => g.kernels.grouped_cp4,
++            .roof_v4 => [3]F{ g.kernels.grouped_roof_v4, g.kernels.grouped_roof_v4, g.kernels.grouped_roof_v4 },
++            .roof_lane => [3]F{ g.kernels.grouped_roof_lane, g.kernels.grouped_roof_lane, g.kernels.grouped_roof_lane },
++            .base => if (g.x_ahead) (if (g.depth == 2) g.kernels.grouped_xa2 else g.kernels.grouped_xa1) else if (g.depth == 2) g.kernels.grouped_pf2 else g.kernels.grouped,
++        };
++        const cols: usize = if (g.fit == .narrow) 64 else 128;
++        try launch.launch(fns[@backingInt(w.codebook)], .{ .grid = .{ .x = @intCast(items), .y = @intCast(n / cols), .z = @intCast(mats * sk * (g.tile / 16)) }, .block = .{ .x = 128 } }, s, &args);
+         var finish: launch.Args = .{};
+         finish.add(a);
+         try launch.launch(g.kernels.plan_finish, .{ .grid = .{ .x = @intCast(items), .y = @intCast(n / 128) }, .block = .{ .x = 32 } }, s, &finish);
+     }
++
++    /// The pair rows a call's scratch holds: items * 64, or pair_cap when set and smaller (members index pairs below it).
++    pub fn pairRows(g: *const Grouped, items: usize) !usize {
++        const p = try std.math.mul(usize, items, 64);
++        return if (g.pair_cap != 0) @min(p, g.pair_cap) else p;
++    }
++
++    /// Scratch for calls of up to `pairs` routed pairs of a k x n layer, allocated now (before any graph capture).
++    pub fn reservePairs(g: *Grouped, dims: usize, width: usize, pairs: usize) !void {
++        const up = try pairBytes(dims, width, pairs, try ex.plan(dims, width, true), 2);
++        const down = try pairBytes(width, dims, pairs, try ex.plan(width, dims, false), 1);
++        const size = @max(up, down);
++        if (g.storage == null or g.storage.?.len < size) {
++            const replacement = try memory.DeviceBuffer.alloc(g.d, size);
++            if (g.storage) |*old| old.free();
++            g.storage = replacement;
++        }
++        g.pair_cap = @max(g.pair_cap, pairs);
++    }
+ };
+ 
+ /// The activations plan_finish runs (0 bf16, 1 fp32, 2 SwiGLU-OAI); SwiGLU-OAI needs its clamp and alpha.
+diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
+index 84f23b21a8638d222d4f2c1e3fc61abdedc19a04..40ed19401df73b1a8ee154b46a94991682c2721b 100644
+--- a/zig/src/families/flashnext/cuda_batch_kernels.zig
++++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
+@@ -8,6 +8,7 @@ const qmm_smem = state.qmm_smem;
+ const chain_tpr_smem = state.chain_tpr_smem;
+ const gdn_fused_smem = state.gdn_fused_smem;
+ const Heads = @import("cuda_heads.zig").Heads;
++const exl3x = @import("cuda_exl3_experts.zig");
+ 
+ /// The DeltaNet kernels of one head geometry: the full heads', or their `_h8` twins' (8 key and 24 value heads).
+ pub const Gdn = struct {
+@@ -55,6 +56,8 @@ pub const Kernels = struct {
+     /// Block-FP8 routed experts (the MTP head of NVIDIA's NVFP4 checkpoint; cuda_moe_native.zig).
+     fp8: cuda.experts.Fp8Experts,
+     expert_tile: ?cuda.experts_tile.Tile = null,
++    /// TF_FLASHNEXT_EXPERTS_EXL3's grouped kernels and scratch (null when the switch is off).
++    exl3: ?*exl3x.Kit = null,
+     /// The DeltaNet kernels for the whole layer's heads and for a rank's half under the head split (gdnSet).
+     gdn: Gdn,
+     gdn_h8: Gdn,
+@@ -79,6 +82,9 @@ pub const Kernels = struct {
+         const tile_mode = try cuda.experts_tile.mode(if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERT_TILE")) |v| std.mem.span(v) else null);
+         var k: Kernels = undefined;
+         k.expert_tile = null;
++        k.exl3 = null;
++        if (try exl3x.config() != null) k.exl3 = try exl3x.Kit.load(d);
++        errdefer if (k.exl3) |x| x.unload();
+         k.qmm = try cuda.Module.load(d, cuda.kernels.qmm);
+         errdefer k.qmm.unload();
+         k.experts = try cuda.Module.load(d, cuda.kernels.experts);
+@@ -130,6 +136,7 @@ pub const Kernels = struct {
+     }
+ 
+     pub fn deinit(k: *Kernels) void {
++        if (k.exl3) |x| x.unload();
+         if (k.expert_tile) |*tile| tile.unload();
+         k.fp8.unload();
+         k.nvfp4.unload();
+diff --git a/zig/src/families/flashnext/cuda_exl3_experts.zig b/zig/src/families/flashnext/cuda_exl3_experts.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..a83ad1fa0259747ecf12354e83ba8d42b7f85901
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_exl3_experts.zig
+@@ -0,0 +1,345 @@
++//! TF_FLASHNEXT_EXPERTS_EXL3=DIR: the routed experts from an experts-only EXL3 folder (mul1 trellises under the EXL3
++//! checkpoint's names, model.safetensors.index.json beside them); router, shared expert and the rest load as before.
++//! TF_FLASHNEXT_EXPERTS_EXL3_LAYERS=all (default) | main (the 48 decoder layers) | mtp (the MTP head's layer only).
++//! Unset or empty DIR: nothing here runs and the NVFP4 / block-FP8 experts load and run exactly as without it.
++const std = @import("std");
++const core = @import("core");
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++const routed = @import("cuda_modelopt_experts.zig");
++const layout = @import("cuda_exl3_routed.zig");
++pub const prompt = @import("cuda_exl3_prompt.zig");
++
++const ex = cuda.exl3_experts;
++/// The folder reader `load` takes, for the device tests that open a staged pack themselves.
++pub const Store = wt.Store;
++const Proj = layout.Proj;
++
++/// The mul1 codebook marker each projection carries (exl3_format.Mul1Mul).
++pub const mul1_magic: u32 = core.exl3_format.Mul1Mul;
++/// plan_finish's fp32 silu(gate) * up, unclamped (Flash Next's SwiGLU, qwen3_5's mode).
++pub const act_mode: i32 = 1;
++
++pub const Scope = enum { all, main, mtp };
++pub const Part = enum { main, mtp };
++pub const Config = struct {
++    dir: []const u8,
++    scope: Scope,
++
++    pub fn covers(c: Config, part: Part) bool {
++        return c.scope == .all or (c.scope == .main and part == .main) or (c.scope == .mtp and part == .mtp);
++    }
++};
++
++/// The switch from the two variables' values: null (off) when `dir` is unset or empty.
++pub fn parse(dir: ?[]const u8, scope: ?[]const u8) !?Config {
++    const d = dir orelse return null;
++    if (d.len == 0) return null;
++    const s = scope orelse "all";
++    const sc: Scope = if (s.len == 0 or std.mem.eql(u8, s, "all")) .all else if (std.mem.eql(u8, s, "main")) .main else if (std.mem.eql(u8, s, "mtp")) .mtp else return error.BadExl3Scope;
++    return .{ .dir = d, .scope = sc };
++}
++
++pub fn config() !?Config {
++    const span = struct {
++        fn f(name: [*:0]const u8) ?[]const u8 {
++            return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
++        }
++    }.f;
++    return parse(span("TF_FLASHNEXT_EXPERTS_EXL3"), span("TF_FLASHNEXT_EXPERTS_EXL3_LAYERS"));
++}
++
++/// The part a loader prefix names: the MTP head's layer ("language_model.mtp." or "mtp."), else a decoder layer.
++pub fn partOf(prefix: []const u8) Part {
++    return if (std.mem.startsWith(u8, prefix, "language_model.mtp.") or std.mem.startsWith(u8, prefix, "mtp.")) .mtp else .main;
++}
++
++/// Opens the EXL3 folder beside `store` when the switch is on and covers `part`; the store frees it with its own deinit.
++pub fn attach(gpa: std.mem.Allocator, io: std.Io, store: *wt.Store, part: Part) !void {
++    const c = (try config()) orelse return;
++    try attachTo(gpa, io, store, c, part);
++}
++
++pub fn attachTo(gpa: std.mem.Allocator, io: std.Io, store: *wt.Store, c: Config, part: Part) !void {
++    if (!c.covers(part) or store.experts_exl3 != null) return;
++    const x = try gpa.create(wt.Store);
++    errdefer gpa.destroy(x);
++    x.* = try wt.Store.open(gpa, io, c.dir);
++    store.experts_exl3 = x;
++    std.log.info("flashnext: {s} routed experts from EXL3 folder {s}", .{ @tagName(part), c.dir });
++}
++
++const projs = [3][]const u8{ "gate_proj", "up_proj", "down_proj" };
++
++/// One projection's tensors, checked as qwen3_5's admit.group checks them: trellis [k/16][n/16][8 * halves] i16, the
++/// mul1 marker, fp16 suh [k] and svh [n].
++pub fn group(store: anytype, base: []const u8, k: usize, n: usize) !layout.Source {
++    var buf: [256]u8 = undefined;
++    const t = try store.hold(try std.fmt.bufPrint(&buf, "{s}.trellis", .{base}));
++    if (t.dtype != .i16 or t.rank != 3 or t.dim(0) != k / 16 or t.dim(1) != n / 16 or t.dim(2) % 8 != 0) return error.UnexpectedTensor;
++    const halves = t.dim(2) / 8;
++    if (halves < 2 or halves > 16) return error.UnsupportedQuantization;
++    const marker = try store.hold(try std.fmt.bufPrint(&buf, "{s}.mul1", .{base}));
++    if ((marker.dtype != .i32 and marker.dtype != .u32) or marker.bytes.len != 4 or std.mem.readInt(u32, marker.bytes[0..4], .little) != mul1_magic) return error.UnsupportedQuantization;
++    const suh = try store.hold(try std.fmt.bufPrint(&buf, "{s}.suh", .{base}));
++    const svh = try store.hold(try std.fmt.bufPrint(&buf, "{s}.svh", .{base}));
++    if (!suh.is(.f16, &.{k}) or !svh.is(.f16, &.{n})) return error.UnexpectedTensor;
++    return .{ .trellis = t.bytes, .suh = suh.bytes, .svh = svh.bytes, .halves = @intCast(halves) };
++}
++
++fn expertBase(buf: []u8, prefix: []const u8, e: usize, p: usize) ![]const u8 {
++    return std.fmt.bufPrint(buf, "{s}.experts.{d}.{s}", .{ prefix, e, projs[p] });
++}
++
++/// The rank's experts of the layer at `prefix` (the loader's names; the store's aliases reach the EXL3 names): the
++/// global ids [own.first, own.first + own.count) at local slots 0.., each projection's half-bit width as stored.
++pub fn plan(a: std.mem.Allocator, store: anytype, prefix: []const u8, own: routed.Experts, dims: usize, width: usize) !layout.Layout {
++    var halves: [3][]u32 = undefined;
++    var made: usize = 0;
++    defer for (halves[0..made]) |h| a.free(h);
++    var buf: [256]u8 = undefined;
++    for (0..3) |p| {
++        halves[p] = try a.alloc(u32, own.count);
++        made += 1;
++        const s = layout.kn(@fromBackingInt(@intCast(p)), dims, width);
++        for (halves[p], 0..) |*h, i| h.* = (try group(store, try expertBase(&buf, prefix, own.first + i, p), s[0], s[1])).halves;
++    }
++    return layout.Layout.init(a, dims, width, .{ halves[0], halves[1], halves[2] });
++}
++
++/// Fills `img` (the plan's total bytes, its device address `base`) with the rank's experts; the store's borrows stay held.
++pub fn fill(store: anytype, prefix: []const u8, own: routed.Experts, l: layout.Layout, img: []u8, base: u64) !void {
++    @memset(img, 0);
++    var buf: [256]u8 = undefined;
++    for (0..3) |p| {
++        const proj: Proj = @fromBackingInt(@intCast(p));
++        const s = layout.kn(proj, l.dims, l.width);
++        for (0..own.count) |i| {
++            const src = try group(store, try expertBase(&buf, prefix, own.first + i, p), s[0], s[1]);
++            try l.put(img, base, proj, i, src, src.halves);
++        }
++    }
++}
++
++/// The layer's routed experts for `world` ranks as rank `rank` holds them, on the device as one image.
++pub fn load(a: std.mem.Allocator, d: *const cuda.Driver, store: *wt.Store, prefix: []const u8, world: usize, rank: usize) !routed.Owned {
++    return loadShape(a, d, store, prefix, world, rank, wt.dims, wt.moe_w, wt.experts_n);
++}
++
++pub fn loadShape(a: std.mem.Allocator, d: *const cuda.Driver, store: *wt.Store, prefix: []const u8, world: usize, rank: usize, dims: usize, width: usize, count: usize) !routed.Owned {
++    defer store.release();
++    const own = try routed.Experts.init(count, world, rank);
++    var l = try plan(a, store, prefix, own, dims, width);
++    defer l.deinit(a);
++    var image = try cuda.DeviceBuffer.alloc(d, l.total);
++    errdefer image.free();
++    const img = try store.pinned(d, l.total);
++    try fill(store, prefix, own, l, img, image.ptr);
++    try image.upload(0, img);
++    const empty: cuda.DeviceBuffer = .{ .d = d, .ptr = 0, .len = 0 };
++    return .{ .up = empty, .down = empty, .up_scale = empty, .down_scale = empty, .width = width, .dims = dims, .count = own.count, .first = own.first, .format = .exl3, .image = image, .exl3 = l.layer(image.ptr, act_mode), .exl3_prompt = l.prompt_ok };
++}
++
++/// The EXL3 grouped kernels and their scratch, loaded beside the engine's when the switch is on; passes of
++/// `prompt_rows` rows or more take the prompt kernels (cuda_exl3_prompt.zig, 0 never) in the grouped scratch.
++pub const Kit = struct {
++    experts: ex.Experts,
++    grouped: cuda.exl3_grouped.Grouped,
++    prompt_rows: usize = prompt.default_rows,
++    prompt_dn: prompt.Down = .v3,
++
++    pub fn load(d: *const cuda.Driver) !*Kit {
++        const k = try std.heap.page_allocator.create(Kit);
++        errdefer std.heap.page_allocator.destroy(k);
++        k.experts = try ex.Experts.load(d);
++        const pf = try depth(std.c.getenv("TF_EXL3_GROUPED_PF"));
++        const xa = try xAhead(std.c.getenv("TF_EXL3_GROUPED_XA"));
++        k.grouped = .{ .d = d, .kernels = &k.experts, .tile = 16, .depth = pf, .x_ahead = xa, .fit = try fitFor(std.c.getenv("TF_EXL3_GROUPED_FIT"), xa, pf) };
++        k.prompt_rows = try prompt.rowsFrom(std.c.getenv("TF_EXL3_PROMPT_ROWS"));
++        k.prompt_dn = try prompt.downFrom(std.c.getenv("TF_EXL3_PROMPT_DN"));
++        return k;
++    }
++
++    /// Scratch for passes of up to `rows` rows (every slot routed), allocated before any graph captures a call.
++    pub fn reserve(k: *Kit, rows: usize) !void {
++        try k.grouped.reservePairs(wt.dims, wt.moe_w, rows * wt.slots);
++    }
++
++    pub fn unload(k: *Kit) void {
++        k.grouped.deinit();
++        k.experts.unload();
++        std.heap.page_allocator.destroy(k);
++    }
++};
++
++/// TF_EXL3_GROUPED_PF: k tiles of words a warp of the grouped kernels keeps in flight, 1 (unset) or 2; same bits.
++pub fn depth(value: ?[*:0]const u8) !u8 {
++    const v = std.mem.span(value orelse return 1);
++    if (std.mem.eql(u8, v, "1")) return 1;
++    if (std.mem.eql(u8, v, "2")) return 2;
++    return error.BadExl3GroupedDepth;
++}
++
++/// TF_EXL3_GROUPED_XA: 1 (unset) loads each k tile's A fragment with its words, ahead of its mma; 0 in the iteration.
++pub fn xAhead(value: ?[*:0]const u8) !bool {
++    const v = std.mem.span(value orelse return true);
++    if (std.mem.eql(u8, v, "1")) return true;
++    if (std.mem.eql(u8, v, "0")) return false;
++    return error.BadExl3GroupedXa;
++}
++
++/// TF_EXL3_GROUPED_FIT: cp4 (unset: the 4-stage cp.async ring, 0.69x NVFP4's time at 84 rows), base, lean,
++/// narrow or cp3 grouped programs (exl3_grouped.Fit), all the same bits; all but base need TF_EXL3_GROUPED_XA=1 and
++/// TF_EXL3_GROUPED_PF=1. The bench's roofline probes are refused.
++pub fn fit(value: ?[*:0]const u8) !cuda.exl3_grouped.Fit {
++    const v = std.mem.span(value orelse return .cp4);
++    const f = std.meta.stringToEnum(cuda.exl3_grouped.Fit, v) orelse return error.BadExl3GroupedFit;
++    return switch (f) {
++        .roof_v4, .roof_lane => error.BadExl3GroupedFit,
++        else => f,
++    };
++}
++
++/// fit's choice for the loaded depth and A-ahead switch: unset at PF=2 or XA=0 keeps base (cp4 needs XA=1, PF=1).
++pub fn fitFor(value: ?[*:0]const u8, x_ahead: bool, pf: u8) !cuda.exl3_grouped.Fit {
++    if (value == null and (!x_ahead or pf != 1)) return .base;
++    return fit(value);
++}
++
++test "TF_EXL3_GROUPED_FIT unset is cp4 at the default depth and A-ahead, base beside PF=2 or XA=0" {
++    try std.testing.expectEqual(cuda.exl3_grouped.Fit.cp4, try fitFor(null, true, 1));
++    try std.testing.expectEqual(cuda.exl3_grouped.Fit.base, try fitFor(null, true, 2));
++    try std.testing.expectEqual(cuda.exl3_grouped.Fit.base, try fitFor(null, false, 1));
++    try std.testing.expectEqual(cuda.exl3_grouped.Fit.lean, try fitFor("lean", true, 1));
++}
++
++test "TF_EXL3_GROUPED_FIT takes cp4 (the default), base, lean, narrow or cp3 and refuses anything else" {
++    try std.testing.expectEqual(cuda.exl3_grouped.Fit.cp4, try fit(null));
++    try std.testing.expectEqual(cuda.exl3_grouped.Fit.base, try fit("base"));
++    try std.testing.expectEqual(cuda.exl3_grouped.Fit.lean, try fit("lean"));
++    try std.testing.expectEqual(cuda.exl3_grouped.Fit.narrow, try fit("narrow"));
++    try std.testing.expectEqual(cuda.exl3_grouped.Fit.cp3, try fit("cp3"));
++    try std.testing.expectEqual(cuda.exl3_grouped.Fit.cp4, try fit("cp4"));
++    try std.testing.expectError(error.BadExl3GroupedFit, fit("roof_v4"));
++    try std.testing.expectError(error.BadExl3GroupedFit, fit("roof_lane"));
++    try std.testing.expectError(error.BadExl3GroupedFit, fit("4"));
++    try std.testing.expectError(error.BadExl3GroupedFit, fit(""));
++}
++
++test "TF_EXL3_GROUPED_XA takes 1 (the default) or 0 and refuses anything else" {
++    try std.testing.expect(try xAhead(null));
++    try std.testing.expect(try xAhead("1"));
++    try std.testing.expect(!try xAhead("0"));
++    try std.testing.expectError(error.BadExl3GroupedXa, xAhead("2"));
++}
++
++test "TF_EXL3_GROUPED_PF takes 1 (the default) or 2 and refuses anything else" {
++    try std.testing.expectEqual(@as(u8, 1), try depth(null));
++    try std.testing.expectEqual(@as(u8, 1), try depth("1"));
++    try std.testing.expectEqual(@as(u8, 2), try depth("2"));
++    try std.testing.expectError(error.BadExl3GroupedDepth, depth("3"));
++    try std.testing.expectError(error.BadExl3GroupedDepth, depth(""));
++}
++
++/// Kit.reserve's device bytes for `rows` rows.
++pub fn scratchBytes(rows: usize) !usize {
++    const pairs = rows * wt.slots;
++    const g = cuda.exl3_grouped.Grouped;
++    const up = try g.pairBytes(wt.dims, wt.moe_w, pairs, try ex.plan(wt.dims, wt.moe_w, true), 2);
++    const down = try g.pairBytes(wt.moe_w, wt.dims, pairs, try ex.plan(wt.moe_w, wt.dims, false), 1);
++    return @max(up, down);
++}
++
++/// An EXL3 routed-expert trellis name: the MTP head's or a decoder layer's, its expert and projection.
++pub const Name = struct { part: Part, layer: usize, expert: usize, proj: Proj };
++
++pub fn parseName(name: []const u8) ?Name {
++    const heads = [_]struct { []const u8, Part }{ .{ "model.language_model.layers.", .main }, .{ "mtp.layers.", .mtp } };
++    for (heads) |h| {
++        if (!std.mem.startsWith(u8, name, h[0])) continue;
++        var it = std.mem.splitScalar(u8, name[h[0].len..], '.');
++        const layer = std.fmt.parseInt(usize, it.next() orelse return null, 10) catch return null;
++        if (!std.mem.eql(u8, it.next() orelse return null, "mlp")) return null;
++        if (!std.mem.eql(u8, it.next() orelse return null, "experts")) return null;
++        const expert = std.fmt.parseInt(usize, it.next() orelse return null, 10) catch return null;
++        const p = it.next() orelse return null;
++        if (!std.mem.eql(u8, it.next() orelse return null, "trellis") or it.next() != null) return null;
++        for (projs, 0..) |want, i| if (std.mem.eql(u8, p, want)) return .{ .part = h[1], .layer = layer, .expert = expert, .proj = @fromBackingInt(@intCast(i)) };
++        return null;
++    }
++    return null;
++}
++
++/// The memory ledger's EXL3 terms for one rank: its decoder layers' images, the MTP head's (rank 0 drafting), the scratch.
++pub const Ledger = struct { main: u64 = 0, mtp: u64 = 0, scratch: u64 = 0 };
++
++/// Device bytes from the folder's headers alone (no tensor byte read), each layer's image as `plan` lays it out.
++pub fn ledger(gpa: std.mem.Allocator, io: std.Io, c: Config, world: usize, rank: usize, drafts: bool, rows: usize) !Ledger {
++    return ledgerShape(gpa, io, c, world, rank, drafts, rows, wt.layers_n, wt.dims, wt.moe_w, wt.experts_n);
++}
++
++pub fn ledgerShape(gpa: std.mem.Allocator, io: std.Io, c: Config, world: usize, rank: usize, drafts: bool, rows: usize, layers: usize, dims: usize, width: usize, count: usize) !Ledger {
++    const own = try routed.Experts.init(count, world, rank);
++    const want_main = c.covers(.main);
++    const want_mtp = c.covers(.mtp) and drafts and rank == 0;
++    var out: Ledger = .{ .scratch = if (want_main or want_mtp) try scratchBytes(rows) else 0 };
++    if (!want_main and !want_mtp) return out;
++    const main = try gpa.alloc(u32, layers * 3 * own.count);
++    defer gpa.free(main);
++    @memset(main, 0);
++    const mtp = try gpa.alloc(u32, 3 * count);
++    defer gpa.free(mtp);
++    @memset(mtp, 0);
++    var store = try wt.Store.open(gpa, io, c.dir);
++    defer store.deinit();
++    const wm = store.parsed.value.object.get("weight_map") orelse return error.MissingTensor;
++    var files: std.StringArrayHashMapUnmanaged(void) = .empty;
++    defer files.deinit(gpa);
++    var wi = wm.object.iterator();
++    while (wi.next()) |item| if (item.value_ptr.* == .string) try files.put(gpa, item.value_ptr.string, {});
++    for (files.keys()) |file| {
++        const path = try std.fs.path.join(gpa, &.{ c.dir, file });
++        defer gpa.free(path);
++        // a rank's folder may hold only its own files (and the MTP's on rank 0); what this rank needs is checked below
++        var meta = core.safetensors.Metadata.read(gpa, io, path) catch |err| switch (err) {
++            error.FileNotFound => continue,
++            else => return err,
++        };
++        defer meta.deinit();
++        var names = meta.names.iterator();
++        while (names.next()) |entry| {
++            const n = parseName(entry.key_ptr.*) orelse continue;
++            const e = entry.value_ptr.*;
++            if (e.dtype != .i16 or e.rank != 3 or e.dim(2) % 8 != 0) return error.UnexpectedTensor;
++            const halves: u32 = @intCast(e.dim(2) / 8);
++            switch (n.part) {
++                .main => {
++                    if (n.layer >= layers or n.expert >= count) return error.UnexpectedTensor;
++                    if (n.expert < own.first or n.expert >= own.first + own.count) continue;
++                    main[(n.layer * 3 + @backingInt(n.proj)) * own.count + n.expert - own.first] = halves;
++                },
++                .mtp => {
++                    if (n.layer != 0 or n.expert >= count) return error.UnexpectedTensor;
++                    mtp[@as(usize, @backingInt(n.proj)) * count + n.expert] = halves;
++                },
++            }
++        }
++    }
++    if (want_main) for (0..layers) |layer| {
++        const at = layer * 3 * own.count;
++        out.main += try imageBytes(gpa, dims, width, main[at..][0 .. 3 * own.count], own.count);
++    };
++    if (want_mtp) out.mtp = try imageBytes(gpa, dims, width, mtp, count);
++    return out;
++}
++
++fn imageBytes(gpa: std.mem.Allocator, dims: usize, width: usize, halves: []const u32, count: usize) !u64 {
++    for (halves) |h| if (h == 0) return error.MissingTensor;
++    var l = try layout.Layout.init(gpa, dims, width, .{ halves[0..count], halves[count..][0..count], halves[2 * count ..][0..count] });
++    defer l.deinit(gpa);
++    return l.total;
++}
++
++test {
++    _ = @import("cuda_exl3_experts_test.zig");
++}
+diff --git a/zig/src/families/flashnext/cuda_exl3_experts_test.zig b/zig/src/families/flashnext/cuda_exl3_experts_test.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..4766947658b2377ecac1afb00b0963a264adf9d4
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_exl3_experts_test.zig
+@@ -0,0 +1,295 @@
++//! TF_FLASHNEXT_EXPERTS_EXL3 on the host: the switch, the EXL3 names, a rank's experts in its image, the ledger.
++const std = @import("std");
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++const x = @import("cuda_exl3_experts.zig");
++const layout = @import("cuda_exl3_routed.zig");
++const Fake = @import("cuda_modelopt_threads_test.zig").Fake;
++const ta = std.testing.allocator;
++const io = std.testing.io;
++
++const count = 4;
++const dims = 256;
++const width = 128;
++const projs = [_][]const u8{ "gate_proj", "up_proj", "down_proj" };
++
++test "exl3 experts: the switch is off unless the folder is named, and its scope picks the layers" {
++    try std.testing.expectEqual(@as(?x.Config, null), try x.parse(null, "mtp"));
++    try std.testing.expectEqual(@as(?x.Config, null), try x.parse("", null));
++    const all = (try x.parse("/w", null)).?;
++    try std.testing.expect(all.covers(.main) and all.covers(.mtp));
++    const main = (try x.parse("/w", "main")).?;
++    try std.testing.expect(main.covers(.main) and !main.covers(.mtp));
++    const mtp = (try x.parse("/w", "mtp")).?;
++    try std.testing.expect(!mtp.covers(.main) and mtp.covers(.mtp));
++    try std.testing.expectEqual(x.Scope.all, (try x.parse("/w", "")).?.scope);
++    try std.testing.expectError(error.BadExl3Scope, x.parse("/w", "both"));
++    try std.testing.expectEqual(x.Part.mtp, x.partOf("language_model.mtp.layers.0.mlp"));
++    try std.testing.expectEqual(x.Part.main, x.partOf("language_model.model.layers.7.mlp"));
++}
++
++test "exl3 experts: trellis names parse to their part, layer, expert and projection; anything else is skipped" {
++    const a = x.parseName("model.language_model.layers.47.mlp.experts.511.down_proj.trellis").?;
++    try std.testing.expectEqual(x.Part.main, a.part);
++    try std.testing.expectEqual(@as(usize, 47), a.layer);
++    try std.testing.expectEqual(@as(usize, 511), a.expert);
++    try std.testing.expectEqual(layout.Proj.down, a.proj);
++    const m = x.parseName("mtp.layers.0.mlp.experts.3.gate_proj.trellis").?;
++    try std.testing.expectEqual(x.Part.mtp, m.part);
++    try std.testing.expectEqual(layout.Proj.gate, m.proj);
++    for ([_][]const u8{
++        "model.language_model.layers.0.mlp.experts.0.gate_proj.suh",
++        "model.language_model.layers.0.mlp.shared_expert.gate_proj.trellis",
++        "model.language_model.layers.0.mlp.experts.0.gate_up_proj.trellis",
++        "model.language_model.layers.0.mlp.experts.x.gate_proj.trellis",
++        "language_model.model.layers.0.mlp.experts.0.gate_proj.trellis",
++    }) |n| try std.testing.expectEqual(@as(?x.Name, null), x.parseName(n));
++}
++
++/// A tensor of the fixture shard: name, dtype, shape (any rank) and bytes.
++const Entry = struct { name: []const u8, dtype: []const u8, shape: []const usize, data: []const u8 };
++
++fn fixture(dir: std.Io.Dir, entries: []const Entry) !void {
++    var header: std.Io.Writer.Allocating = .init(ta);
++    defer header.deinit();
++    var index: std.Io.Writer.Allocating = .init(ta);
++    defer index.deinit();
++    var data: std.ArrayList(u8) = .empty;
++    defer data.deinit(ta);
++    try header.writer.writeByte('{');
++    try index.writer.writeAll("{\"weight_map\":{");
++    for (entries, 0..) |e, i| {
++        if (i > 0) {
++            try header.writer.writeByte(',');
++            try index.writer.writeByte(',');
++        }
++        const at = data.items.len;
++        try data.appendSlice(ta, e.data);
++        try header.writer.print("\"{s}\":{{\"dtype\":\"{s}\",\"shape\":[", .{ e.name, e.dtype });
++        for (e.shape, 0..) |d, j| try header.writer.print("{s}{d}", .{ if (j > 0) "," else "", d });
++        try header.writer.print("],\"data_offsets\":[{d},{d}]}}", .{ at, data.items.len });
++        try index.writer.print("\"{s}\":\"experts-r0-00001-of-00001.safetensors\"", .{e.name});
++    }
++    try header.writer.writeByte('}');
++    try index.writer.writeAll("}}");
++    while (header.written().len % 8 != 0) try header.writer.writeByte(' ');
++    var image: std.Io.Writer.Allocating = .init(ta);
++    defer image.deinit();
++    try image.writer.writeAll(&std.mem.toBytes(std.mem.nativeToLittle(u64, header.written().len)));
++    try image.writer.writeAll(header.written());
++    try image.writer.writeAll(data.items);
++    try dir.writeFile(io, .{ .sub_path = "experts-r0-00001-of-00001.safetensors", .data = image.written() });
++    try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = index.written() });
++}
++
++/// Every expert's projections under EXL3 names: bytes that name their expert and projection, and a width per expert.
++const Pack = struct {
++    arena: std.heap.ArenaAllocator,
++    entries: std.ArrayList(Entry) = .empty,
++    trellis: [2][count][3][]u8 = undefined,
++    suh: [2][count][3][]u8 = undefined,
++    svh: [2][count][3][]u8 = undefined,
++
++    fn halvesOf(e: usize, p: usize) u32 {
++        return @intCast(4 + (e + p) % 3); // 2, 2.5 and 3 bits
++    }
++
++    fn init(marker: u32, layer: usize) !*Pack {
++        const pk = try ta.create(Pack);
++        pk.* = .{ .arena = .init(ta) };
++        const a = pk.arena.allocator();
++        const mul1 = try a.dupe(u8, &std.mem.toBytes(std.mem.nativeToLittle(u32, marker)));
++        for (0..2) |part| for (0..count) |e| for (projs, 0..) |proj, p| {
++            const s = layout.kn(@fromBackingInt(@intCast(p)), dims, width);
++            const h = halvesOf(e, p);
++            const tb = try layout.trellisBytes(s[0], s[1], h);
++            const t = try a.alloc(u8, tb);
++            for (t, 0..) |*b, i| b.* = @truncate(i * 7 + e * 31 + p * 101 + part * 13);
++            const su = try a.alloc(u8, s[0] * 2);
++            @memset(su, @intCast(0x10 + e * 4 + p + part * 64));
++            const sv = try a.alloc(u8, s[1] * 2);
++            @memset(sv, @intCast(0x80 + e * 4 + p + part * 32));
++            pk.trellis[part][e][p] = t;
++            pk.suh[part][e][p] = su;
++            pk.svh[part][e][p] = sv;
++            const base = if (part == 0) try std.fmt.allocPrint(a, "model.language_model.layers.{d}.mlp.experts.{d}.{s}", .{ layer, e, proj }) else try std.fmt.allocPrint(a, "mtp.layers.0.mlp.experts.{d}.{s}", .{ e, proj });
++            const shape_t = try a.dupe(usize, &.{ s[0] / 16, s[1] / 16, h * 8 });
++            try pk.entries.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}.trellis", .{base}), .dtype = "I16", .shape = shape_t, .data = t });
++            try pk.entries.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}.suh", .{base}), .dtype = "F16", .shape = try a.dupe(usize, &.{s[0]}), .data = su });
++            try pk.entries.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}.svh", .{base}), .dtype = "F16", .shape = try a.dupe(usize, &.{s[1]}), .data = sv });
++            try pk.entries.append(a, .{ .name = try std.fmt.allocPrint(a, "{s}.mul1", .{base}), .dtype = "I32", .shape = &.{}, .data = mul1 });
++        };
++        return pk;
++    }
++
++    fn deinit(pk: *Pack) void {
++        pk.arena.deinit();
++        ta.destroy(pk);
++    }
++};
++
++fn deviceBytes(addr: u64, n: usize) []const u8 {
++    return @as([*]const u8, @ptrFromInt(addr))[0..n];
++}
++
++/// The loaded image holds global experts first.. at slots 0.., with their own trellis, width and scales.
++fn expectRank(pk: *const Pack, part: usize, o: anytype, first: usize, n: usize) !void {
++    try std.testing.expectEqual(cuda.experts.Format.exl3, o.format);
++    try std.testing.expectEqual(first, o.first);
++    try std.testing.expectEqual(n, o.count);
++    const v = o.view();
++    try std.testing.expectEqual(cuda.experts.Format.exl3, v.format);
++    const l = v.exl3.?;
++    try std.testing.expectEqual(n, l.experts);
++    try std.testing.expectEqual(@as(usize, dims), l.dims);
++    try std.testing.expectEqual(@as(usize, width), l.width);
++    try std.testing.expectEqual(x.act_mode, l.act_mode);
++    try std.testing.expectEqual(cuda.exl3_experts.Codebook.mul1, l.codebook);
++    try std.testing.expectEqual(@as(f32, 0), l.limit);
++    const img = o.image.?;
++    const ptrs = [3]u64{ l.gate, l.up, l.down };
++    const k2s = [3]u64{ l.gate_k2, l.up_k2, l.down_k2 };
++    const suh = [3]u64{ l.suh_g, l.suh_u, l.suh_d };
++    const svh = [3]u64{ l.svh_g, l.svh_u, l.svh_d };
++    for (0..3) |p| {
++        const s = layout.kn(@fromBackingInt(@intCast(p)), dims, width);
++        for (0..n) |i| {
++            const e = first + i;
++            const at = std.mem.readInt(u64, deviceBytes(ptrs[p] + i * 8, 8)[0..8], .little);
++            try std.testing.expect(at >= img.ptr and at < img.ptr + img.len and (at - img.ptr) % layout.align_bytes == 0);
++            try std.testing.expectEqualSlices(u8, pk.trellis[part][e][p], deviceBytes(at, pk.trellis[part][e][p].len));
++            try std.testing.expectEqual(@as(i32, @intCast(Pack.halvesOf(e, p))), std.mem.readInt(i32, deviceBytes(k2s[p] + i * 4, 4)[0..4], .little));
++            try std.testing.expectEqualSlices(u8, pk.suh[part][e][p], deviceBytes(suh[p] + i * s[0] * 2, s[0] * 2));
++            try std.testing.expectEqualSlices(u8, pk.svh[part][e][p], deviceBytes(svh[p] + i * s[1] * 2, s[1] * 2));
++        }
++    }
++}
++
++test "exl3 experts: each rank's image holds its own global experts in order, under the loader's names, MTP whole at world 1" {
++    const pk = try Pack.init(x.mul1_magic, 2);
++    defer pk.deinit();
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try fixture(tmp.dir, pk.entries.items);
++    const path = try tmp.dir.realPathFileAlloc(io, ".", ta);
++    defer ta.free(path);
++    var store = try wt.Store.open(ta, io, path);
++    defer store.deinit();
++    Fake.reset();
++    var d = Fake.driver();
++    for (0..2) |rank| {
++        var o = try x.loadShape(ta, &d, &store, "language_model.model.layers.2.mlp", 2, rank, dims, width, count);
++        defer o.free();
++        try expectRank(pk, 0, o, rank * 2, 2);
++        try std.testing.expectEqual(@as(usize, 0), store.held.items.len);
++    }
++    var m = try x.loadShape(ta, &d, &store, "language_model.mtp.layers.0.mlp", 1, 0, dims, width, count);
++    try expectRank(pk, 1, m, 0, count);
++    m.free();
++    try std.testing.expectEqual(@as(usize, 0), Fake.live_device);
++    try std.testing.expectError(error.UnevenExpertSplit, x.loadShape(ta, &d, &store, "language_model.model.layers.2.mlp", 3, 0, dims, width, count));
++    try std.testing.expectError(error.MissingTensor, x.loadShape(ta, &d, &store, "language_model.model.layers.3.mlp", 2, 0, dims, width, count));
++    store.dropStaging();
++    try std.testing.expectEqual(@as(usize, 0), Fake.live_device);
++}
++
++test "exl3 experts: a projection without the mul1 marker is refused before anything reaches the device" {
++    const pk = try Pack.init(0x12345678, 0);
++    defer pk.deinit();
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try fixture(tmp.dir, pk.entries.items);
++    const path = try tmp.dir.realPathFileAlloc(io, ".", ta);
++    defer ta.free(path);
++    var store = try wt.Store.open(ta, io, path);
++    defer store.deinit();
++    Fake.reset();
++    var d = Fake.driver();
++    try std.testing.expectError(error.UnsupportedQuantization, x.loadShape(ta, &d, &store, "language_model.model.layers.0.mlp", 2, 0, dims, width, count));
++    try std.testing.expectEqual(@as(usize, 0), Fake.calls[@backingInt(Fake.Kind.device)]);
++}
++
++test "exl3 experts: the ledger prices each rank's images as the loader lays them out, MTP only on the drafting rank" {
++    const pk = try Pack.init(x.mul1_magic, 0);
++    defer pk.deinit();
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try fixture(tmp.dir, pk.entries.items);
++    const path = try tmp.dir.realPathFileAlloc(io, ".", ta);
++    defer ta.free(path);
++    var store = try wt.Store.open(ta, io, path);
++    defer store.deinit();
++    Fake.reset();
++    var d = Fake.driver();
++    const all: x.Config = .{ .dir = path, .scope = .all };
++    for (0..2) |rank| {
++        var o = try x.loadShape(ta, &d, &store, "language_model.model.layers.0.mlp", 2, rank, dims, width, count);
++        defer o.free();
++        const got = try x.ledgerShape(ta, io, all, 2, rank, true, 84, 1, dims, width, count);
++        try std.testing.expectEqual(@as(u64, o.image.?.len), got.main);
++        try std.testing.expectEqual(try x.scratchBytes(84), got.scratch);
++        if (rank == 0) {
++            var m = try x.loadShape(ta, &d, &store, "language_model.mtp.layers.0.mlp", 1, 0, dims, width, count);
++            defer m.free();
++            try std.testing.expectEqual(@as(u64, m.image.?.len), got.mtp);
++        } else try std.testing.expectEqual(@as(u64, 0), got.mtp);
++    }
++    store.dropStaging();
++    const no_drafts = try x.ledgerShape(ta, io, all, 2, 0, false, 84, 1, dims, width, count);
++    try std.testing.expectEqual(@as(u64, 0), no_drafts.mtp);
++    const mtp_only = try x.ledgerShape(ta, io, .{ .dir = path, .scope = .mtp }, 2, 0, true, 84, 1, dims, width, count);
++    try std.testing.expectEqual(@as(u64, 0), mtp_only.main);
++    try std.testing.expect(mtp_only.mtp > 0);
++    // a rank's folder without the other rank's files prices the same; a layer the folder lacks is refused, never zero
++    const lone = try x.ledgerShape(ta, io, all, 2, 1, false, 84, 1, dims, width, count);
++    {
++        var gone = std.testing.tmpDir(.{});
++        defer gone.cleanup();
++        const index = try tmp.dir.readFileAlloc(io, "model.safetensors.index.json", ta, .limited(1 << 20));
++        defer ta.free(index);
++        const moved = try std.mem.replaceOwned(u8, ta, index, "experts-r0-00001-of-00001", "experts-r1-00001-of-00001");
++        defer ta.free(moved);
++        const extra = try std.fmt.allocPrint(ta, "{s},\"absent\":\"experts-r0-00009-of-00009.safetensors\"}}}}", .{moved[0 .. moved.len - 2]});
++        defer ta.free(extra);
++        try gone.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = extra });
++        const shard = try tmp.dir.readFileAlloc(io, "experts-r0-00001-of-00001.safetensors", ta, .limited(1 << 26));
++        defer ta.free(shard);
++        try gone.dir.writeFile(io, .{ .sub_path = "experts-r1-00001-of-00001.safetensors", .data = shard });
++        const gpath = try gone.dir.realPathFileAlloc(io, ".", ta);
++        defer ta.free(gpath);
++        const got = try x.ledgerShape(ta, io, .{ .dir = gpath, .scope = .all }, 2, 1, false, 84, 1, dims, width, count);
++        try std.testing.expectEqual(lone.main, got.main);
++    }
++    // a layer the folder lacks is refused, never priced at zero
++    try std.testing.expectError(error.MissingTensor, x.ledgerShape(ta, io, all, 2, 0, false, 84, 2, dims, width, count));
++}
++
++test "exl3 experts: a scope that does not cover the store's part attaches nothing" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try fixture(tmp.dir, &.{.{ .name = "mtp.layers.0.mlp.experts.0.gate_proj.mul1", .dtype = "I32", .shape = &.{}, .data = &std.mem.toBytes(@as(u32, 0)) }});
++    const path = try tmp.dir.realPathFileAlloc(io, ".", ta);
++    defer ta.free(path);
++    var store = try wt.Store.open(ta, io, path);
++    defer store.deinit();
++    try x.attachTo(ta, io, &store, .{ .dir = path, .scope = .mtp }, .main);
++    try std.testing.expect(store.experts_exl3 == null);
++    try x.attachTo(ta, io, &store, .{ .dir = path, .scope = .mtp }, .mtp);
++    try std.testing.expect(store.experts_exl3 != null);
++    try std.testing.expect(store.experts_exl3.?.has("language_model.mtp.layers.0.mlp.experts.0.gate_proj.mul1"));
++}
++
++test "exl3 experts: the grouped scratch holds the reserved pairs, not 64 a plan item" {
++    var g: cuda.exl3_grouped.Grouped = .{ .d = undefined, .kernels = undefined };
++    try std.testing.expectEqual(@as(usize, 640), try g.pairRows(10));
++    g.pair_cap = 84 * wt.slots;
++    try std.testing.expectEqual(@as(usize, 84 * wt.slots), try g.pairRows(1000));
++    try std.testing.expectEqual(@as(usize, 64), try g.pairRows(1));
++    const ex = cuda.exl3_experts;
++    const up = try cuda.exl3_grouped.Grouped.pairBytes(wt.dims, wt.moe_w, 84 * wt.slots, try ex.plan(wt.dims, wt.moe_w, true), 2);
++    try std.testing.expectEqual(up, try x.scratchBytes(84));
++    try std.testing.expectEqual(try cuda.exl3_grouped.Grouped.bytes(wt.dims, wt.moe_w, 3, 4, 2), try cuda.exl3_grouped.Grouped.pairBytes(wt.dims, wt.moe_w, 192, 4, 2));
++    // a Flash Next pass of 1536 rows: the reserved pairs' scratch is about half a GiB, a fifth of items * 64's
++    const items = cuda.grouped.maxItems(1536 * wt.slots, 257, 16);
++    try std.testing.expect(try x.scratchBytes(1536) * 4 < try cuda.exl3_grouped.Grouped.bytes(wt.dims, wt.moe_w, items, 4, 2));
++}
+diff --git a/zig/src/families/flashnext/cuda_exl3_prompt.zig b/zig/src/families/flashnext/cuda_exl3_prompt.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..0613820e7c57939f0e65aa485596e49606391580
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_exl3_prompt.zig
+@@ -0,0 +1,154 @@
++//! TF_EXL3_PROMPT_ROWS=n: TF_FLASHNEXT_EXPERTS_EXL3's routed experts on passes of n rows or more through x3gm v2's
++//! 64-member items (exl3_fnx_prompt.cuh): each item decodes its expert's 128-column block once for up to 64 pairs and
++//! runs one fp32 mma chain an output with the epilogues fused, where the grouped (decode) kernels decode it once a 16
++//! pairs and sum split-K partials. Three launches after the route: the gate and up inputs' rotation, gate/up (bf16 act
++//! rows and the rotated down input) and down (fp32 y rows), the contract moe_native.exl3's grouped path keeps.
++//! Unset: 256 rows. 0: never (every pass through the grouped kernels). TF_EXL3_PROMPT_DN=v3 (default: x3gm v3's 8-warp
++//! down tile) or dn0 (GM_DN0's 4 warps): the down kernel's tile; both write the same bits.
++const std = @import("std");
++const cuda = @import("cuda");
++
++const ex = cuda.exl3_experts;
++
++/// Members an item holds at most: the route's tile for this path (the kernels' 64-member passes).
++pub const members: usize = 64;
++/// The half-bit widths the kernels dispatch (exl3_fnx_prompt.cuh FNX_CASE): 2, 2.5, 3 and 4 bpw.
++pub const widths = [_]u32{ 4, 5, 6, 8 };
++pub const default_rows: usize = 256;
++
++pub const Down = enum { v3, dn0 };
++
++/// TF_EXL3_PROMPT_ROWS: unset 256, 0 never (returned as 0), else the rows from which a pass takes this path.
++pub fn rowsFrom(value: ?[*:0]const u8) !usize {
++    const v = std.mem.span(value orelse return default_rows);
++    return std.fmt.parseInt(usize, v, 10) catch error.BadExl3PromptRows;
++}
++
++/// TF_EXL3_PROMPT_DN: v3 (unset) or dn0.
++pub fn downFrom(value: ?[*:0]const u8) !Down {
++    const v = std.mem.span(value orelse return .v3);
++    return std.meta.stringToEnum(Down, v) orelse error.BadExl3PromptDown;
++}
++
++/// Whether a pass of `n` rows takes this path: rows at or past the switch, and a layer the kernels take.
++pub fn takes(rows: usize, n: usize, layer_ok: bool) bool {
++    return rows != 0 and n >= rows and layer_ok;
++}
++
++/// Whether one expert's gate, up and down widths are ones the kernels take, gate's and up's equal (one item decodes both
++/// at one width).
++pub fn expertOk(gate: u32, up: u32, down: u32) bool {
++    if (gate != up) return false;
++    for ([_]u32{ gate, down }) |h| if (std.mem.indexOfScalar(u32, &widths, h) == null) return false;
++    return true;
++}
++
++/// exl3_fnx_prompt.cuh's FnxArgs: x3gm's Args (exl3_block_x3gm.GmArgs' fields), then the Grouped plan and act.
++pub const Args = extern struct {
++    x0: u64 = 0,
++    x1: u64 = 0,
++    t0: u64 = 0,
++    t1: u64 = 0,
++    tp0: u64 = 0,
++    tp1: u64 = 0,
++    k2e: u64 = 0,
++    order: u64 = 0,
++    pe: u64 = 0,
++    poff: u64 = 0,
++    pcnt: u64 = 0,
++    npass: u64 = 0,
++    ticket: u64 = 0,
++    sv0: u64 = 0,
++    sv1: u64 = 0,
++    sd: u64 = 0,
++    xd: u64 = 0,
++    y: u64 = 0,
++    K: c_int = 0,
++    N: c_int = 0,
++    limit: f32 = 0,
++    items: u64 = 0,
++    counts: u64 = 0,
++    members: u64 = 0,
++    k2u: u64 = 0,
++    act: u64 = 0,
++    skip: c_int = 0,
++};
++
++comptime {
++    std.debug.assert(@sizeOf(Args) == 208 and @offsetOf(Args, "K") == 144 and @offsetOf(Args, "limit") == 152 and @offsetOf(Args, "items") == 160 and @offsetOf(Args, "skip") == 200);
++}
++
++/// Scratch the path takes for `cap` pairs: the gate and up inputs [cap, dims] fp16 and the down input [cap, width] fp16.
++pub fn scratchBytes(dims: usize, width: usize, cap: usize) usize {
++    return cap * (4 * dims + 2 * width);
++}
++
++/// The rank's routed experts of `pairs` pairs (`p` routed in `members`-pair items, at most `items` of them): act [pairs,
++/// width] bf16 and y [pairs, dims] fp32 rows of the pairs routed here; `storage` holds scratchBytes for `cap` pairs.
++pub fn run(k: *const ex.Experts, s: cuda.Stream, w: ex.Layer, storage: u64, storage_len: usize, cap: usize, x: u64, stride: usize, slots: usize, picks: u64, p: cuda.grouped.Plan, act: u64, y: u64, pairs: usize, items: usize, skip: i32, dn: Down) !void {
++    if (w.codebook != .mul1 or w.act_mode != 1 or w.limit != 0 or w.gu_stride != 0) return error.Exl3Shape;
++    if (w.dims % 128 != 0 or w.width % 128 != 0 or (w.dims / 16) % 2 != 0 or (w.width / 16) % 4 != 0) return error.Exl3Shape;
++    if (pairs > cap or scratchBytes(w.dims, w.width, cap) > storage_len or stride < w.dims) return error.Exl3ScratchShort;
++    if (pairs == 0 or items == 0) return;
++    const x0 = storage;
++    const x1 = x0 + cap * w.dims * 2;
++    const xd = x1 + cap * w.dims * 2;
++    const i = struct {
++        fn f(v: usize) c_int {
++            return @intCast(v);
++        }
++    }.f;
++    var rot: cuda.Args = .{};
++    rot.add(x);
++    rot.add(i(stride));
++    for ([_]u64{ picks, w.suh_g, w.suh_u, x0, x1 }) |v| rot.add(v);
++    for ([_]usize{ w.dims, slots, pairs }) |v| rot.add(i(v));
++    rot.add(skip);
++    const warps = pairs * (w.dims / 128);
++    try cuda.launch.launch(k.fnx_rotate, .{ .grid = .{ .x = @intCast((warps + 7) / 8) }, .block = .{ .x = 256 } }, s, &rot);
++
++    const gu: Args = .{ .x0 = x0, .x1 = x1, .tp0 = w.gate, .tp1 = w.up, .k2e = w.gate_k2, .sv0 = w.svh_g, .sv1 = w.svh_u, .sd = w.suh_d, .xd = xd, .K = i(w.dims), .N = i(w.width), .items = p.items, .counts = p.counts, .members = p.members, .k2u = w.up_k2, .act = act, .skip = skip };
++    var ga: cuda.Args = .{};
++    ga.add(gu);
++    try cuda.launch.launch(k.fnx_gu, .{ .grid = .{ .x = @intCast(items * (w.width / 128)) }, .block = .{ .x = 256 }, .shared = ex.fnx_smem }, s, &ga);
++
++    const down: Args = .{ .x0 = xd, .x1 = xd, .tp0 = w.down, .tp1 = w.down, .k2e = w.down_k2, .sv0 = w.svh_d, .y = y, .K = i(w.width), .N = i(w.dims), .items = p.items, .counts = p.counts, .members = p.members, .skip = skip };
++    var da: cuda.Args = .{};
++    da.add(down);
++    const f = if (dn == .v3) k.fnx_dn else k.fnx_dn0;
++    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(items * (w.dims / 128)) }, .block = .{ .x = if (dn == .v3) 256 else 128 }, .shared = ex.fnx_smem }, s, &da);
++}
++
++test "TF_EXL3_PROMPT_ROWS: 256 unset, 0 never, a row count, nothing else" {
++    try std.testing.expectEqual(default_rows, try rowsFrom(null));
++    try std.testing.expectEqual(@as(usize, 0), try rowsFrom("0"));
++    try std.testing.expectEqual(@as(usize, 1536), try rowsFrom("1536"));
++    try std.testing.expectError(error.BadExl3PromptRows, rowsFrom("x"));
++    try std.testing.expectError(error.BadExl3PromptRows, rowsFrom(""));
++    try std.testing.expect(!takes(0, 4096, true));
++    try std.testing.expect(!takes(256, 255, true));
++    try std.testing.expect(takes(256, 256, true));
++    try std.testing.expect(!takes(256, 4096, false));
++}
++
++test "TF_EXL3_PROMPT_DN takes v3 (the default) or dn0" {
++    try std.testing.expectEqual(Down.v3, try downFrom(null));
++    try std.testing.expectEqual(Down.dn0, try downFrom("dn0"));
++    try std.testing.expectError(error.BadExl3PromptDown, downFrom("4"));
++}
++
++test "the prompt path takes an expert at 2, 2.5, 3 or 4 bpw with gate and up at one width" {
++    try std.testing.expect(expertOk(5, 5, 5));
++    try std.testing.expect(expertOk(6, 6, 8));
++    try std.testing.expect(!expertOk(5, 6, 5));
++    try std.testing.expect(!expertOk(7, 7, 7));
++    try std.testing.expect(!expertOk(5, 5, 10));
++}
++
++test "the prompt path's scratch fits in the grouped kernels' reservation for the same pairs" {
++    const g = cuda.exl3_grouped.Grouped;
++    for ([_]usize{ 1, 70 * 11, 4096 * 11 }) |cap| {
++        const up = try g.pairBytes(2560, 640, cap, try ex.plan(2560, 640, true), 2);
++        try std.testing.expect(scratchBytes(2560, 640, cap) <= up);
++    }
++}
+diff --git a/zig/src/families/flashnext/cuda_exl3_routed.zig b/zig/src/families/flashnext/cuda_exl3_routed.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..7450fef7080e785de7e36bdb6c71ac37836bd784
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_exl3_routed.zig
+@@ -0,0 +1,189 @@
++//! A rank's EXL3 routed experts as one device image: trellises, pointer tables, widths and stacked fp16 scales.
++const std = @import("std");
++const cuda = @import("cuda");
++const routed = @import("cuda_modelopt_experts.zig");
++
++const exl3e = cuda.exl3_experts;
++const prompt = @import("cuda_exl3_prompt.zig");
++
++pub const hadamard: usize = 128;
++pub const tile: usize = 16;
++pub const align_bytes: usize = 256;
++
++pub const Proj = enum(u2) { gate = 0, up = 1, down = 2 };
++
++/// One projection's source tensors: the int16 trellis, fp16 suh [k] and svh [n], and its half-bit width.
++pub const Source = struct { trellis: []const u8, suh: []const u8, svh: []const u8, halves: u32 };
++
++pub fn kn(p: Proj, dims: usize, width: usize) [2]usize {
++    return if (p == .down) .{ width, dims } else .{ dims, width };
++}
++
++/// Trellis bytes of a k x n projection at `halves` half-bits a weight: halves * 8 int16 words a 16 x 16 tile.
++pub fn trellisBytes(k: usize, n: usize, halves: u32) !usize {
++    if (k == 0 or n == 0 or k % hadamard != 0 or n % hadamard != 0) return error.Exl3Shape;
++    if (halves < 2 or halves > 16) return error.Exl3Width;
++    return (k / tile) * (n / tile) * @as(usize, halves) * tile;
++}
++
++fn up256(n: usize) usize {
++    return (n + align_bytes - 1) / align_bytes * align_bytes;
++}
++
++/// Where every part of one rank's layer lives in its image; `halves` is [3][count], gate then up then down.
++pub const Layout = struct {
++    count: usize,
++    dims: usize,
++    width: usize,
++    trellis: [3][]usize,
++    ptrs: [3]usize,
++    k2: [3]usize,
++    suh: [3]usize,
++    svh: [3]usize,
++    total: usize,
++    /// Every expert's widths are ones TF_EXL3_PROMPT_ROWS's kernels take (cuda_exl3_prompt.expertOk).
++    prompt_ok: bool,
++
++    pub fn init(a: std.mem.Allocator, dims: usize, width: usize, halves: [3][]const u32) !Layout {
++        const count = halves[0].len;
++        if (count == 0 or halves[1].len != count or halves[2].len != count) return error.BadExperts;
++        var l: Layout = .{ .count = count, .dims = dims, .width = width, .trellis = undefined, .ptrs = undefined, .k2 = undefined, .suh = undefined, .svh = undefined, .total = 0, .prompt_ok = true };
++        for (0..count) |e| l.prompt_ok = l.prompt_ok and prompt.expertOk(halves[0][e], halves[1][e], halves[2][e]);
++        var made: usize = 0;
++        errdefer for (l.trellis[0..made]) |t| a.free(t);
++        var at: usize = 0;
++        for (0..3) |p| {
++            l.trellis[p] = try a.alloc(usize, count);
++            made += 1;
++            const s = kn(@fromBackingInt(@intCast(p)), dims, width);
++            for (halves[p], 0..) |h, e| {
++                l.trellis[p][e] = at;
++                at += up256(try trellisBytes(s[0], s[1], h));
++            }
++        }
++        for (0..3) |p| {
++            l.ptrs[p] = at;
++            at += up256(count * 8);
++            l.k2[p] = at;
++            at += up256(count * 4);
++        }
++        for (0..3) |p| {
++            const s = kn(@fromBackingInt(@intCast(p)), dims, width);
++            l.suh[p] = at;
++            at += up256(count * s[0] * 2);
++            l.svh[p] = at;
++            at += up256(count * s[1] * 2);
++        }
++        l.total = at;
++        return l;
++    }
++
++    pub fn deinit(l: *Layout, a: std.mem.Allocator) void {
++        for (l.trellis) |t| a.free(t);
++        l.* = undefined;
++    }
++
++    /// Writes expert `e`'s projection `p` into the host image `img` (the layout's total bytes, `base` its device address).
++    pub fn put(l: Layout, img: []u8, base: u64, p: Proj, e: usize, src: Source, halves: u32) !void {
++        if (img.len != l.total or e >= l.count) return error.BadExperts;
++        const i = @backingInt(p);
++        const s = kn(p, l.dims, l.width);
++        const tb = try trellisBytes(s[0], s[1], halves);
++        if (src.trellis.len != tb or src.suh.len != s[0] * 2 or src.svh.len != s[1] * 2 or src.halves != halves) return error.BadExperts;
++        const at = l.trellis[i][e];
++        @memcpy(img[at..][0..tb], src.trellis);
++        std.mem.writeInt(u64, img[l.ptrs[i] + e * 8 ..][0..8], base + at, .little);
++        std.mem.writeInt(i32, img[l.k2[i] + e * 4 ..][0..4], @intCast(halves), .little);
++        @memcpy(img[l.suh[i] + e * s[0] * 2 ..][0 .. s[0] * 2], src.suh);
++        @memcpy(img[l.svh[i] + e * s[1] * 2 ..][0 .. s[1] * 2], src.svh);
++    }
++
++    /// The kernels' layer over the image at `base`: Qwen's unclamped SwiGLU with fp32 silu(gate) * up (qwen3_5's mode).
++    pub fn layer(l: Layout, base: u64, act_mode: i32) exl3e.Layer {
++        return .{
++            .gate = base + l.ptrs[0],
++            .up = base + l.ptrs[1],
++            .down = base + l.ptrs[2],
++            .gate_k2 = base + l.k2[0],
++            .up_k2 = base + l.k2[1],
++            .down_k2 = base + l.k2[2],
++            .suh_g = base + l.suh[0],
++            .suh_u = base + l.suh[1],
++            .svh_g = base + l.svh[0],
++            .svh_u = base + l.svh[1],
++            .suh_d = base + l.suh[2],
++            .svh_d = base + l.svh[2],
++            .experts = l.count,
++            .dims = l.dims,
++            .width = l.width,
++            .codebook = .mul1,
++            .limit = 0,
++            .act_mode = act_mode,
++        };
++    }
++
++    pub fn view(l: Layout, base: u64, act_mode: i32) cuda.experts.Layer {
++        return .{ .format = .exl3, .exl3 = l.layer(base, act_mode), .up = 0, .down = 0, .width = l.width, .dims = l.dims, .experts = l.count, .swiglu = true };
++    }
++};
++
++/// Device bytes of a rank's whole experts for one layer at one uniform width (the memory ledger's EXL3 term).
++pub fn rankLayerBytes(a: std.mem.Allocator, total: usize, world: usize, rank: usize, dims: usize, width: usize, halves: u32) !usize {
++    const own = try routed.Experts.init(total, world, rank);
++    const hs = try a.alloc(u32, own.count);
++    defer a.free(hs);
++    @memset(hs, halves);
++    var l = try Layout.init(a, dims, width, .{ hs, hs, hs });
++    defer l.deinit(a);
++    return l.total;
++}
++
++test "exl3 routed: trellis bytes follow the half-bit width and refuse shapes the Hadamard blocks cannot cover" {
++    try std.testing.expectEqual(@as(usize, 614_400), try trellisBytes(2560, 640, 6));
++    try std.testing.expectEqual(@as(usize, 512_000), try trellisBytes(640, 2560, 5));
++    try std.testing.expectEqual(@as(usize, 819_200), try trellisBytes(2560, 640, 8));
++    try std.testing.expectError(error.Exl3Shape, trellisBytes(2560, 600, 6));
++    try std.testing.expectError(error.Exl3Width, trellisBytes(2560, 640, 1));
++}
++
++test "exl3 routed: a Flash Next rank's 3-bit layer is about two thirds of its NVFP4 bytes" {
++    const a = std.testing.allocator;
++    const r0 = try rankLayerBytes(a, 512, 2, 0, 2560, 640, 6);
++    const r1 = try rankLayerBytes(a, 512, 2, 1, 2560, 640, 6);
++    try std.testing.expectEqual(r0, r1);
++    const nvfp4 = 256 * 3 * 921_600;
++    try std.testing.expect(r0 > 256 * 1_862_400);
++    try std.testing.expect(r0 < 256 * 1_862_400 + 64 * 1024);
++    try std.testing.expect(r0 * 100 / nvfp4 == 67);
++    const half = try rankLayerBytes(a, 512, 2, 0, 2560, 640, 5);
++    try std.testing.expect(half * 100 / nvfp4 == 56);
++}
++
++test "exl3 routed: put fills the pointer table, widths and stacked scales of an expert" {
++    const a = std.testing.allocator;
++    const dims = 256;
++    const width = 128;
++    const hs = [_]u32{ 6, 5 };
++    var l = try Layout.init(a, dims, width, .{ &hs, &hs, &hs });
++    defer l.deinit(a);
++    const img = try a.alloc(u8, l.total);
++    defer a.free(img);
++    @memset(img, 0);
++    const base: u64 = 0x7000_0000;
++    const tb = try trellisBytes(width, dims, 5);
++    const tr = try a.alloc(u8, tb);
++    defer a.free(tr);
++    @memset(tr, 0xab);
++    const su: [width * 2]u8 = @splat(1);
++    const sv: [dims * 2]u8 = @splat(2);
++    try l.put(img, base, .down, 1, .{ .trellis = tr, .suh = &su, .svh = &sv, .halves = 5 }, 5);
++    try std.testing.expectEqual(base + l.trellis[2][1], std.mem.readInt(u64, img[l.ptrs[2] + 8 ..][0..8], .little));
++    try std.testing.expectEqual(@as(i32, 5), std.mem.readInt(i32, img[l.k2[2] + 4 ..][0..4], .little));
++    try std.testing.expectEqual(@as(u8, 0xab), img[l.trellis[2][1]]);
++    try std.testing.expectEqual(@as(u8, 2), img[l.svh[2] + dims * 2]);
++    try std.testing.expectError(error.BadExperts, l.put(img, base, .down, 1, .{ .trellis = tr, .suh = &su, .svh = &sv, .halves = 5 }, 6));
++    for (l.trellis) |t| for (t) |off| try std.testing.expect(off % align_bytes == 0);
++    const v = l.view(base, 1);
++    try std.testing.expectEqual(cuda.experts.Format.exl3, v.format);
++    try std.testing.expectEqual(base + l.svh[2], v.exl3.?.svh_d);
++}
+diff --git a/zig/src/families/flashnext/cuda_lanes_bytes.zig b/zig/src/families/flashnext/cuda_lanes_bytes.zig
+index ba1a163a965b8b56b8405c0a3eb3e3b9e5f642fe..f3986c99b21fbe69ec5468df1a4af4a33c51aea9 100644
+--- a/zig/src/families/flashnext/cuda_lanes_bytes.zig
++++ b/zig/src/families/flashnext/cuda_lanes_bytes.zig
+@@ -14,6 +14,8 @@ pub fn placementWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8,
+     if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
+     const mode = try config.mode(gpa, io, dir);
+     if (mode == .modelopt) {
++        const exl3 = try @import("cuda_exl3_experts.zig").config();
++        if (exl3) |c| return exl3Bytes(gpa, io, dir, c, world, rank, drafts);
+         const main = try @import("cuda_rank_memory.zig").estimate(gpa, io, dir, world, rank);
+         // Dense draft projections and vocabulary rows exceed the affine head's estimate.
+         return main + if (drafts and rank == 0) mtp.headBytes(try headFp8(gpa, io, dir)) + (1 << 30) else @as(u64, 0);
+@@ -23,6 +25,24 @@ pub fn placementWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8,
+     return main + if (drafts) mtp.headBytes(try headFp8(gpa, io, dir)) else @as(u64, 0);
+ }
+ 
++/// placementWeightBytes under TF_FLASHNEXT_EXPERTS_EXL3: the covered parts' NVFP4 / FP8 routed experts out, their EXL3
++/// images (from the folder's headers) and the grouped kernels' scratch for the widest pass in.
++pub fn exl3Bytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: @import("cuda_exl3_experts.zig").Config, world: usize, rank: usize, drafts: bool) !u64 {
++    const chunk = @import("cuda_chunk.zig");
++    const parts = try @import("cuda_rank_memory.zig").estimateParts(gpa, io, dir, world, rank);
++    const busy = try chunk.chunkRowsAt(world);
++    const rows = @max(busy, try chunk.soloRows(busy));
++    const x = try @import("cuda_exl3_experts.zig").ledger(gpa, io, c, world, rank, drafts, rows);
++    var total = parts.total + x.scratch;
++    if (c.covers(.main)) total = total - parts.routed + x.main;
++    if (drafts and rank == 0) {
++        const fp8 = try headFp8(gpa, io, dir);
++        const head = mtp.headBytes(fp8) + (1 << 30);
++        total += if (c.covers(.mtp)) head - mtp.headRoutedBytes(fp8) + x.mtp else head;
++    }
++    return total;
++}
++
+ /// Whether the MTP head's routed experts are block FP8: its first expert's gate weight is F8_E4M3 (absent: false).
+ pub fn headFp8(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !bool {
+     var store = try weights.Store.open(gpa, io, dir);
+diff --git a/zig/src/families/flashnext/cuda_launch.zig b/zig/src/families/flashnext/cuda_launch.zig
+index d43df592daddf83422f84e3b9c4e66ebfa428b89..5409031fce9e5695118d3dc8087a34302d39e23b 100644
+--- a/zig/src/families/flashnext/cuda_launch.zig
++++ b/zig/src/families/flashnext/cuda_launch.zig
+@@ -13,6 +13,11 @@ pub const rank_wire = @import("cuda_rank_wire.zig");
+ pub const modelopt_experts = @import("cuda_modelopt_experts.zig");
+ /// The MoE pass's native routed experts (NVFP4, block FP8), whose FP8 call a device test takes.
+ pub const moe_native = @import("cuda_moe_native.zig");
++/// TF_FLASHNEXT_EXPERTS_EXL3's loader, kit and image layout, and the NVFP4 tile choice its device tests mirror.
++pub const exl3_experts = @import("cuda_exl3_experts.zig");
++pub const exl3_routed = @import("cuda_exl3_routed.zig");
++pub const exl3_prompt = @import("cuda_exl3_prompt.zig");
++pub const nvfp4_tile = @import("cuda_nvfp4_tile.zig");
+ pub const hc = @import("cuda_hc.zig");
+ pub const draft_affine = @import("cuda_draft_affine.zig");
+ pub const qmm = @import("cuda_qmm.zig");
+@@ -484,6 +489,9 @@ test {
+     _ = @import("cuda_rank_memory.zig");
+     _ = @import("cuda_rank_wire.zig");
+     _ = @import("cuda_modelopt_experts.zig");
++    _ = @import("cuda_exl3_routed.zig");
++    _ = @import("cuda_exl3_experts.zig");
++    _ = @import("cuda_exl3_prompt.zig");
+     _ = @import("cuda_modelopt_threads.zig");
+     _ = row_path;
+     _ = @import("cuda_mtp_check.zig");
+diff --git a/zig/src/families/flashnext/cuda_mixed_experts.zig b/zig/src/families/flashnext/cuda_mixed_experts.zig
+index c451485baef8369eb0fd2d816aa7f75c0d53e94c..d345d34875f10f1533f024bca2ec4f8ba785904b 100644
+--- a/zig/src/families/flashnext/cuda_mixed_experts.zig
++++ b/zig/src/families/flashnext/cuda_mixed_experts.zig
+@@ -22,7 +22,8 @@ pub const Owned = struct {
+ };
+ 
+ pub fn load(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, prefix: []const u8, world: usize, rank: usize, split: bool, sum: bool) !Owned {
+-    var e = try routed.load(a, d, store, prefix, world, rank);
++    // TF_FLASHNEXT_EXPERTS_EXL3 attaches its folder to the store (cuda_exl3_experts.attach); unattached, the NVFP4 loader
++    var e = if (store.experts_exl3) |x| try @import("cuda_exl3_experts.zig").load(a, d, x, prefix, world, rank) else try routed.load(a, d, store, prefix, world, rank);
+     errdefer e.free();
+     var shared: [3]wt.Q4 = @splat(wt.Q4.empty(d));
+     errdefer for (&shared) |*p| p.free();
+diff --git a/zig/src/families/flashnext/cuda_modelopt_experts.zig b/zig/src/families/flashnext/cuda_modelopt_experts.zig
+index 7bae50f6cf97ac3a3b02eb15fb81257d9e3fea48..10a00fbb4bef269061457026d2c0c73d5faeb797 100644
+--- a/zig/src/families/flashnext/cuda_modelopt_experts.zig
++++ b/zig/src/families/flashnext/cuda_modelopt_experts.zig
+@@ -45,10 +45,17 @@ pub const Owned = struct {
+     count: usize,
+     /// The global id of the rank's first expert (0 at world 1); `count` experts from it are this rank's.
+     first: usize = 0,
+-    /// .nvfp4 (global scales a projection) or .fp8g (f32 128x128 block scales, cuda_fp8_experts_load.zig).
++    /// .nvfp4 (global scales a projection), .fp8g (f32 128x128 block scales, cuda_fp8_experts_load.zig) or .exl3
++    /// (TF_FLASHNEXT_EXPERTS_EXL3's trellises in `image`, cuda_exl3_experts.zig; up, down and their scales empty).
+     format: cuda.experts.Format = .nvfp4,
++    /// .exl3: the layer's device image (cuda_exl3_routed.Layout) and the kernels' view of it.
++    image: ?cuda.DeviceBuffer = null,
++    exl3: ?cuda.exl3_experts.Layer = null,
++    /// .exl3: the layer's widths are ones TF_EXL3_PROMPT_ROWS's kernels take (cuda_exl3_routed.Layout.prompt_ok).
++    exl3_prompt: bool = false,
+ 
+     pub fn free(self: *Owned) void {
++        if (self.image) |*b| b.free();
+         self.up.free();
+         self.down.free();
+         self.up_scale.free();
+@@ -57,6 +64,7 @@ pub const Owned = struct {
+     }
+ 
+     pub fn view(self: *const Owned) cuda.experts.Layer {
++        if (self.format == .exl3) return .{ .format = .exl3, .exl3 = self.exl3, .up = 0, .down = 0, .width = self.width, .dims = self.dims, .experts = self.count, .swiglu = true };
+         return .{ .format = self.format, .up = self.up.ptr, .down = self.down.ptr, .up_scale = self.up_scale.ptr, .down_scale = self.down_scale.ptr, .width = self.width, .dims = self.dims, .experts = self.count };
+     }
+ };
+diff --git a/zig/src/families/flashnext/cuda_moe_native.zig b/zig/src/families/flashnext/cuda_moe_native.zig
+index eef2e51af671a736f7ce1b4adda548789d12a98b..7a6ae0d90cfc06a4029b5245d0beef504663a462 100644
+--- a/zig/src/families/flashnext/cuda_moe_native.zig
++++ b/zig/src/families/flashnext/cuda_moe_native.zig
+@@ -33,6 +33,7 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
+             try nvfp4_tile.run(self.k, pt, self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, skip);
+         },
+         .fp8g => try fp8(self.k, self.stream, s.picks, s.mixed, owned.view(), plan, pairs, n, s.y, s.moe_act),
++        .exl3 => try exl3(self, picks, owned, plan, pairs, n, e, skip),
+         else => return error.UnsupportedQuantization,
+     }
+     // the shared partial stays in s.shared_out and the sum reads it there (fn_moe_sum_slot)
+@@ -48,6 +49,31 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
+     }
+ }
+ 
++/// TF_FLASHNEXT_EXPERTS_EXL3's experts (cuda_exl3_experts.zig): 16-pair items at every row count when the kit's grouped
++/// tile is 16 (Kit.load's; the batch scratch holds that many items), else NVFP4's tiles (16-pair decode, 64-pair prompt
++/// items from factRows() rows); SwiGLU's bf16 activations into moe_act, each pair's fp32 row into y as NVFP4 writes them.
++/// Passes of TF_EXL3_PROMPT_ROWS rows or more take the prompt kernels' 64-pair items instead (cuda_exl3_prompt.zig), the
++/// same act and y rows.
++pub fn exl3(self: anytype, picks: u64, owned: anytype, plan: cuda.grouped.Plan, pairs: usize, n: usize, e: usize, skip: i32) !void {
++    const s = self.s;
++    const kit = self.k.exl3 orelse return error.FormatNotLoaded;
++    if (pairs > kit.grouped.pair_cap) return error.Exl3ScratchShort; // Engine.reserve sizes it with the batch scratch
++    const xp = @import("cuda_exl3_prompt.zig");
++    if (xp.takes(kit.prompt_rows, n, owned.exl3_prompt)) {
++        const store = kit.grouped.storage orelse return error.Exl3ScratchShort;
++        try self.k.router.route(self.stream, picks, pairs, e, xp.members, plan);
++        const items = cuda.grouped.maxItems(pairs, e, xp.members);
++        return xp.run(&kit.experts, self.stream, owned.exl3.?, store.ptr, store.len, kit.grouped.pair_cap, s.mixed, dims, slots, picks, plan, s.moe_act, s.y, pairs, items, skip, kit.prompt_dn);
++    }
++    const pt = if (kit.grouped.tile == 16) 16 else nvfp4_tile.size(n);
++    try self.k.router.route(self.stream, picks, pairs, e, pt, plan);
++    const items = cuda.grouped.maxItems(pairs, e, pt);
++    const g: cuda.experts.Grouped = .{ .exl3 = &kit.grouped };
++    const call = if (pt == 16) &cuda.experts.Grouped.decode else &cuda.experts.Grouped.prompt;
++    try call(g, self.stream, .up, .{ .x = s.mixed, .stride = dims, .slots = slots }, owned.view(), plan, s.moe_act, items, skip);
++    try call(g, self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, skip);
++}
++
+ /// This rank's slots' weighted fp32 sum into moe_f32 (fn_moe_sum; every other rank's slots and columns are zero in y).
+ fn partialSum(self: anytype, n: usize) !void {
+     const s = self.s;
+diff --git a/zig/src/families/flashnext/cuda_mtp.zig b/zig/src/families/flashnext/cuda_mtp.zig
+index c682dce16a55dd4e5327d45554637cfc73416d67..7837be45245511f942206e20d49dd1021537f46e 100644
+--- a/zig/src/families/flashnext/cuda_mtp.zig
++++ b/zig/src/families/flashnext/cuda_mtp.zig
+@@ -388,6 +388,7 @@ pub const Head = struct {
+         h.gpa = gpa;
+         var store = try wt.Store.open(gpa, io, dir);
+         defer store.deinit();
++        try @import("cuda_exl3_experts.zig").attach(gpa, io, &store, .mtp);
+         try store.detectNorms();
+         var buf: [120]u8 = undefined;
+         const ne = try store.normScale(gpa, try store.tensor("language_model.mtp.pre_fc_norm_embedding.weight"));
+@@ -502,13 +503,19 @@ pub const Head = struct {
+ pub fn headBytes(fp8: bool) usize {
+     const weights = 3 * wt.moe_w * dims;
+     const nvfp4 = weights / 2 * 5 / 4;
+-    const routed = if (fp8) weights + 3 * (wt.moe_w / 128) * (dims / 128) * 4 else nvfp4;
+-    const experts = wt.experts_n * routed + nvfp4;
++    const experts = headRoutedBytes(fp8) + nvfp4;
+     const attn = (wt.proj_n + dims) * dims / 2 * 5 / 4;
+     const draft = 79_591 * dims / 2 * 5 / 4;
+     return experts + attn + draft + 2 * dims * dims / 2 * 5 / 4;
+ }
+ 
++/// headBytes' routed experts (the shared one apart): what TF_FLASHNEXT_EXPERTS_EXL3's MTP image replaces.
++pub fn headRoutedBytes(fp8: bool) usize {
++    const weights = 3 * wt.moe_w * dims;
++    const routed = if (fp8) weights + 3 * (wt.moe_w / 128) * (dims / 128) * 4 else weights / 2 * 5 / 4;
++    return wt.experts_n * routed;
++}
++
+ pub const headFormat = @import("cuda_mtp_draft.zig").headFormat;
+ pub const headFormatIn = @import("cuda_mtp_draft.zig").headFormatIn;
+ pub const headOverCharge = @import("cuda_mtp_draft.zig").headOverCharge;
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index 8f0ab8157c5c139063f2827f719dc8f7ee94db20..d4a8c1ce66d371b3fed0c48d6454080ba3dc26ba 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -180,6 +180,7 @@ pub const Engine = struct {
+         errdefer gpa.free(e.model_dir);
+         e.store = try Store.open(gpa, io, e.model_dir);
+         errdefer e.store.deinit();
++        try @import("cuda_exl3_experts.zig").attach(gpa, io, &e.store, .main);
+         try e.store.detectNorms();
+         const weight = try e.store.tensor(embed.weight_name);
+         if (weight.dtype == .bf16) {
+@@ -401,6 +402,8 @@ pub const Engine = struct {
+             e.batch_s = null;
+         }
+         e.batch_s = try batch.Scratch.alloc(e.gpa, e.driver, e.stream.*, rows);
++        // the EXL3 experts' scratch grows with the batch scratch, so no captured round ever allocates it
++        if (e.batch_k.exl3) |x| try x.reserve(rows);
+         return &e.batch_s.?;
+     }
+ 
+diff --git a/zig/src/families/flashnext/cuda_prompt_wt.zig b/zig/src/families/flashnext/cuda_prompt_wt.zig
+index ab8800aa6d77061da133092421046ce352fcc718..96385341fa0e1cfd3fee8fb4e9c1969916ea5a04 100644
+--- a/zig/src/families/flashnext/cuda_prompt_wt.zig
++++ b/zig/src/families/flashnext/cuda_prompt_wt.zig
+@@ -113,6 +113,8 @@ pub const Store = struct {
+     /// Shards a load already opened, kept open until it ends (loaded or deinit): reopening one parses its header again.
+     released: std.ArrayList(Held) = .empty,
+     norm_offset: f32 = 0,
++    /// TF_FLASHNEXT_EXPERTS_EXL3's folder, attached when its scope covers this store's layers (cuda_exl3_experts.zig).
++    experts_exl3: ?*Store = null,
+ 
+     pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Store {
+         const index = try std.fs.path.join(gpa, &.{ dir, "model.safetensors.index.json" });
+@@ -155,6 +157,11 @@ pub const Store = struct {
+     }
+ 
+     pub fn deinit(self: *Store) void {
++        if (self.experts_exl3) |x| {
++            x.deinit();
++            self.gpa.destroy(x);
++            self.experts_exl3 = null;
++        }
+         self.dropStaging();
+         self.release();
+         self.held.deinit(self.gpa);
+@@ -180,6 +187,7 @@ pub const Store = struct {
+ 
+     /// A finished load: the pinned staging freed, borrowed planes released, every open shard closed.
+     pub fn loaded(self: *Store) void {
++        if (self.experts_exl3) |x| x.loaded();
+         self.dropStaging();
+         self.release();
+         self.closeReleased();
+diff --git a/zig/src/families/flashnext/cuda_rank_memory.zig b/zig/src/families/flashnext/cuda_rank_memory.zig
+index b8d852137e7006800721be0f0a4ea054c15f3163..306f0a79256a795bc0a41bfc7df94aad8f5f44f2 100644
+--- a/zig/src/families/flashnext/cuda_rank_memory.zig
++++ b/zig/src/families/flashnext/cuda_rank_memory.zig
+@@ -7,6 +7,13 @@ const dense_split = @import("cuda_dense_split.zig");
+ const Entry = core.safetensors.Entry;
+ 
+ pub fn estimate(a: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize, rank: usize) !u64 {
++    return (try estimateParts(a, io, dir, world, rank)).total;
++}
++
++/// estimate's total and the routed experts' part of it (the decoder layers' .mlp.experts. tensors on this rank).
++pub const Parts = struct { total: u64, routed: u64 };
++
++pub fn estimateParts(a: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize, rank: usize) !Parts {
+     if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
+     var store = try wt.Store.open(a, io, dir);
+     defer store.deinit();
+@@ -17,6 +24,7 @@ pub fn estimate(a: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize,
+     var wi = wm.object.iterator();
+     while (wi.next()) |item| try files.put(a, item.value_ptr.string, {});
+     var total: u64 = 0;
++    var experts: u64 = 0;
+     var fi = files.keyIterator();
+     while (fi.next()) |name| {
+         const path = try std.fs.path.join(a, &.{ dir, name.* });
+@@ -25,10 +33,12 @@ pub fn estimate(a: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize,
+         defer file.close(io);
+         var tensors = file.names.iterator();
+         while (tensors.next()) |tensor| {
+-            total = try std.math.add(u64, total, try tensorBytes(tensor.key_ptr.*, tensor.value_ptr.*, world, rank, split));
++            const bytes = try tensorBytes(tensor.key_ptr.*, tensor.value_ptr.*, world, rank, split);
++            total = try std.math.add(u64, total, bytes);
++            if (std.mem.indexOf(u8, tensor.key_ptr.*, ".mlp.experts.") != null) experts = try std.math.add(u64, experts, bytes);
+         }
+     }
+-    return total;
++    return .{ .total = total, .routed = experts };
+ }
+ 
+ fn tensorBytes(name: []const u8, e: Entry, world: usize, rank: usize, split: bool) !u64 {
+diff --git a/zig/tests/cuda/flashnext_exl3_tests.zig b/zig/tests/cuda/flashnext_exl3_tests.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..858e57367d53a4419192269e652cbbb98b160673
+--- /dev/null
++++ b/zig/tests/cuda/flashnext_exl3_tests.zig
+@@ -0,0 +1,737 @@
++//! TF_FLASHNEXT_EXPERTS_EXL3 on the device: moe_native.exl3 at Flash Next's shapes against FP64 (both ranks on
++//! synthetic experts, then this host's rank of the staged pack), decode shapes through the grouped kernels and prompt
++//! shapes through TF_EXL3_PROMPT_ROWS's kernels (cuda_exl3_prompt.zig), and `flashnext-exl3-bench`: EXL3 against NVFP4
++//! grouped experts at a --tp 2 rank's 256 experts.
++//!
++//! Both commands take PACK RANK: an experts-only EXL3 folder (its model.safetensors.index.json, manifest.json
++//! and each rank's expert files) and the rank whose files this host holds (0 on the head, 1 on the worker). Before any
++//! GPU work they check the folder's index, its manifest and every file the manifest lists for RANK at its size, and exit
++//! at once when one is missing. Each step prints a "STEP +s" line as it ends, and a watchdog thread ends the process
++//! with status 124 after `deadline_s` (a step that never returns cannot outlive the run's timeout unseen).
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const flash = @import("flashnext");
++const check = @import("check.zig");
++const rig = @import("flashnext_rig.zig");
++
++const D = 2560; // dims
++const NI = 640; // expert width
++const slots = 11; // ten routed picks a row, then the shared slot
++const picked = slots - 1;
++const global = 512; // routed experts across both ranks
++const layout = flash.exl3_routed;
++const X = flash.exl3_experts;
++const projs = [3][]const u8{ "gate_proj", "up_proj", "down_proj" };
++
++/// Seconds after which the watchdog ends the process (status 124): the bench finishes in about 2 min on a GB10 and the
++/// check, with its prompt shapes, in about 3 (estimated); a 600 s timeout applies, so the test names the hang
++/// itself first.
++const deadline_s = 540;
++
++/// A rank's experts in the synthetic check, alternating 2.5 and 3 bpw (a width mix-up shows). Two ranks' worth must
++/// hold ten distinct picks a row: with fewer, localPicks could never finish a row.
++const fixture_count = 6;
++const fixture_halves = [fixture_count]u32{ 5, 6, 5, 6, 5, 6 };
++comptime {
++    std.debug.assert(2 * fixture_count >= picked);
++}
++
++/// The pack's layers the device check and the bench load: an edge layer (3.0 bpw in the 2.68 bpw self-calibrated quant), a middle one (2.5 bpw),
++/// and the MTP head's (all 512 experts, rank 0 only).
++const Real = struct { label: []const u8, prefix: []const u8, world: usize };
++const real_layers = [_]Real{
++    .{ .label = "layer 0", .prefix = "language_model.model.layers.0.mlp", .world = 2 },
++    .{ .label = "layer 24", .prefix = "language_model.model.layers.24.mlp", .world = 2 },
++    .{ .label = "MTP head", .prefix = "language_model.mtp.layers.0.mlp", .world = 1 },
++};
++/// Per row count of the pack check: distinct experts dequantized to FP64, and pairs of each checked.
++const real_experts = 4;
++const real_pairs = 4;
++
++/// The pass fields moe_native.exl3 reads.
++const Pass = struct {
++    s: struct { mixed: u64, moe_act: u64, y: u64 },
++    k: *const flash.batch_state.Kernels,
++    stream: cuda.Stream,
++};
++
++const Inputs = struct { pack: []const u8, rank: usize };
++
++fn refuse(comptime fmt: []const u8, args: anytype) error{BadInputs} {
++    std.debug.print("FAIL " ++ fmt ++ "\n", args);
++    return error.BadInputs;
++}
++
++/// PACK RANK from `args`, checked against the folder: its index, manifest.json (world 2, 512 experts) and each of the
++/// manifest's files for RANK present at its size. `extra` names the command's optional arguments in the usage line.
++fn inputs(io: std.Io, a: std.mem.Allocator, cmd: []const u8, extra: []const u8, args: []const [:0]const u8) !Inputs {
++    if (args.len < 2) return refuse("{s}: usage: {s} PACK RANK{s} (PACK: the staged experts-only folder, e.g. /root/.cache/huggingface/exl3-experts; RANK: the rank whose files this host holds, 0 on the head, 1 on the worker); got {d} argument(s)", .{ cmd, cmd, extra, args.len });
++    const pack: []const u8 = args[0];
++    const rank = std.fmt.parseInt(usize, args[1], 10) catch return refuse("{s}: RANK {s} is not 0 or 1", .{ cmd, args[1] });
++    if (rank > 1) return refuse("{s}: RANK {d} is not 0 or 1", .{ cmd, rank });
++    const dir = std.Io.Dir.cwd();
++    const index = try std.fs.path.join(a, &.{ pack, "model.safetensors.index.json" });
++    _ = dir.statFile(io, index, .{}) catch |e| return refuse("{s}: {s}: {t} (is PACK staged and mounted?)", .{ cmd, index, e });
++    const mpath = try std.fs.path.join(a, &.{ pack, "manifest.json" });
++    const text = dir.readFileAlloc(io, mpath, a, .limited(1 << 20)) catch |e| return refuse("{s}: {s}: {t}", .{ cmd, mpath, e });
++    const m = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch |e| return refuse("{s}: {s}: {t}", .{ cmd, mpath, e });
++    if (m != .object) return refuse("{s}: {s} is not an object", .{ cmd, mpath });
++    const world = m.object.get("world") orelse return refuse("{s}: {s} has no world", .{ cmd, mpath });
++    const experts = m.object.get("experts") orelse return refuse("{s}: {s} has no experts", .{ cmd, mpath });
++    if (world != .integer or world.integer != 2 or experts != .integer or experts.integer != global) return refuse("{s}: {s} is not a world-2, {d}-expert pack", .{ cmd, mpath, global });
++    var key: [4]u8 = undefined;
++    const ranks = m.object.get("ranks") orelse return refuse("{s}: {s} has no ranks", .{ cmd, mpath });
++    if (ranks != .object) return refuse("{s}: {s}: ranks is not an object", .{ cmd, mpath });
++    const mine = ranks.object.get(try std.fmt.bufPrint(&key, "{d}", .{rank})) orelse return refuse("{s}: {s} has no rank {d}", .{ cmd, mpath, rank });
++    if (mine != .object) return refuse("{s}: {s}: rank {d} is not an object", .{ cmd, mpath, rank });
++    const files = mine.object.get("files") orelse return refuse("{s}: {s}: rank {d} lists no files", .{ cmd, mpath, rank });
++    if (files != .array or files.array.items.len == 0) return refuse("{s}: {s}: rank {d} lists no files", .{ cmd, mpath, rank });
++    var bytes: u64 = 0;
++    for (files.array.items) |f| {
++        if (f != .object) return refuse("{s}: {s}: a rank {d} file entry is not an object", .{ cmd, mpath, rank });
++        const name = f.object.get("file") orelse return refuse("{s}: {s}: a rank {d} file has no name", .{ cmd, mpath, rank });
++        const want = f.object.get("bytes") orelse return refuse("{s}: {s}: a rank {d} file has no size", .{ cmd, mpath, rank });
++        if (name != .string or want != .integer) return refuse("{s}: {s}: a rank {d} file entry is malformed", .{ cmd, mpath, rank });
++        const path = try std.fs.path.join(a, &.{ pack, name.string });
++        const st = dir.statFile(io, path, .{}) catch |e| return refuse("{s}: {s}: {t} (rank {d}'s files are not staged on this host: is RANK right?)", .{ cmd, path, e, rank });
++        if (st.size != @as(u64, @intCast(want.integer))) return refuse("{s}: {s}: {d} bytes, the manifest says {d} (a partial copy?)", .{ cmd, path, st.size, want.integer });
++        bytes += st.size;
++    }
++    std.debug.print("STEP {s}: pack {s} rank {d}: index, manifest and {d} files ({d:.1} GiB) present\n", .{ cmd, pack, rank, files.array.items.len, @as(f64, @floatFromInt(bytes)) / (1 << 30) });
++    return .{ .pack = pack, .rank = rank };
++}
++
++/// Ends the process with status 124 once `deadline_s` passes, whatever the main thread waits on.
++fn watchdog(cmd: []const u8) void {
++    const T = struct {
++        fn run(name: []const u8) void {
++            var left: std.c.timespec = .{ .sec = deadline_s, .nsec = 0 };
++            var rem: std.c.timespec = undefined;
++            while (std.c.nanosleep(&left, &rem) != 0) left = rem;
++            std.debug.print("FAIL {s}: not finished after {d} s (a step never returned); exiting 124\n", .{ name, deadline_s });
++            std.process.exit(124);
++        }
++    };
++    const t = std.Thread.spawn(.{}, T.run, .{cmd}) catch |e| {
++        std.debug.print("{s}: no watchdog ({t}); the caller's timeout is the only bound\n", .{ cmd, e });
++        return;
++    };
++    t.detach();
++}
++
++const Clock = struct {
++    io: std.Io,
++    cmd: []const u8,
++    t0: i96,
++
++    fn start(io: std.Io, cmd: []const u8) Clock {
++        return .{ .io = io, .cmd = cmd, .t0 = check.now(io) };
++    }
++
++    fn step(c: Clock, comptime fmt: []const u8, args: anytype) void {
++        const s = @as(f64, @floatFromInt(check.now(c.io) - c.t0)) / 1e9;
++        std.debug.print("STEP {s} +{d:.1} s: " ++ fmt ++ "\n", .{ c.cmd, s } ++ args);
++    }
++};
++
++/// A rank's `count` experts at `halves[e]` half-bits, as one image: random trellis words and scales on the host too.
++const Image = struct {
++    l: layout.Layout,
++    base: u64,
++    host: []u8,
++    trellis: [3][][]i16,
++    suh: [3][][]f16,
++    svh: [3][][]f16,
++
++    fn init(r: *rig.Rig, count: usize, halves: []const u32, keep: bool) !Image {
++        var im: Image = undefined;
++        im.l = try layout.Layout.init(r.a, D, NI, .{ halves, halves, halves });
++        const buf = try cuda.DeviceBuffer.alloc(r.gpu.d, im.l.total);
++        try r.bufs.append(r.gpu.gpa, buf);
++        im.base = buf.ptr;
++        im.host = try r.a.alloc(u8, im.l.total);
++        @memset(im.host, 0);
++        for (0..3) |p| {
++            const proj: layout.Proj = @fromBackingInt(@intCast(p));
++            const s = layout.kn(proj, D, NI);
++            im.trellis[p] = try r.a.alloc([]i16, count);
++            im.suh[p] = try r.a.alloc([]f16, count);
++            im.svh[p] = try r.a.alloc([]f16, count);
++            for (0..count) |e| {
++                const tb = try layout.trellisBytes(s[0], s[1], halves[e]);
++                const t = try r.a.alloc(i16, tb / 2);
++                r.rng.bytes(std.mem.sliceAsBytes(t));
++                const su = try r.a.alloc(f16, s[0]);
++                for (su) |*v| v.* = @floatCast(if (r.rng.boolean()) @as(f32, 0.03) else -0.03);
++                const sv = try r.a.alloc(f16, s[1]);
++                for (sv) |*v| v.* = @floatCast(if (r.rng.boolean()) @as(f32, 0.03) else -0.03);
++                try im.l.put(im.host, im.base, proj, e, .{ .trellis = std.mem.sliceAsBytes(t), .suh = std.mem.sliceAsBytes(su), .svh = std.mem.sliceAsBytes(sv), .halves = halves[e] }, halves[e]);
++                if (keep) {
++                    im.trellis[p][e] = t;
++                    im.suh[p][e] = su;
++                    im.svh[p][e] = sv;
++                }
++            }
++        }
++        try buf.upload(0, im.host);
++        return im;
++    }
++
++    fn owned(im: Image, d: *const cuda.Driver, first: usize, count: usize) flash.modelopt_experts.Owned {
++        const empty: cuda.DeviceBuffer = .{ .d = d, .ptr = 0, .len = 0 };
++        return .{ .up = empty, .down = empty, .up_scale = empty, .down_scale = empty, .width = NI, .dims = D, .count = count, .first = first, .format = .exl3, .exl3 = im.l.layer(im.base, X.act_mode), .exl3_prompt = im.l.prompt_ok };
++    }
++};
++
++/// FP64 weights of one expert: gate and up [D][NI], down [NI][D] (exl3_format.dequantize, the format's reference
++/// decoder, about 0.4 s a projection on one core), the three projections on three threads, in buffers reused from
++/// expert to expert.
++const Weights = struct {
++    w: [3][]f64,
++    scratch: [3][]f64,
++
++    /// One projection's trellis words, sign scales and half-bit width, host copies dequantize can read aligned.
++    const Proj = struct { halves: u32, trellis: []const i16, suh: []const f16, svh: []const f16 };
++
++    fn init(gpa: std.mem.Allocator) !Weights {
++        var out: Weights = undefined;
++        for (&out.w, &out.scratch) |*w, *s| {
++            w.* = try gpa.alloc(f64, D * NI);
++            s.* = try gpa.alloc(f64, 2 * D * NI);
++        }
++        return out;
++    }
++
++    fn deinit(self: *Weights, gpa: std.mem.Allocator) void {
++        for (self.w, self.scratch) |w, s| {
++            gpa.free(w);
++            gpa.free(s);
++        }
++    }
++
++    fn one(self: *Weights, p: usize, src: Proj) void {
++        const s = layout.kn(@fromBackingInt(@intCast(p)), D, NI);
++        core.exl3_format.dequantize(.{ .halves = @intCast(src.halves) }, .mul1, src.trellis, s[0] / 16, s[1] / 16, src.suh, src.svh, self.w[p], self.scratch[p]);
++    }
++
++    fn set(self: *Weights, src: [3]Proj) void {
++        var ts: [3]?std.Thread = undefined;
++        for (&ts, 0..) |*t, p| t.* = std.Thread.spawn(.{}, one, .{ self, p, src[p] }) catch null;
++        for (ts, 0..) |t, p| if (t) |th| th.join() else self.one(p, src[p]);
++    }
++
++    /// The pack's expert `e` of the layer at `prefix`, copied out of the store's mapping; its gate's half-bit width.
++    fn setFrom(self: *Weights, gpa: std.mem.Allocator, store: *X.Store, prefix: []const u8, e: usize) !u32 {
++        var src: [3]Proj = undefined;
++        var made: usize = 0;
++        defer for (src[0..made]) |q| {
++            gpa.free(q.trellis);
++            gpa.free(q.suh);
++            gpa.free(q.svh);
++        };
++        var buf: [256]u8 = undefined;
++        for (&src, 0..) |*q, p| {
++            const s = layout.kn(@fromBackingInt(@intCast(p)), D, NI);
++            const g = try X.group(store, try std.fmt.bufPrint(&buf, "{s}.experts.{d}.{s}", .{ prefix, e, projs[p] }), s[0], s[1]);
++            const t = try gpa.alloc(i16, g.trellis.len / 2);
++            errdefer gpa.free(t);
++            @memcpy(std.mem.sliceAsBytes(t), g.trellis);
++            const su = try gpa.alloc(f16, s[0]);
++            errdefer gpa.free(su);
++            @memcpy(std.mem.sliceAsBytes(su), g.suh);
++            const sv = try gpa.alloc(f16, s[1]);
++            @memcpy(std.mem.sliceAsBytes(sv), g.svh);
++            q.* = .{ .halves = g.halves, .trellis = t, .suh = su, .svh = sv };
++            made += 1;
++        }
++        self.set(src);
++        return src[0].halves;
++    }
++
++    /// Rel L2 errors of one pair against FP64: its bf16 silu(gate) * up row `act`, and its fp32 down row `y` from the
++    /// kernel's own act (so a down error is not an act error carried on).
++    fn pairError(self: *const Weights, xr: []const u16, act: []const u16, y: []const f32) [2]f64 {
++        var g: [NI]f64 = @splat(0);
++        var u: [NI]f64 = @splat(0);
++        for (0..D) |i| {
++            const xv = rig.bf(xr[i]);
++            const wg = self.w[0][i * NI ..][0..NI];
++            const wu = self.w[1][i * NI ..][0..NI];
++            for (0..NI) |j| {
++                g[j] += xv * wg[j];
++                u[j] += xv * wu[j];
++            }
++        }
++        var ae: f64 = 0;
++        var an: f64 = 0;
++        for (0..NI) |j| {
++            const want = g[j] / (1 + @exp(-g[j])) * u[j];
++            const have = rig.bf(act[j]);
++            ae += (have - want) * (have - want);
++            an += want * want;
++        }
++        var s: [D]f64 = @splat(0);
++        for (0..NI) |i| {
++            const av = rig.bf(act[i]);
++            const wd = self.w[2][i * D ..][0..D];
++            for (0..D) |j| s[j] += av * wd[j];
++        }
++        var ye: f64 = 0;
++        var yn: f64 = 0;
++        for (0..D) |j| {
++            const have: f64 = y[j];
++            ye += (have - s[j]) * (have - s[j]);
++            yn += s[j] * s[j];
++        }
++        return .{ @sqrt(ae / @max(an, 1e-300)), @sqrt(ye / @max(yn, 1e-300)) };
++    }
++};
++
++fn plan(r: *rig.Rig, pairs: usize, entries: usize) !cuda.grouped.Plan {
++    return .{
++        .members = try r.out(pairs * 4),
++        .items = try r.out(((pairs + 15) / 16 + entries) * 12),
++        .counts = try r.out(8),
++        .rank = try r.out(pairs * 4),
++        .hist = try r.out(((pairs + cuda.grouped.small - 1) / cuda.grouped.small) * entries * 4),
++    };
++}
++
++/// Rank-local picks: ten distinct global experts a row (another rank's, and the shared slot, mapped to `count`).
++fn localPicks(a: std.mem.Allocator, rng: std.Random, rows: usize, first: usize, count: usize, total: usize) ![]i32 {
++    if (total < picked) return error.TooFewExperts;
++    const out = try a.alloc(i32, rows * slots);
++    var g: [picked]usize = undefined;
++    for (0..rows) |row| {
++        for (0..picked) |j| {
++            var e = rng.uintLessThan(usize, total);
++            while (std.mem.indexOfScalar(usize, g[0..j], e) != null) e = rng.uintLessThan(usize, total);
++            g[j] = e;
++            out[row * slots + j] = if (e >= first and e < first + count) @intCast(e - first) else @intCast(count);
++        }
++        out[row * slots + picked] = @intCast(count);
++    }
++    return out;
++}
++
++/// One moe_native.exl3 call on `rows` rows of `x` with `owned`; the act and y rows back on the host, and the picks.
++const Call = struct { picks: []i32, act: []u16, y: []f32 };
++
++fn call(r: *rig.Rig, k: *const flash.batch_state.Kernels, dx: u64, owned: *const flash.modelopt_experts.Owned, rows: usize) !Call {
++    const total = if (owned.count == global) global else 2 * owned.count; // the MTP head's 512, else two ranks' worth
++    return callWith(r, k, dx, owned, rows, try localPicks(r.a, r.rng, rows, owned.first, owned.count, total));
++}
++
++fn callWith(r: *rig.Rig, k: *const flash.batch_state.Kernels, dx: u64, owned: *const flash.modelopt_experts.Owned, rows: usize, picks: []i32) !Call {
++    const pairs = rows * slots;
++    const p = try plan(r, pairs, owned.count + 1);
++    const act = try r.out(pairs * NI * 2);
++    const y = try r.out(pairs * D * 4);
++    var pass: Pass = .{ .s = .{ .mixed = dx, .moe_act = act, .y = y }, .k = k, .stream = r.s };
++    try flash.moe_native.exl3(&pass, try r.dev(std.mem.sliceAsBytes(picks)), owned, p, pairs, rows, owned.count + 1, @intCast(owned.count));
++    try r.s.synchronize();
++    return .{ .picks = picks, .act = try r.back(u16, act, pairs * NI), .y = try r.back(f32, y, pairs * D) };
++}
++
++/// Every pair routed elsewhere left its y row untouched (0xff); the number routed here, which must be > 0.
++fn skipped(c: Call, count: usize, what: []const u8, rows: usize) !usize {
++    var routed: usize = 0;
++    for (c.picks, 0..) |e, pi| {
++        if (e == count) {
++            for (std.mem.sliceAsBytes(c.y[pi * D ..][0..D])) |v| try check.expect(v == 0xff, "{s}, {d} rows: a skipped pair's row untouched", .{ what, rows });
++        } else routed += 1;
++    }
++    try check.expect(routed > 0, "{s}, {d} rows: some pairs routed to this rank", .{ what, rows });
++    return routed;
++}
++
++fn checkPair(w: *const Weights, x: []const u16, c: Call, pi: usize, what: []const u8, rows: usize, expert: usize) !f64 {
++    const row = pi / slots;
++    const err = w.pairError(x[row * D ..][0..D], c.act[pi * NI ..][0..NI], c.y[pi * D ..][0..D]);
++    try check.expect(err[0] < 1e-2 and err[1] < 1e-2, "{s}, {d} rows, pair {d} (expert {d}): rel L2 error act {e:.2}, down {e:.2} (bound 1e-2)", .{ what, rows, pi, expert, err[0], err[1] });
++    return @max(err[0], err[1]);
++}
++
++/// Decode shapes through the grouped kernels (5 rows, and 70: NVFP4's prompt tile), then prompt shapes through
++/// TF_EXL3_PROMPT_ROWS's kernels: just past its default 256 rows, and a 1,536-row prompt chunk (multi-item experts).
++const row_counts = [_]usize{ 5, 70, 300, 1536 };
++const most = 1536;
++/// Routed pairs of one synthetic expert checked against FP64 a row count past 70 rows (5 and 70: every pair).
++const synth_cap = 40;
++/// Bound on the rel L2 distance of the prompt kernels' act and y from the grouped kernels' on the same picks (the same
++/// rotated inputs and weights, other summation orders, so a few bf16 act values round the other way).
++const path_bound = 1e-2;
++
++/// Rel L2 distance of `b` from `a` over the pairs routed here (act and y), and whether the y bytes are equal.
++fn pathDistance(a: Call, b: Call, count: usize) struct { act: f64, y: f64, same_y: bool } {
++    var ad: f64 = 0;
++    var an: f64 = 0;
++    var yd: f64 = 0;
++    var yn: f64 = 0;
++    var same = true;
++    for (a.picks, 0..) |e, pi| {
++        if (e == count) continue;
++        for (a.act[pi * NI ..][0..NI], b.act[pi * NI ..][0..NI]) |x, y| {
++            const d = rig.bf(x) - rig.bf(y);
++            ad += d * d;
++            an += rig.bf(x) * rig.bf(x);
++        }
++        for (a.y[pi * D ..][0..D], b.y[pi * D ..][0..D]) |x, y| {
++            const d = @as(f64, x) - y;
++            yd += d * d;
++            yn += @as(f64, x) * x;
++            same = same and @as(u32, @bitCast(x)) == @as(u32, @bitCast(y));
++        }
++    }
++    return .{ .act = @sqrt(ad / @max(an, 1e-300)), .y = @sqrt(yd / @max(yn, 1e-300)), .same_y = same };
++}
++
++/// `flashnext-exl3-experts PACK RANK`: synthetic experts on both ranks (every routed pair against FP64), then the
++/// pack's layers for RANK through the loader (cuda_exl3_experts.loadShape), a sample of pairs against FP64.
++pub fn run(gpu: check.Gpu, args: []const [:0]const u8) !void {
++    const cmd = "flashnext-exl3-experts";
++    if (std.c.getenv("TF_FLASHNEXT_FACT_ROWS") != null) return check.expect(false, "{s} runs with TF_FLASHNEXT_FACT_ROWS unset", .{cmd});
++    for ([_][:0]const u8{ "TF_EXL3_PROMPT_ROWS", "TF_EXL3_PROMPT_DN" }) |v| if (std.c.getenv(v) != null) return check.expect(false, "{s} runs with {s} unset (it checks the defaults' paths)", .{ cmd, v });
++    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const in = try inputs(gpu.io, a, cmd, "", args);
++    watchdog(cmd);
++    const clock = Clock.start(gpu.io, cmd);
++    var rng = std.Random.DefaultPrng.init(0xe3e3);
++    var r = try rig.Rig.init(gpu, a, rng.random());
++    defer r.deinit();
++    var k = try flash.batch_state.Kernels.load(gpu.d);
++    defer k.deinit();
++    if (k.exl3 == null) k.exl3 = try X.Kit.load(gpu.d);
++    try k.exl3.?.reserve(most);
++    const kit: struct { prompt_rows: usize, prompt_dn: X.prompt.Down } = .{ .prompt_rows = k.exl3.?.prompt_rows, .prompt_dn = k.exl3.?.prompt_dn };
++    try check.expect(kit.prompt_rows > 70 and kit.prompt_rows <= 300, "{s}: the prompt kernels take 300 rows and not 70 (TF_EXL3_PROMPT_ROWS default {d})", .{ cmd, kit.prompt_rows });
++    const x = r.bfs(most * D, 1.0);
++    const dx = try r.dev(std.mem.sliceAsBytes(x));
++    var w = try Weights.init(gpu.gpa);
++    defer w.deinit(gpu.gpa);
++    clock.step("kernels loaded, {d} rows reserved", .{most});
++    var worst: f64 = 0;
++    var worst_path: f64 = 0;
++    var checked: usize = 0;
++    for (0..2) |rank| {
++        const im = try Image.init(&r, fixture_count, &fixture_halves, true);
++        const owned = im.owned(gpu.d, rank * fixture_count, fixture_count);
++        var calls: [row_counts.len]Call = undefined;
++        for (row_counts, &calls) |rows, *c| c.* = try call(&r, &k, dx, &owned, rows);
++        for (0..fixture_count) |e| {
++            var src: [3]Weights.Proj = undefined;
++            for (&src, 0..) |*q, p| q.* = .{ .halves = fixture_halves[e], .trellis = im.trellis[p][e], .suh = im.suh[p][e], .svh = im.svh[p][e] };
++            w.set(src);
++            for (row_counts, calls) |rows, c| {
++                if (e == 0) _ = try skipped(c, fixture_count, "synthetic", rows);
++                var m: usize = 0;
++                for (c.picks, 0..) |pe, pi| if (pe == e and (rows <= 70 or m < synth_cap)) {
++                    worst = @max(worst, try checkPair(&w, x, c, pi, if (rows >= kit.prompt_rows) "synthetic prompt" else "synthetic", rows, rank * fixture_count + e));
++                    checked += 1;
++                    m += 1;
++                };
++            }
++        }
++        clock.step("synthetic rank {d}: 5 and 70 rows every routed pair, 300 and {d} rows (prompt kernels) {d} pairs an expert, within 1e-2 (worst so far {e:.2})", .{ rank, most, synth_cap, worst });
++    }
++    var store = try X.Store.open(gpu.gpa, gpu.io, in.pack);
++    defer store.deinit();
++    for (real_layers) |spec| {
++        if (spec.world == 1 and in.rank != 0) continue;
++        const rk = if (spec.world == 1) 0 else in.rank;
++        var owned = try X.loadShape(gpu.gpa, gpu.d, &store, spec.prefix, spec.world, rk, D, NI, global);
++        defer owned.free();
++        defer store.loaded();
++        clock.step("pack {s}: experts {d}..{d} loaded ({d} MiB image)", .{ spec.label, owned.first, owned.first + owned.count - 1, owned.image.?.len >> 20 });
++        for (row_counts) |rows| {
++            const c = try call(&r, &k, dx, &owned, rows);
++            const routed = try skipped(c, owned.count, spec.label, rows);
++            // experts spread over the rows: the picks visited at a prime stride (7919 divides no rows * 11 here)
++            var chosen: [real_experts]i32 = @splat(-1);
++            var n: usize = 0;
++            var pi: usize = 0;
++            while (pi < c.picks.len and n < real_experts) : (pi += 1) {
++                const e = c.picks[(pi * 7919) % c.picks.len];
++                if (e == owned.count or std.mem.indexOfScalar(i32, chosen[0..n], e) != null) continue;
++                chosen[n] = e;
++                n += 1;
++            }
++            var halves: u32 = 0;
++            for (chosen[0..n]) |e| {
++                const ue: usize = @intCast(e);
++                halves = try w.setFrom(gpu.gpa, &store, spec.prefix, owned.first + ue);
++                var m: usize = 0;
++                for (c.picks, 0..) |pe, qi| if (pe == e and m < real_pairs) {
++                    worst = @max(worst, try checkPair(&w, x, c, qi, spec.label, rows, owned.first + ue));
++                    checked += 1;
++                    m += 1;
++                };
++            }
++            clock.step("pack {s}, {d} rows ({s}): {d} routed pairs, {d} experts at {d} half-bits checked, within 1e-2 (worst so far {e:.2})", .{ spec.label, rows, if (rows >= kit.prompt_rows) "prompt kernels" else "grouped kernels", routed, n, halves, worst });
++        }
++        // the same picks through both paths and both down tiles: every routed pair's act and y, not a sample
++        const picks = try localPicks(r.a, r.rng, most, owned.first, owned.count, if (spec.world == 1) global else 2 * owned.count);
++        const prompt_v3 = try callWith(&r, &k, dx, &owned, most, picks);
++        k.exl3.?.prompt_dn = .dn0;
++        const prompt_dn0 = try callWith(&r, &k, dx, &owned, most, picks);
++        k.exl3.?.prompt_dn = kit.prompt_dn;
++        k.exl3.?.prompt_rows = 0;
++        const grouped = try callWith(&r, &k, dx, &owned, most, picks);
++        k.exl3.?.prompt_rows = kit.prompt_rows;
++        const tiles = pathDistance(prompt_v3, prompt_dn0, owned.count);
++        try check.expect(tiles.same_y, "pack {s}, {d} rows: the prompt down tiles v3 and dn0 write the same y bytes", .{ spec.label, most });
++        const d = pathDistance(grouped, prompt_v3, owned.count);
++        try check.expect(d.act < path_bound and d.y < path_bound, "pack {s}, {d} rows: prompt vs grouped kernels rel L2 act {e:.2}, y {e:.2} (bound {e:.0})", .{ spec.label, most, d.act, d.y, path_bound });
++        worst_path = @max(worst_path, @max(d.act, d.y));
++        clock.step("pack {s}, {d} rows: prompt vs grouped kernels over every routed pair: rel L2 act {e:.2}, y {e:.2}; down tiles v3 and dn0 byte-equal", .{ spec.label, most, d.act, d.y });
++    }
++    check.pass("{s}: synthetic both ranks and pack {s} rank {d} (layers 0, 24{s}), decode 5 / 70 and prompt 300 / {d} rows: {d} pairs, worst rel L2 error {e:.2} against FP64; prompt vs grouped kernels {e:.2}", .{ cmd, in.pack, in.rank, if (in.rank == 0) ", MTP" else "", most, checked, worst, worst_path });
++}
++
++/// One way the grouped kernels run a layer: the router's items (`tile` members at most) and the k tiles of words a warp
++/// keeps in flight; every variant of a layer must write the same act and y bytes as the first.
++const Variant = struct {
++    label: []const u8,
++    tile: usize,
++    depth: u8,
++    x_ahead: bool = false,
++    fit: cuda.exl3_grouped.Fit = .base,
++    /// false: a roofline probe (the same words read, no decode), timed but neither the bits nor checked.
++    exact: bool = true,
++    /// Set: TF_EXL3_PROMPT_ROWS's kernels at this down tile (route and items its own), compared with the first such.
++    prompt: ?X.prompt.Down = null,
++};
++
++/// Rel L2 distance of `cur` from `ref` (act, y) over the pairs routed here (picks not `count`).
++fn relL2(picks: []const i32, count: usize, ref_act: []const u16, ref_y: []const u32, cur_act: []const u16, cur_y: []const u32) [2]f64 {
++    var s: [4]f64 = @splat(0);
++    for (picks, 0..) |e, pi| {
++        if (e == count) continue;
++        for (ref_act[pi * NI ..][0..NI], cur_act[pi * NI ..][0..NI]) |r, c| {
++            const d = rig.bf(r) - rig.bf(c);
++            s[0] += d * d;
++            s[1] += rig.bf(r) * rig.bf(r);
++        }
++        for (ref_y[pi * D ..][0..D], cur_y[pi * D ..][0..D]) |r, c| {
++            const rf: f64 = @as(f32, @bitCast(r));
++            const d = rf - @as(f32, @bitCast(c));
++            s[2] += d * d;
++            s[3] += rf * rf;
++        }
++    }
++    return .{ @sqrt(s[0] / @max(s[1], 1e-300)), @sqrt(s[2] / @max(s[3], 1e-300)) };
++}
++
++/// tile 64 depth 1 is the first EXL3 route (NVFP4's tiles, four 16-member programs an item); Kit.load's is tile 16 with the
++/// A fragments ahead (TF_EXL3_GROUPED_XA) at TF_EXL3_GROUPED_PF's depth.
++const variants = [_]Variant{
++    .{ .label = "nvfp4 tiles, depth 1", .tile = 64, .depth = 1 },
++    .{ .label = "tile 16, depth 1", .tile = 16, .depth = 1 },
++    .{ .label = "tile 16, depth 2", .tile = 16, .depth = 2 },
++    .{ .label = "tile 16, depth 1, A ahead", .tile = 16, .depth = 1, .x_ahead = true },
++    .{ .label = "tile 16, depth 2, A ahead", .tile = 16, .depth = 2, .x_ahead = true },
++    .{ .label = "tile 16, A ahead, lean (4 an SM)", .tile = 16, .depth = 1, .x_ahead = true, .fit = .lean },
++    .{ .label = "tile 16, A ahead, narrow (6 an SM)", .tile = 16, .depth = 1, .x_ahead = true, .fit = .narrow },
++    .{ .label = "tile 16, cp.async ring 3 stages (4 an SM)", .tile = 16, .depth = 1, .x_ahead = true, .fit = .cp3 },
++    .{ .label = "tile 16, cp.async ring 4 stages (4 an SM)", .tile = 16, .depth = 1, .x_ahead = true, .fit = .cp4 },
++    .{ .label = "roofline: same words, 16-byte loads, no decode", .tile = 16, .depth = 1, .x_ahead = true, .fit = .roof_v4, .exact = false },
++    .{ .label = "roofline: same words, per-lane loads, no decode", .tile = 16, .depth = 1, .x_ahead = true, .fit = .roof_lane, .exact = false },
++    .{ .label = "prompt kernels, x3gm 64-pair items, down v3 tile", .tile = 16, .depth = 1, .x_ahead = true, .fit = .cp4, .prompt = .v3 },
++    .{ .label = "prompt kernels, x3gm 64-pair items, down dn0 tile", .tile = 16, .depth = 1, .x_ahead = true, .fit = .cp4, .prompt = .dn0 },
++};
++/// The first prompt variant: the one the others of its kind are compared with byte for byte.
++const first_prompt = blk: {
++    for (variants, 0..) |v, i| if (v.prompt != null) break :blk i;
++    unreachable;
++};
++
++/// `flashnext-exl3-bench PACK RANK [ROWS...]`: one MoE layer's routed experts at a --tp 2 rank (256 of 512, ten picks a
++/// row and the shared slot skipped), routed as the engine routes them (nvfp4_tile.size): NVFP4 against EXL3 at 2.5 and
++/// 3.0 bpw (synthetic) and against the pack's layers 24 and 0 for RANK. GB/s counts the weight bytes of the experts a
++/// call touches. Each arm runs every `variants` entry (grouped bytes checked equal to the first's, prompt bytes to the
++/// first prompt variant's, and the prompt kernels' rel L2 distance from the grouped kernels' printed); exit 3 when the
++/// served one (Kit.load's tile, TF_EXL3_GROUPED_PF depth and TF_EXL3_GROUPED_XA below TF_EXL3_PROMPT_ROWS, the prompt
++/// kernels at TF_EXL3_PROMPT_DN's tile from it) of any EXL3 arm falls below 0.6x NVFP4's at a decode row count. At
++/// prompt row counts the served variant's time against NVFP4's is the measure: `BENCH prompt` lines.
++pub fn bench(gpu: check.Gpu, args: []const [:0]const u8) !void {
++    const cmd = "flashnext-exl3-bench";
++    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const in = try inputs(gpu.io, a, cmd, " [ROWS...]", args);
++    var rows_list: std.ArrayList(usize) = .empty;
++    for (args[2..]) |s| {
++        const n = std.fmt.parseInt(usize, s, 10) catch return refuse("{s}: ROWS {s} is not a row count", .{ cmd, s });
++        if (n == 0 or n > 4096) return refuse("{s}: ROWS {d} is not in 1..4096", .{ cmd, n });
++        try rows_list.append(a, n);
++    }
++    if (rows_list.items.len == 0) try rows_list.appendSlice(a, &.{ 84, 48, 1536 });
++    watchdog(cmd);
++    const clock = Clock.start(gpu.io, cmd);
++    var rng = std.Random.DefaultPrng.init(0xbe7c);
++    var r = try rig.Rig.init(gpu, a, rng.random());
++    defer r.deinit();
++    var top: usize = 0;
++    for (rows_list.items) |n| top = @max(top, n);
++    const count = global / 2;
++    var k = try flash.batch_state.Kernels.load(gpu.d);
++    defer k.deinit();
++    if (k.exl3 == null) k.exl3 = try X.Kit.load(gpu.d);
++    try k.exl3.?.reserve(top);
++    // NVFP4: the packed blocks the loader writes (any bytes time the same), unit global scales
++    const fx = cuda.experts.Nvfp4Experts;
++    const up_b = fx.bytes(count, NI, D, 2);
++    const down_b = fx.bytes(count, D, NI, 1);
++    const nv_up = try cuda.DeviceBuffer.alloc(gpu.d, up_b);
++    try r.bufs.append(gpu.gpa, nv_up);
++    const nv_down = try cuda.DeviceBuffer.alloc(gpu.d, down_b);
++    try r.bufs.append(gpu.gpa, nv_down);
++    try nv_up.fill8(0x22, r.s.handle);
++    try nv_down.fill8(0x22, r.s.handle);
++    const ones = try a.alloc(f32, 2 * count);
++    @memset(ones, 1);
++    const nvfp4: cuda.experts.Layer = .{ .format = .nvfp4, .up = nv_up.ptr, .down = nv_down.ptr, .up_scale = try r.dev(std.mem.sliceAsBytes(ones)), .down_scale = try r.dev(std.mem.sliceAsBytes(ones[0..count])), .width = NI, .dims = D, .experts = count };
++    const nv_expert: f64 = @floatFromInt((up_b + down_b) / count);
++    clock.step("kernels and NVFP4 layer ready, {d} rows reserved", .{top});
++
++    // the arms: synthetic 2.5 and 3.0 bpw, then the pack's layer 24 and layer 0 for RANK; per_expert[e]: trellis bytes
++    const Arm = struct { label: []const u8, owned: flash.modelopt_experts.Owned, per_expert: []usize };
++    var arms: std.ArrayList(Arm) = .empty;
++    defer for (arms.items) |*arm| if (arm.owned.image != null) arm.owned.free();
++    for ([_]u32{ 5, 6 }, [_][]const u8{ "synthetic 2.5 bpw", "synthetic 3.0 bpw" }) |h, label| {
++        const hs = try a.alloc(u32, count);
++        @memset(hs, h);
++        const im = try Image.init(&r, count, hs, false);
++        const per = try a.alloc(usize, count);
++        var b: usize = 0;
++        for (0..3) |p| {
++            const s = layout.kn(@fromBackingInt(@intCast(p)), D, NI);
++            b += try layout.trellisBytes(s[0], s[1], h);
++        }
++        @memset(per, b);
++        try arms.append(a, .{ .label = label, .owned = im.owned(gpu.d, 0, count), .per_expert = per });
++        clock.step("{s} image ready", .{label});
++    }
++    var store = try X.Store.open(gpu.gpa, gpu.io, in.pack);
++    defer store.deinit();
++    for ([_]Real{ real_layers[1], real_layers[0] }) |spec| {
++        const owned = try X.loadShape(gpu.gpa, gpu.d, &store, spec.prefix, 2, in.rank, D, NI, global);
++        try arms.append(a, .{ .label = try std.fmt.allocPrint(a, "pack {s}", .{spec.label}), .owned = owned, .per_expert = try a.alloc(usize, count) });
++        const per = arms.items[arms.items.len - 1].per_expert;
++        var buf: [256]u8 = undefined;
++        for (per, 0..) |*b, e| {
++            b.* = 0;
++            for (0..3) |p| {
++                const s = layout.kn(@fromBackingInt(@intCast(p)), D, NI);
++                const src = try X.group(&store, try std.fmt.bufPrint(&buf, "{s}.experts.{d}.{s}", .{ spec.prefix, owned.first + e, projs[p] }), s[0], s[1]);
++                b.* += src.trellis.len;
++            }
++        }
++        store.loaded();
++        clock.step("pack {s} rank {d} loaded ({d} MiB image, expert {d}: {d} trellis bytes)", .{ spec.label, in.rank, owned.image.?.len >> 20, owned.first, per[0] });
++    }
++
++    const x = try r.dev(std.mem.sliceAsBytes(r.bfs(top * D, 1.0)));
++    const act = try r.out(top * slots * NI * 2);
++    const y = try r.out(top * slots * D * 4);
++    const act_b: cuda.DeviceBuffer = .{ .d = gpu.d, .ptr = act, .len = top * slots * NI * 2 };
++    const y_b: cuda.DeviceBuffer = .{ .d = gpu.d, .ptr = y, .len = top * slots * D * 4 };
++    const ref_act = try a.alloc(u16, top * slots * NI);
++    const cur_act = try a.alloc(u16, top * slots * NI);
++    const ref_y = try a.alloc(u32, top * slots * D);
++    const cur_y = try a.alloc(u32, top * slots * D);
++    const loaded: Variant = .{ .label = "", .tile = k.exl3.?.grouped.tile, .depth = k.exl3.?.grouped.depth, .x_ahead = k.exl3.?.grouped.x_ahead, .fit = k.exl3.?.grouped.fit, .prompt = k.exl3.?.prompt_dn };
++    const loaded_rows = k.exl3.?.prompt_rows;
++    const ref2_act = try a.alloc(u16, top * slots * NI);
++    const ref2_y = try a.alloc(u32, top * slots * D);
++    var stop = false;
++    for (rows_list.items) |rows| {
++        const pairs = rows * slots;
++        const picks_h = try localPicks(a, r.rng, rows, 0, count, global);
++        var used: std.AutoArrayHashMapUnmanaged(i32, void) = .empty;
++        for (picks_h) |e| if (e != count) try used.put(a, e, {});
++        const touched: f64 = @floatFromInt(used.count());
++        const picks = try r.dev(std.mem.sliceAsBytes(picks_h));
++        const p = try plan(&r, pairs, count + 1);
++        const pt = flash.nvfp4_tile.size(rows);
++        const items = cuda.grouped.maxItems(pairs, count + 1, pt);
++        const reps = 40;
++        // NVFP4: the engine's route and nvfp4_tile.run
++        var nv_us: f64 = 0;
++        for (0..2) |phase| {
++            const t0 = check.now(gpu.io);
++            for (0..if (phase == 0) 3 else reps) |_| {
++                try k.router.route(r.s, picks, pairs, count + 1, pt, p);
++                try flash.nvfp4_tile.run(&k, pt, r.s, .up, .{ .x = x, .stride = D, .slots = slots }, nvfp4, p, act, items, @intCast(count));
++                try flash.nvfp4_tile.run(&k, pt, r.s, .down_f32, .{ .x = act, .stride = NI }, nvfp4, p, y, items, @intCast(count));
++            }
++            try r.s.synchronize();
++            if (phase == 1) nv_us = @as(f64, @floatFromInt(check.now(gpu.io) - t0)) / 1e3 / reps;
++        }
++        const nv_gbs = touched * nv_expert / nv_us / 1e3;
++        std.debug.print("BENCH {d} rows ({d} pairs, tile {d}, {d} experts touched): nvfp4 {d:.1} us {d:.0} GB/s\n", .{ rows, pairs, pt, used.count(), nv_us, nv_gbs });
++        for (arms.items) |arm| {
++            var pass: Pass = .{ .s = .{ .mixed = x, .moe_act = act, .y = y }, .k = &k, .stream = r.s };
++            var bytes: f64 = 0;
++            for (used.keys()) |e| bytes += @floatFromInt(arm.per_expert[@intCast(e)]);
++            const bpw = bytes / touched / (3 * D * NI) * 8;
++            const prompt_served = X.prompt.takes(loaded_rows, rows, arm.owned.exl3_prompt);
++            for (variants, 0..) |v, vi| {
++                if (v.prompt != null and !arm.owned.exl3_prompt) continue;
++                k.exl3.?.grouped.tile = v.tile;
++                k.exl3.?.grouped.depth = v.depth;
++                k.exl3.?.grouped.x_ahead = v.x_ahead;
++                k.exl3.?.grouped.fit = v.fit;
++                k.exl3.?.prompt_rows = if (v.prompt != null) 1 else 0;
++                k.exl3.?.prompt_dn = v.prompt orelse loaded.prompt.?;
++                var us: f64 = 0;
++                for (0..2) |phase| {
++                    const t0 = check.now(gpu.io);
++                    for (0..if (phase == 0) 3 else reps) |_| try flash.moe_native.exl3(&pass, picks, &arm.owned, p, pairs, rows, count + 1, @intCast(count));
++                    try r.s.synchronize();
++                    if (phase == 1) us = @as(f64, @floatFromInt(check.now(gpu.io) - t0)) / 1e3 / reps;
++                }
++                try act_b.download(0, std.mem.sliceAsBytes(cur_act[0 .. pairs * NI]));
++                try y_b.download(0, std.mem.sliceAsBytes(cur_y[0 .. pairs * D]));
++                var dist: ?[2]f64 = null;
++                if (vi == 0) {
++                    @memcpy(ref_act[0 .. pairs * NI], cur_act[0 .. pairs * NI]);
++                    @memcpy(ref_y[0 .. pairs * D], cur_y[0 .. pairs * D]);
++                } else if (vi == first_prompt) {
++                    @memcpy(ref2_act[0 .. pairs * NI], cur_act[0 .. pairs * NI]);
++                    @memcpy(ref2_y[0 .. pairs * D], cur_y[0 .. pairs * D]);
++                    dist = relL2(picks_h, count, ref_act, ref_y, cur_act, cur_y);
++                } else if (v.exact) {
++                    const ra = if (v.prompt != null) ref2_act else ref_act;
++                    const ry = if (v.prompt != null) ref2_y else ref_y;
++                    const same = std.mem.eql(u16, ra[0 .. pairs * NI], cur_act[0 .. pairs * NI]) and
++                        std.mem.eql(u32, ry[0 .. pairs * D], cur_y[0 .. pairs * D]);
++                    try check.expect(same, "{d} rows, {s}: {s}'s act and y bytes equal {s}'s", .{ rows, arm.label, v.label, variants[if (v.prompt != null) first_prompt else 0].label });
++                }
++                const gbs = bytes / us / 1e3;
++                const ratio = gbs / nv_gbs;
++                const served = if (prompt_served) v.prompt == loaded.prompt else v.prompt == null and v.tile == loaded.tile and v.depth == loaded.depth and v.x_ahead == loaded.x_ahead and v.fit == loaded.fit;
++                const below = served and !prompt_served and ratio < 0.6;
++                stop = stop or below;
++                std.debug.print("BENCH {d} rows: exl3 {s} ({d:.2} bpw) [{s}{s}] {d:.1} us {d:.0} GB/s = {d:.2}x nvfp4's GB/s, time {d:.2}x nvfp4's{s}\n", .{ rows, arm.label, bpw, v.label, if (served) ", served" else "", us, gbs, ratio, us / nv_us, if (below) " STOP (below 0.6x)" else "" });
++                if (dist) |dd| std.debug.print("BENCH {d} rows: exl3 {s}: prompt kernels vs grouped rel L2 act {e:.2}, y {e:.2}\n", .{ rows, arm.label, dd[0], dd[1] });
++                if (served and prompt_served) std.debug.print("BENCH prompt {d} rows: exl3 {s} served prompt kernels time {d:.3}x nvfp4's ({d:.1} vs {d:.1} us)\n", .{ rows, arm.label, us / nv_us, us, nv_us });
++            }
++            k.exl3.?.grouped.tile = loaded.tile;
++            k.exl3.?.grouped.depth = loaded.depth;
++            k.exl3.?.grouped.x_ahead = loaded.x_ahead;
++            k.exl3.?.grouped.fit = loaded.fit;
++            k.exl3.?.prompt_rows = loaded_rows;
++            k.exl3.?.prompt_dn = loaded.prompt.?;
++        }
++        clock.step("{d} rows timed ({d} variants a layer, bytes equal across them)", .{ rows, variants.len });
++    }
++    if (stop) {
++        std.debug.print("BENCH verdict: STOP, EXL3 below 0.6x NVFP4's GB/s\n", .{});
++        std.process.exit(3);
++    }
++    check.pass("{s}: EXL3 (synthetic and pack {s} rank {d}) at or above 0.6x NVFP4's GB/s at every row count", .{ cmd, in.pack, in.rank });
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 1509626e02c220b76aa6de1be997b4f12f796ad7..96f364aecf4fdfb2bb87e9aaefc93d36f0dbba80 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -96,6 +96,7 @@ const flashnext_draft_affine_tests = @import("flashnext_draft_affine_tests.zig")
+ const flashnext_shared_tests = @import("flashnext_shared_tests.zig");
+ const flashnext_nvfp4_tp_tests = @import("flashnext_nvfp4_tp_tests.zig");
+ const flashnext_fp8_experts_tests = @import("flashnext_fp8_experts_tests.zig");
++const flashnext_exl3_tests = @import("flashnext_exl3_tests.zig");
+ const nvfp4_fact_tests = @import("nvfp4_fact_tests.zig");
+ const lane_half_tests = @import("lane_half_tests.zig");
+ const flashnext_dense_hc_tests = @import("flashnext_dense_hc_tests.zig");
+@@ -143,6 +144,8 @@ const usage =
+     \\  flashnext-moe-slot        --tp 2 own-slot and shared-slot MoE sums equal fn_moe_sum's bytes (one GPU)
+     \\  flashnext-roce RANK PORT  TF_FLASHNEXT_TP_ROCE's gathers and fp32 sums equal NCCL's bytes on two ranks (TF_RANK_HOST: rank 0's address)
+     \\  flashnext-fp8-experts     the MTP head's block-FP8 experts (512 x 640 x 2560) through moe_native.fp8 against FP64
++    \\  flashnext-exl3-experts PACK RANK  TF_FLASHNEXT_EXPERTS_EXL3's experts through moe_native.exl3 against FP64, decode and prompt tiles: synthetic on both ranks, then the staged pack's layers 0 and 24 (and the MTP head on rank 0) for RANK
++    \\  flashnext-exl3-bench PACK RANK [ROWS...]  EXL3 (synthetic 2.5 and 3.0 bpw, the pack's layers 24 and 0 for RANK) vs NVFP4 grouped experts at a --tp 2 rank's 256 (default 84 48 rows); exit 3 below 0.6x NVFP4's GB/s
+     \\  nvfp4-fact                NVFP4 experts' prompt tiles with the decode form's sums: its bytes at every row, FP64
+     \\  lane-half                 lane half tiles (MXFP8, BF16): bytes equal to the 64-column tile, FP64, cold-weight time
+     \\  flashnext-dense-hc        dense connection weights and FP32 normalization against FP64
+@@ -364,6 +367,8 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "flashnext-moe-slot")) return @import("flashnext_moe_slot_tests.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-roce")) return @import("flashnext_roce_tests.zig").run(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10), try std.fmt.parseInt(u16, try arg(rest, 1), 10));
+     if (std.mem.eql(u8, cmd, "flashnext-fp8-experts")) return flashnext_fp8_experts_tests.run(gpu);
++    if (std.mem.eql(u8, cmd, "flashnext-exl3-experts")) return flashnext_exl3_tests.run(gpu, rest);
++    if (std.mem.eql(u8, cmd, "flashnext-exl3-bench")) return flashnext_exl3_tests.bench(gpu, rest);
+     if (std.mem.eql(u8, cmd, "nvfp4-fact")) return nvfp4_fact_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "lane-half")) return lane_half_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-dense-hc")) return flashnext_dense_hc_tests.run(gpu);

@@ -1,0 +1,9 @@
+# Copy to scripts/local.sh (not in git) and fill in this setup's values; scripts/config.sh reads it first.
+# Adapted from MiaAI-Lab's Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold scripts/local.sh.example (Apache-2.0).
+WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-copy-id user@192.0.2.2)
+# FABRIC_PEER=192.0.2.12       # the worker's CX7 address, when WORKER is reached over another network
+# MASTER_PORT=29500            # the ranks' rendezvous port on the link (open it between the two Sparks)
+# WORKER_HF_CACHE=/models/hf   # the worker's Hugging Face cache when it is not its HF_HOME
+# HF_TOKEN=hf_...              # optional: a Hugging Face read token for the downloads (both repositories are public)
+# EXL3_SOURCE=download         # fetch the EXL3 shards whole (~43.4 GiB) instead of only the experts' byte ranges
+# export TF_FLASHNEXT_EXPERTS_TOPK=5   # five experts a token instead of ten: faster at 1-8 streams, lower quality (README)
