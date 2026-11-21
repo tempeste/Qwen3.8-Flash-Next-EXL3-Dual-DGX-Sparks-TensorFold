@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shuuul <6903405+shuuul@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 12:43:00 +0000
-Subject: [PATCH 08/33] cuda: stage synchronous downloads through a thread's
+Subject: [PATCH 08/34] cuda: stage synchronous downloads through a thread's
  pinned buffer
 
 Upstream TensorFold commit by shuuul, ported onto this series (upstream main a3962b45fc57).

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: ashhart <71890694+ashhart@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 18:44:19 +0000
-Subject: [PATCH 20/33] fix(server): return trailing tool calls before a think
+Subject: [PATCH 20/34] fix(server): return trailing tool calls before a think
  close
 
 Upstream TensorFold commit by ashhart, ported onto this series (upstream main 84d242a96bde).

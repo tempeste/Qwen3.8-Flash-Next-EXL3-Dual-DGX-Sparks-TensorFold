@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Armin <2369138+Arminova@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 18:45:25 +0000
-Subject: [PATCH 23/33] cuda route_rows: tf_route_logits_wide walks the expert
+Subject: [PATCH 23/34] cuda route_rows: tf_route_logits_wide walks the expert
  blocks first, so a row tile's input rows are read once
 
 Upstream TensorFold commit by Armin, ported onto this series (see the note below for its upstream source).

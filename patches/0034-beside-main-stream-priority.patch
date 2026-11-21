@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tempeste <tempeste@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 16:54:52 +0000
+Subject: [PATCH 34/34] flashnext: with TF_FLASHNEXT_MIXED_BESIDE on, the main
+ stream sits one priority step above the least, below the split-sum stream
+
+With TF_FLASHNEXT_MIXED_BESIDE on, the main stream was created at the highest stream priority, so that decode rounds
+outrank the beside piece's stream. The split sums' stream (TF_FLASHNEXT_TP_SPLIT_SUM) is also at the highest, so that
+each layer's exchange starts as soon as an SM frees while the main stream computes the other half. At the same level
+as the main stream the exchange queued behind the main stream's blocks, and a prompt pass with no stream decoding lost
+that overlap: with the beside flags on and nothing beside, prompt reading was about 4.5-7% slower.
+
+Now with beside on, the main stream and the MTP head's side stream take one priority step above the least. They stay
+above the beside stream and below the split sums' and ride-front streams, the order beside off has. With beside off
+the streams are created exactly as before. A load line prints the levels. Priorities change only scheduling, not
+which kernels run or what they read, so replies are unchanged. No new flags.
+
+Changes, in the order they were made:
+- perf(flashnext): with TF_FLASHNEXT_MIXED_BESIDE on, the main stream sits one priority step above the least instead
+  of the highest, so a lone prompt pass keeps its split sums ahead of it
+---
+ zig/src/cuda/green.zig                        | 10 ++------
+ zig/src/cuda/stream.zig                       | 23 ++++++++++++++-----
+ zig/src/families/flashnext/cuda_beside.zig    | 17 ++++++++++++++
+ .../families/flashnext/cuda_lanes_load.zig    |  7 ++++--
+ zig/src/families/flashnext/cuda_mtp_side.zig  |  6 ++++-
+ 5 files changed, 46 insertions(+), 17 deletions(-)
+
+diff --git a/zig/src/cuda/green.zig b/zig/src/cuda/green.zig
+index d14a1c3289cdb5dcb28b4889be48de9f6014d2b5..6da43787760d822e81737b0a755dbccf0d902d5e 100644
+--- a/zig/src/cuda/green.zig
++++ b/zig/src/cuda/green.zig
+@@ -36,13 +36,7 @@ pub const Green = struct {
+ 
+     pub fn stream(self: *const Green, priority: Stream.Priority) Error!Stream {
+         const api = self.d.green orelse return error.MissingSymbol;
+-        var least: c_int = 0;
+-        var greatest: c_int = 0;
+-        try self.d.check(self.d.api.cuCtxGetStreamPriorityRange(&least, &greatest), "cuCtxGetStreamPriorityRange");
+-        const p: c_int = switch (priority) {
+-            .default => 0,
+-            .highest => greatest,
+-        };
++        const p = Stream.level(priority, try Stream.range(self.d));
+         var s: abi.Stream = null;
+         try self.d.check(api.cuGreenCtxStreamCreate(&s, self.handle, abi.stream_non_blocking, p), "cuGreenCtxStreamCreate");
+         return .{ .d = self.d, .handle = s };
+@@ -68,7 +62,7 @@ pub fn streamIn(d: *const Driver, green: ?*const Green, priority: Stream.Priorit
+     if (green) |g| return g.stream(priority);
+     return switch (priority) {
+         .default => Stream.init(d, true),
+-        .highest => Stream.initPriority(d, .highest),
++        .above_least, .highest => Stream.initPriority(d, priority),
+     };
+ }
+ 
+diff --git a/zig/src/cuda/stream.zig b/zig/src/cuda/stream.zig
+index 173396519316f06cef9be4540fc8a8e4bfad87ba..b171265581788f734232d610b9720d9fe9e802a5 100644
+--- a/zig/src/cuda/stream.zig
++++ b/zig/src/cuda/stream.zig
+@@ -16,18 +16,29 @@ pub const Stream = struct {
+     }
+ 
+     /// A non-blocking stream at `priority`, clamped to the context's range (lower numbers run first).
+-    pub const Priority = enum { default, highest };
++    pub const Priority = enum { default, above_least, highest };
+ 
+-    pub fn initPriority(d: *const Driver, priority: Priority) Error!Stream {
++    pub const Range = struct { least: c_int, greatest: c_int };
++
++    pub fn range(d: *const Driver) Error!Range {
+         var least: c_int = 0;
+         var greatest: c_int = 0;
+         try d.check(d.api.cuCtxGetStreamPriorityRange(&least, &greatest), "cuCtxGetStreamPriorityRange");
+-        var s: abi.Stream = null;
+-        const p: c_int = switch (priority) {
++        return .{ .least = least, .greatest = greatest };
++    }
++
++    pub fn level(priority: Priority, r: Range) c_int {
++        return switch (priority) {
+             .default => 0,
+-            .highest => greatest,
++            .above_least => if (r.least > r.greatest) r.least - 1 else r.least,
++            .highest => r.greatest,
+         };
+-        try d.check(d.api.cuStreamCreateWithPriority(&s, abi.stream_non_blocking, p), "cuStreamCreateWithPriority");
++    }
++
++    pub fn initPriority(d: *const Driver, priority: Priority) Error!Stream {
++        const r = try range(d);
++        var s: abi.Stream = null;
++        try d.check(d.api.cuStreamCreateWithPriority(&s, abi.stream_non_blocking, level(priority, r)), "cuStreamCreateWithPriority");
+         return .{ .d = d, .handle = s };
+     }
+ 
+diff --git a/zig/src/families/flashnext/cuda_beside.zig b/zig/src/families/flashnext/cuda_beside.zig
+index f645b54d8ba99ef6851863a4f285c97cadbaa4a2..aaef1a5900bbff12d252eb0ab3427428d879a67e 100644
+--- a/zig/src/families/flashnext/cuda_beside.zig
++++ b/zig/src/families/flashnext/cuda_beside.zig
+@@ -264,6 +264,23 @@ pub const Beside = struct {
+     }
+ };
+ 
++pub fn mainPriority(on: bool) cuda.Stream.Priority {
++    return if (on) .above_least else .default;
++}
++
++test "with beside on the main stream sits one step above the beside stream and below the sums' stream; off it is the default" {
++    const S = cuda.Stream;
++    const r: S.Range = .{ .least = 0, .greatest = -5 };
++    try std.testing.expectEqual(S.Priority.default, mainPriority(false));
++    try std.testing.expectEqual(S.Priority.above_least, mainPriority(true));
++    try std.testing.expectEqual(@as(c_int, -1), S.level(mainPriority(true), r));
++    try std.testing.expect(S.level(mainPriority(true), r) < S.level(.default, r));
++    try std.testing.expect(S.level(.highest, r) < S.level(mainPriority(true), r));
++    try std.testing.expectEqual(@as(c_int, 0), S.level(mainPriority(false), r));
++    try std.testing.expectEqual(@as(c_int, 0), S.level(.above_least, .{ .least = 0, .greatest = 0 }));
++    try std.testing.expectEqual(@as(c_int, -1), S.level(.above_least, .{ .least = 0, .greatest = -1 }));
++}
++
+ test "a beside piece's pass keeps the typed glue in its work's room" {
+     const Tri = @import("cuda_launch.zig").Tri;
+     try std.testing.expect(@sizeOf(Tri) <= Beside.tri_room);
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index af30f460c0a88c351a9d433a9b307988872cf35f..bb3a692248985587b697991551e6718c58f98ac3 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -125,7 +125,8 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     own.* = .{ .gpa = gpa, .context = o.context, .engine = undefined, .glue = undefined, .stream = undefined, .logits = undefined };
+     // fixed-size lane buffers reused across streams (cuda_lane_parts.zig; TF_FLASHNEXT_LANE_PARTS=0: allocate each)
+     own.parts.on = if (std.c.getenv("TF_FLASHNEXT_LANE_PARTS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+-    own.stream = if (try @import("cuda_knobs.zig").mixedBeside()) try cuda.Stream.initPriority(driver, .highest) else try cuda.Stream.init(driver, true);
++    const main_priority = @import("cuda_beside.zig").mainPriority(try @import("cuda_knobs.zig").mixedBeside());
++    own.stream = try cuda.green.streamIn(driver, null, main_priority);
+     errdefer own.stream.deinit();
+     own.glue = try Glue.load(driver);
+     errdefer own.glue.deinit();
+@@ -238,7 +239,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     if (own.head) |h| if (try @import("cuda_knobs.zig").tpMtpSide()) {
+         const Side = @import("cuda_mtp_side.zig").Side;
+         const rows = Side.rowsFor(e.chunk, @import("cuda_knobs.zig").headPiece(), e.chunk);
+-        h.side = try Side.init(gpa, driver, &e.batch_k, rows);
++        h.side = try Side.initAt(gpa, driver, &e.batch_k, rows, main_priority);
+         _ = try h.side.?.reserveScores(window, rows / 2);
+         std.log.info("flashnext: the MTP head's prompt rows on a side stream, {d} rows of scratch ({d} MiB)", .{ rows, (prompt.batch.Scratch.bytes(rows) + prompt.batch.scoreBytes(window, rows / 2)) >> 20 });
+     };
+@@ -259,6 +260,8 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+         if (own.beside_pack > 0 and !own.beside_sums.any) std.log.info("flashnext: a beside pass takes a second waiting whole prompt's piece, {d} rows together at most, when both pieces' solo passes sum in fp32 (each under {d} rows with TF_FLASHNEXT_TP_SCATTER_BF16)", .{ own.beside_pack, @import("cuda_knobs.zig").split_sum_min_rows });
+         if (own.beside_pack > 0 and own.beside_sums.any) std.log.info("flashnext: a beside pass takes a second waiting whole prompt's piece, {d} rows together at most, of any rows (TF_FLASHNEXT_MIXED_BESIDE_PACK_ANY: a pair with a piece of {d} rows or more sums with the bf16 peer by the packed pass's row owners, not bit-equal to its solo passes)", .{ own.beside_pack, @import("cuda_knobs.zig").split_sum_min_rows });
+         if (own.beside_whole) std.log.info("flashnext: whole prompts' pieces go beside the decode rounds too", .{});
++        const pr = try cuda.Stream.range(driver);
++        std.log.info("flashnext: the main stream and the MTP head's side stream at priority {d}, above the beside stream's {d} and below the sums' stream's {d}", .{ cuda.Stream.level(main_priority, pr), cuda.Stream.level(.default, pr), cuda.Stream.level(.highest, pr) });
+         if (own.beside_most > 0) std.log.info("flashnext: a piece goes beside only while {d} or fewer other streams decode", .{own.beside_most});
+         if (e.beside.?.green) |g| std.log.info("flashnext: the beside piece runs on {d} of {d} SMs (a green context, alignment {d}); the decode rounds keep all {d}", .{ g.sms, g.device_sms, g.alignment, g.device_sms });
+     }
+diff --git a/zig/src/families/flashnext/cuda_mtp_side.zig b/zig/src/families/flashnext/cuda_mtp_side.zig
+index 1bda46809078d0eab80fa08f02d4136f7a11f39a..2072e99dcf03915b47abacb306cfe4dc91ce0f93 100644
+--- a/zig/src/families/flashnext/cuda_mtp_side.zig
++++ b/zig/src/families/flashnext/cuda_mtp_side.zig
+@@ -20,9 +20,13 @@ pub const Side = struct {
+     }
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, k: *const batch.Kernels, rows: usize) !*Side {
++        return initAt(gpa, d, k, rows, .default);
++    }
++
++    pub fn initAt(gpa: std.mem.Allocator, d: *const cuda.Driver, k: *const batch.Kernels, rows: usize, priority: cuda.Stream.Priority) !*Side {
+         const x = try gpa.create(Side);
+         errdefer gpa.destroy(x);
+-        var st = try cuda.Stream.init(d, true);
++        var st = try cuda.green.streamIn(d, null, priority);
+         errdefer st.deinit();
+         var ready = try cuda.Event.init(d, false);
+         errdefer ready.deinit();

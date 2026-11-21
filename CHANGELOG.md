@@ -4,12 +4,13 @@ Every change to this recipe, newest first.
 
 ## Unreleased: first version
 
-- **The engine** (`patches/0001`-`0033`): TensorFold upstream `main` at `089a18dff` plus Flash Next at `--tp 2`
+- **The engine** (`patches/0001`-`0034`): TensorFold upstream `main` at `089a18dff` plus Flash Next at `--tp 2`
   (upstream PR #1784), two-rank KV formats and prompt-cache snapshots, collectives and shared decode rounds, routed
   experts from EXL3, prompt passes and mixed rounds, the prompt pipeline, batched picks and shared kept rows, 19 ported
   upstream commits (besides PR #1784), relaxed DeltaNet paths and prompt pieces beside decode, picture prompts at text speed, small decode
-  tiles and beside packing, reply-keep, and the five-expert switch (off by default). Each patch's message lists the
-  flags it adds and their defaults.
+  tiles and beside packing, reply-keep, the five-expert switch (off by default), and the main stream one priority
+  step above the least with beside on, below the split-sum stream. Each patch's message lists the flags it adds and
+  their defaults.
 - **The serving setup** of the deployment the README's numbers come from: 24 streams × 409,600 tokens, NVFP4 KV cache,
   45 GiB prompt cache, EXL3 routed experts on NVIDIA's FP4 checkpoint, MTP drafts, image input, and its 105 engine
   variables in `scripts/engine.env`.

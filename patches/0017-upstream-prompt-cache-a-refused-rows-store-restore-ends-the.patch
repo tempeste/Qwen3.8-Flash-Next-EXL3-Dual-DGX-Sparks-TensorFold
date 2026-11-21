@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: ashhart <71890694+ashhart@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 00:26:46 +0000
-Subject: [PATCH 17/33] prompt cache: a refused rows-store restore ends the
+Subject: [PATCH 17/34] prompt cache: a refused rows-store restore ends the
  retry (#2130)
 
 Upstream TensorFold commit by ashhart, ported onto this series (upstream main 271b691897d2).

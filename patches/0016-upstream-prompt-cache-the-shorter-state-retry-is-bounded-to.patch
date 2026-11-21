@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: ashhart <71890694+ashhart@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 20:28:10 +0000
-Subject: [PATCH 16/33] prompt cache: the shorter-state retry is bounded to RAM
+Subject: [PATCH 16/34] prompt cache: the shorter-state retry is bounded to RAM
 
 Upstream TensorFold commit by ashhart, ported onto this series (upstream main 2adb8f944722).
 

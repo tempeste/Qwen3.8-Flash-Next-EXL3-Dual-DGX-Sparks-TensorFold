@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: tempeste <tempeste@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 22:00:05 +0000
-Subject: [PATCH 02/33] flashnext: two-rank KV formats, indexer window,
+Subject: [PATCH 02/34] flashnext: two-rank KV formats, indexer window,
  prompt-cache snapshots with drafts, recipe ports
 
 The two-rank foundation the rest of the series builds on:

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shuuul <6903405+shuuul@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 04:13:09 +0000
-Subject: [PATCH 10/33] cuda: stage downloads only on integrated devices, and
+Subject: [PATCH 10/34] cuda: stage downloads only on integrated devices, and
  count the bounce
 
 Upstream TensorFold commit by shuuul, ported onto this series (upstream main 194115d240a4).

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Armin <2369138+Arminova@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 18:45:41 +0000
-Subject: [PATCH 24/33] flashnext cuda: fn_qsa_select keeps 8 keys in flight a
+Subject: [PATCH 24/34] flashnext cuda: fn_qsa_select keeps 8 keys in flight a
  pass and places its picks by warp runs
 
 Upstream TensorFold commit by Armin, ported onto this series (see the note below for its upstream source).

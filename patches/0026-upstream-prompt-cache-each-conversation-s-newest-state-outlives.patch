@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: ashhart <71890694+ashhart@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 19:03:03 +0000
-Subject: [PATCH 26/33] prompt cache: each conversation's newest state outlives
+Subject: [PATCH 26/34] prompt cache: each conversation's newest state outlives
  its redundant copies (e5f75e8be, 917a745ad)
 
 Upstream TensorFold commit by ashhart, ported onto this series (see the note below for its upstream source).

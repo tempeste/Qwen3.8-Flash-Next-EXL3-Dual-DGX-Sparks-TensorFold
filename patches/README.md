@@ -1,6 +1,6 @@
 # Patches
 
-33 patches on upstream [TensorFold](https://github.com/ashhart/TensorFold) `main` at [`089a18dff289d4c58043c1957ad0d7fe73d814b3`](https://github.com/ashhart/TensorFold/commit/089a18dff289d4c58043c1957ad0d7fe73d814b3) (2026-11-02, changelog: #1855 under Unreleased). Apply them in filename order to a checkout of that commit:
+34 patches on upstream [TensorFold](https://github.com/ashhart/TensorFold) `main` at [`089a18dff289d4c58043c1957ad0d7fe73d814b3`](https://github.com/ashhart/TensorFold/commit/089a18dff289d4c58043c1957ad0d7fe73d814b3) (2026-11-02, changelog: #1855 under Unreleased). Apply them in filename order to a checkout of that commit:
 
 ```sh
 git clone https://github.com/ashhart/TensorFold.git && cd TensorFold
@@ -51,5 +51,6 @@ Kinds: **ours** (written for this series), **ours, adapting others' work** (writ
 | [0031](0031-small-decode-tiles-prealloc-moe-glue-beside-pack.patch) | flashnext: small decode tiles, preallocated prompt pool, MoE router glue, beside packing, fixes | tempeste | ours, adapting others' work | TF_FLASHNEXT_LATE_SKIP is ported from the idea of Picom-code's pico-dgx-qwen38 patch 0111 ([`0111-q38-drafted-windows-skip-deltanet-end-state-writes.patch`](https://github.com/Picom-code/pico-dgx-qwen38/blob/ba679439e8e87994223f15bca572376557061fea/tensorfold/patches/0111-q38-drafted-windows-skip-deltanet-end-state-writes.patch), Apache-2.0); rewritten, no code copied |
 | [0032](0032-reply-keep.patch) | flashnext: TF_FLASHNEXT_REPLY_KEEP, a finished reply keeps its lane's state for the next turn | tempeste | ours | This series |
 | [0033](0033-experts-topk.patch) | flashnext: TF_FLASHNEXT_EXPERTS_TOPK, route K of the model's 10 experts per token (default off) | tempeste | ours, adapting others' work | The idea of azampatti's 5-expert checkpoint [`Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound`](https://huggingface.co/azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound); no weights or code of it are used |
+| [0034](0034-beside-main-stream-priority.patch) | flashnext: with TF_FLASHNEXT_MIXED_BESIDE on, the main stream sits one priority step above the least, below the split-sum stream | tempeste | ours | This series |
 
 This file is not a patch: `git apply patches/*.patch` and the scripts read only the `.patch` files.

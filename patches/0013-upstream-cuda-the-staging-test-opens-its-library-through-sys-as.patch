@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: ashhart <71890694+ashhart@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 00:04:55 +0000
-Subject: [PATCH 13/33] cuda: the staging test opens its library through sys,
+Subject: [PATCH 13/34] cuda: the staging test opens its library through sys,
  as its sibling test does, so Windows builds it
 
 Upstream TensorFold commit by ashhart, ported onto this series (upstream main 9cab48d7ee0b).

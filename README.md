@@ -7,7 +7,7 @@ split across the two Sparks at `--tp 2`: one rank on each.
 This is the serving setup of a deployment that serves coding agents around the clock: **24 streams at once, each with
 a 409,600-token window** (YaRN factor 2 over the trained 262,144), an **NVFP4 KV cache**, a **45 GiB prompt cache** that
 keeps conversation states between agent turns, **routed experts in EXL3** (turboderp's 2.68 bpw quant) on NVIDIA's FP4
-checkpoint, MTP drafts, image input and tool calls. The engine changes it needs are a series of 33 patches on upstream
+checkpoint, MTP drafts, image input and tool calls. The engine changes it needs are a series of 34 patches on upstream
 TensorFold; `scripts/prepare.sh` clones TensorFold at a pinned commit, applies them with `git apply` and builds the
 image. The layout follows MiaAI-Lab's
 [Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold),
@@ -44,20 +44,22 @@ Whole-pair decode, tokens a second, 16 November:
 |---|---:|---:|---:|---:|---:|
 | **this recipe** (EXL3 experts, 24 × 409,600) | 78 | 101 | 171 | 260 | **379** |
 
-- This row is the engine as it served on 16 November; changes rolled after that day (among them beside packing and
-  reply-keep) are in the series but not in this row. The series' own engine on 20 November made 75 / 105 / 171 / 258 /
-  375 on the same benchmark ([Five experts](#five-experts-off-by-default)).
+- This row is the engine as it served on 16 November; changes rolled after that day (among them beside packing,
+  reply-keep and the main stream's priority with beside on) are in the series but not in this row. The series' own
+  engine on 20 November made 75 / 105 / 171 / 258 / 375 on the same benchmark
+  ([Five experts](#five-experts-off-by-default)).
 - The same engine with the checkpoint's own NVFP4 experts in place of EXL3 (`EXL3_EXPERTS=0`) made 60 / 94 / 162 /
   232 / 335 the same day.
 
 ### Prompt reading (lab)
 
-One request at a time, tokens a second. This recipe's row is the mean of 5 runs on 21 November, each after a fresh
-engine start (run-to-run spread under 1.5%):
+One request at a time, tokens a second. This recipe's row is the mean of 3 runs on 22 November, each after a fresh
+engine start (run-to-run spread under 1.5%), with the whole series through `patches/0034`; the engine before 0034,
+run in the same rounds, read 3,696 / 3,621 / 3,544 / 3,458:
 
 | | 4K | 32K | 131K | 262K |
 |---|---:|---:|---:|---:|
-| this recipe | 3,754 | 3,622 | 3,547 | 3,458 |
+| this recipe | 3,910 | 3,806 | 3,709 | 3,612 |
 
 ### Agent traffic (lab and real)
 
@@ -293,8 +295,8 @@ its earlier turns instead of reading the whole prompt again.
 Without a Spark (the details are in this repository's history and can be re-run):
 
 - `patches/` applies with `git apply` onto a fresh clone of TensorFold at `089a18dff` (`scripts/prepare.sh
-  --check-patches`), and the result is the deployment's engine tree plus the five-expert switch (`patches/0033`, off
-  by default), except reworded comments and strings.
+  --check-patches`), and the result is the deployment's engine tree, which carries the five-expert switch
+  (`patches/0033`, off by default), except reworded comments and strings.
 - The `docker run` commands `DRY_RUN=1 ./start.sh` prints match the deployment's launcher for both ranks: the same
   docker options, the same 113 container variables (all but the link's netdev, RoCE devices, GID index and the experts
   folder's path, which depend on the machine), and the same `serve` arguments except `--host` (the deployment binds
@@ -363,6 +365,6 @@ start.sh, stop.sh   start and stop both ranks
 scripts/            config.sh (settings), engine.env (the engine's variables), prepare.sh (image and weights on both
                     Sparks), nodes.sh (ssh and the link), local.sh.example, checkpoint.sha256, exl3-pack.sha256
 tools/              exl3_experts_pack.py (the per-rank EXL3 experts folder)
-patches/            0001-0033, applied to TensorFold at TF_REF in filename order
+patches/            0001-0034, applied to TensorFold at TF_REF in filename order
 CHANGELOG.md, CREDITS.md, LICENSE, NOTICE
 ```

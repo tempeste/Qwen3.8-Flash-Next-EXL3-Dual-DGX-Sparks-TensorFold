@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: tempeste <tempeste@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 19:45:40 +0000
-Subject: [PATCH 27/33] prompt cache: the newest-state eviction order is opt-in
+Subject: [PATCH 27/34] prompt cache: the newest-state eviction order is opt-in
  (TENSORFOLD_PCACHE_NEWEST=1)
 
 Keeps the previous eviction order unless TENSORFOLD_PCACHE_NEWEST=1, so the upstream port in the patch before this

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shuuul <6903405+shuuul@users.noreply.github.com>
 Date: Wed, 4 Nov 2026 14:03:58 +0000
-Subject: [PATCH 09/33] cuda: a fake driver pins the download staging path
+Subject: [PATCH 09/34] cuda: a fake driver pins the download staging path
 
 Upstream TensorFold commit by shuuul, ported onto this series (upstream main 36a87df7923d).
 

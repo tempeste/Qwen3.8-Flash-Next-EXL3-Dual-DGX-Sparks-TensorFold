@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: tempeste <tempeste@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 18:32:53 +0000
-Subject: [PATCH 04/33] flashnext: routed experts from an EXL3 checkpoint
+Subject: [PATCH 04/34] flashnext: routed experts from an EXL3 checkpoint
  (TF_FLASHNEXT_EXPERTS_EXL3=DIR)
 
 Loads Flash Next's routed experts from an EXL3 folder (such as turboderp's Qwen3.8-Flash-Next-exl3) and serves them
