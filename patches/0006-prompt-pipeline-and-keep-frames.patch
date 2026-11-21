@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: tempeste <tempeste@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 05:03:21 +0000
-Subject: [PATCH 06/34] flashnext: prompt pipeline, overlap, keep frames and
- NVFP4 prompt attention, each behind its own flag
+Subject: [PATCH] flashnext: prompt pipeline, overlap, keep frames and NVFP4
+ prompt attention, each behind its own flag
 
 Mixed-round sizing tables, the prompt hooks carried to the --tp 2 follower, bf16 scatter, n-gram hints beside the
 pass, the MTP head's prompt rows as a prompt pass, an MXFP8 lane tile, permuted code pairs, gathers and router work

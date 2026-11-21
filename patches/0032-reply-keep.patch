@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: tempeste <tempeste@users.noreply.github.com>
 Date: Fri, 20 Nov 2026 00:04:29 +0000
-Subject: [PATCH 32/34] flashnext: TF_FLASHNEXT_REPLY_KEEP, a finished reply
- keeps its lane's state for the next turn
+Subject: [PATCH] flashnext: TF_FLASHNEXT_REPLY_KEEP, a finished reply keeps
+ its lane's state for the next turn
 
 A finished reply keeps its lane's state, so the turn that extends the reply resumes past it instead of re-reading
 it. Off unless TF_FLASHNEXT_REPLY_KEEP=1.

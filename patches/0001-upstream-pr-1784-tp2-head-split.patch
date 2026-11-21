@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: laudney <106273+laudney@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 19:42:48 +0000
-Subject: [PATCH 01/34] upstream: Flash Next at --tp 2, PR #1784 (laudney) as
- this series carries it
+Subject: [PATCH] upstream: Flash Next at --tp 2, PR #1784 (laudney) as this
+ series carries it
 
 Upstream TensorFold PR #1784 by laudney: --tp 2 for the CUDA families with ranks, the ranks' checkpoint digest,
 BF16 dense and shared layers and FP8 n-gram rows and MTP experts in ModelOpt checkpoints, one GPU's expert sums at

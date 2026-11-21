@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: laudney <106273+laudney@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 14:45:31 +0000
-Subject: [PATCH 14/34] fix(lanes): release a stream that finishes on its first
- token
+Subject: [PATCH] fix(lanes): release a stream that finishes on its first token
 
 Upstream TensorFold commit by laudney, ported onto this series (upstream main ed39acc5aac1).
 

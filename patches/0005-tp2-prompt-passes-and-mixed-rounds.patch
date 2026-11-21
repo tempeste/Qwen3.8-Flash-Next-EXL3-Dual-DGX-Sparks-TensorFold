@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: tempeste <tempeste@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 16:57:54 +0000
-Subject: [PATCH 05/34] flashnext: --tp 2 prompt passes, mixed rounds and
- prompt tiles, each behind its own flag
+Subject: [PATCH] flashnext: --tp 2 prompt passes, mixed rounds and prompt
+ tiles, each behind its own flag
 
 Prompt-side work at --tp 2: a shared-prefix keep threshold for the prompt cache, batched keep frames, prompt chunks
 queued without a drain, mixed rounds (a prompt piece inside a decode round's forward), split rank sums, sequence-

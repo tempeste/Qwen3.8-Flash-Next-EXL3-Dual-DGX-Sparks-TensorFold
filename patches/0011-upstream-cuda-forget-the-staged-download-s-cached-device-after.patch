@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: shuuul <6903405+shuuul@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 10:46:33 +0000
-Subject: [PATCH 11/34] cuda: forget the staged download's cached device after
- its tests
+Subject: [PATCH] cuda: forget the staged download's cached device after its
+ tests
 
 Upstream TensorFold commit by shuuul, ported onto this series (upstream main 1d891001b989).
 

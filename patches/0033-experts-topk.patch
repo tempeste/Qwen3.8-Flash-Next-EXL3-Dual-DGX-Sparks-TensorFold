@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: tempeste <tempeste@users.noreply.github.com>
 Date: Fri, 20 Nov 2026 06:44:04 +0000
-Subject: [PATCH 33/34] flashnext: TF_FLASHNEXT_EXPERTS_TOPK, route K of the
- model's 10 experts per token (default off)
+Subject: [PATCH] flashnext: TF_FLASHNEXT_EXPERTS_TOPK, route K of the model's
+ 10 experts per token (default off)
 
 Routes the top K of the model's 10 experts per token. Unset, routing is the model's own 10 experts and the engine is
 unchanged.

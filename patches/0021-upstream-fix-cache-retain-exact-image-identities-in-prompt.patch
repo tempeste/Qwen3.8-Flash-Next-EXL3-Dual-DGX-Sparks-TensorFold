@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: laudney <106273+laudney@users.noreply.github.com>
 Date: Mon, 2 Nov 2026 01:47:52 +0000
-Subject: [PATCH 21/34] fix(cache): retain exact image identities in prompt
- states
+Subject: [PATCH] fix(cache): retain exact image identities in prompt states
 
 Upstream TensorFold commit by laudney, ported onto this series (upstream main 1db545bd645e).
 

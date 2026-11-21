@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: tempeste <tempeste@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 18:46:27 +0000
-Subject: [PATCH 25/34] build: test-up126-host runs the host tests of the
- upstream ports above
+Subject: [PATCH] build: test-up126-host runs the host tests of the upstream
+ ports above
 
 A build step that runs the host tests of the upstream commits ported in the patches before this one.
 

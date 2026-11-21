@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Armin <2369138+Arminova@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 18:43:28 +0000
-Subject: [PATCH 18/34] flashnext cuda: the grouped draft head's lanes carry
- their page table
+Subject: [PATCH] flashnext cuda: the grouped draft head's lanes carry their
+ page table
 
 Upstream TensorFold commit by Armin, ported onto this series (upstream main 4b2679bf9701).
 

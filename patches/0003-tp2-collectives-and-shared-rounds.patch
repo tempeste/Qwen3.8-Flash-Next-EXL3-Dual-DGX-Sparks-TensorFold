@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: tempeste <tempeste@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 16:24:38 +0000
-Subject: [PATCH 03/34] flashnext: --tp 2 collectives and shared decode rounds,
- each behind its own flag
+Subject: [PATCH] flashnext: --tp 2 collectives and shared decode rounds, each
+ behind its own flag
 
 Cheaper --tp 2 collectives (fused reductions, no host poll, LM-head rows in one gather, a rank's own MoE slots,
 the shared partial summed in place, a RoCE one-shot path for small gathers and sums), wider shared rounds (32 draft

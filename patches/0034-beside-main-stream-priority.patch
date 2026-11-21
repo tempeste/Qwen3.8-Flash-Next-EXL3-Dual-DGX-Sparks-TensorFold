@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: tempeste <tempeste@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 16:54:52 +0000
-Subject: [PATCH 34/34] flashnext: with TF_FLASHNEXT_MIXED_BESIDE on, the main
- stream sits one priority step above the least, below the split-sum stream
+Subject: [PATCH] flashnext: with TF_FLASHNEXT_MIXED_BESIDE on, the main stream
+ sits one priority step above the least, below the split-sum stream
 
 With TF_FLASHNEXT_MIXED_BESIDE on, the main stream was created at the highest stream priority, so that decode rounds
 outrank the beside piece's stream. The split sums' stream (TF_FLASHNEXT_TP_SPLIT_SUM) is also at the highest, so that
