@@ -265,7 +265,7 @@ Less common: `MODEL_ID` / `MODEL_REVISION`, `EXL3_REPO` / `EXL3_REVISION` / `EXL
 deployment serves with (and `NCCL_MAX_NCHANNELS=4`), grouped by the patch that adds each; each patch's message
 describes its flags ("Flags this patch adds"). `start.sh` passes them to both ranks, which compare their settings when
 they connect. Any of these names set in the environment, `scripts/local.sh` (exported) or `.env` replaces the file's
-value; `ENGINE_UNSET="A B"` leaves names out. `TENSORFOLD_API_KEY` (the server's API keys) goes to rank 0 by name only.
+value; `ENGINE_UNSET="A B"` leaves names out. `TENSORFOLD_API_KEY` (the server's API keys) goes to rank 0 by name only. With the default `HOST=0.0.0.0` and no key, anyone who can reach port 8000 can use the model: set a key, or `HOST=127.0.0.1` behind your own gateway.
 
 What the defaults are, in short:
 
