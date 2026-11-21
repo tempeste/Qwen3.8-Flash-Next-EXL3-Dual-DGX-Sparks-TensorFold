@@ -50,14 +50,14 @@ Whole-pair decode, tokens a second, 16 November:
 - The same engine with the checkpoint's own NVFP4 experts in place of EXL3 (`EXL3_EXPERTS=0`) made 60 / 94 / 162 /
   232 / 335 the same day.
 
-### Prompt reading (lab) — being re-measured
+### Prompt reading (lab)
 
-**Being re-measured:** a new run of this table is in progress, and these figures from 16 November may change. One
-request at a time, tokens a second:
+One request at a time, tokens a second. This recipe's row is the mean of 5 runs on 21 November, each after a fresh
+engine start (run-to-run spread under 1.5%):
 
 | | 4K | 32K | 131K | 262K |
 |---|---:|---:|---:|---:|
-| this recipe | 4,147 | 3,830 | 3,714 | 3,617 |
+| this recipe | 3,754 | 3,622 | 3,547 | 3,458 |
 
 ### Agent traffic (lab and real)
 
