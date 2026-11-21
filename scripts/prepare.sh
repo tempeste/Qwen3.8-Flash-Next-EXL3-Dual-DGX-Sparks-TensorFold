@@ -230,23 +230,78 @@ snapshot_download(sys.argv[1], revision=sys.argv[2], cache_dir=sys.argv[3], allo
   log "Checkpoint OK: $snap"
 
   # -------------------------------------------------------------- 5. EXL3 experts (head)
+  # A folder that already holds the pinned files, the index and manifest.json (the engine reads both) is used as it is.
+  # The worker's folder is looked at first: while it lacks rank 1's files the head needs both ranks' to copy from.
+  # A marker (.ok-head, .ok-worker) is trusted only while every pinned file it covers is there at its pinned size.
   pack=$(pack_dir)
   PACK_PINS=$PWD/scripts/exl3-pack.sha256
+  pinned_sums() { awk -v r="experts-r$1-" '($1 == "file" && index($3, r) == 1) || $1 == "index" { print $2 "  " $3 }' "$PACK_PINS"; }
+  pinned_sizes() { awk -v r="experts-r$1-" '$1 == "file" && index($3, r) == 1 { print $4 " " $3 }' "$PACK_PINS"; }
+  pins_complete() {
+    awk -v r="experts-r$1-" '
+      function sha(x) { return length(x) == 64 && x !~ /[^0-9a-f]/ }
+      $1 == "file" && index($3, r) == 1 {
+        if (!sha($2) || $4 !~ /^[0-9]+$/ || ($3 in seen) || !match($3, /-of-[0-9]+\.safetensors$/)) bad = 1
+        t = substr($3, RSTART + 4, RLENGTH - 16) + 0
+        if (n && t != of) bad = 1
+        seen[$3]; n++; of = t
+      }
+      $1 == "index" { i++; if (!sha($2) || $3 != "model.safetensors.index.json") bad = 1 }
+      END { exit !(!bad && n > 0 && n == of && i == 1) }' "$PACK_PINS"
+  }
+  sizes_match() {
+    local dir=$1 size name; shift
+    [[ -s "$dir/model.safetensors.index.json" && -s "$dir/manifest.json" ]] || return 1
+    while read -r size name; do
+      [[ "$(stat -c %s -- "$dir/$name" 2>/dev/null)" == "$size" ]] || return 1
+    done < <(for r in "$@"; do pinned_sizes "$r"; done)
+  }
+  worker_ok=0
+  if [[ "$EXL3_EXPERTS" == 1 ]]; then
+    { pins_complete 0 && pins_complete 1; } ||
+      die "scripts/exl3-pack.sha256 does not list every expert file of both ranks (file lines n-of-N, N of them) and one index line"
+    wpack="$WORKER_HF/$EXL3_PACK"
+    if worker 1 "test -f '$wpack/.ok-worker'"; then
+      if pinned_sizes 1 | worker 1 "cd '$wpack' && test -s model.safetensors.index.json && test -s manifest.json &&
+           while read -r s n; do test \"\$(stat -c %s -- \"\$n\" 2>/dev/null)\" = \"\$s\" || exit 1; done"; then
+        worker_ok=1
+      else
+        log "The worker's $wpack/.ok-worker is stale (a pinned file is missing or of another size): checking it again"
+        worker 1 "rm -f '$wpack/.ok-worker'"
+      fi
+    fi
+    if (( ! worker_ok )) && pinned_sums 1 |
+         worker 1 "cd '$wpack' 2>/dev/null && test -s manifest.json && sha256sum -c --quiet >/dev/null 2>&1"; then
+      log "The worker's $wpack already holds rank 1's EXL3 experts, the index and manifest.json, matching scripts/exl3-pack.sha256: nothing copied"
+      worker 1 "touch '$wpack/.ok-worker'"
+      worker_ok=1
+    fi
+    head_ranks=(0); (( worker_ok )) || head_ranks=(0 1)
+    if [[ -f "$pack/.ok-head" ]] && ! sizes_match "$pack" "${head_ranks[@]}"; then
+      log "$pack/.ok-head is stale for ranks ${head_ranks[*]} (a pinned file is missing or of another size): checking it again"
+      rm -f -- "$pack/.ok-head"
+    fi
+  fi
   if [[ "$EXL3_EXPERTS" == 1 && ! -f "$pack/.ok-head" ]]; then
     mkdir -p "$pack"
-    case "$EXL3_SOURCE" in
-      range)
-        log "Fetching the routed experts of $EXL3_REPO @ ${EXL3_REVISION:0:8} ($EXL3_BRANCH) by range into $pack (~37.5 GiB, resumes)"
-        python3 -I tools/exl3_experts_pack.py fetch --repo "$EXL3_REPO" --rev "$EXL3_REVISION" --shards "$EXL3_SHARDS" \
-          --out "$pack" --ranks 0,1 --pins "$PACK_PINS" --limit-rate "$EXL3_LIMIT_RATE" ;;
-      download)
-        log "Downloading $EXL3_REPO @ ${EXL3_REVISION:0:8} ($EXL3_BRANCH), its model shards (~43.4 GiB, resumes)"
-        hf_download "$EXL3_REPO" "$EXL3_REVISION" 'model-*.safetensors' || die "$EXL3_REPO: the download failed"
-        src="$HF_CACHE/hub/models--${EXL3_REPO//\//--}/snapshots/$EXL3_REVISION"
-        python3 -I tools/exl3_experts_pack.py extract --repo "$EXL3_REPO" --rev "$EXL3_REVISION" --shards "$EXL3_SHARDS" \
-          --src "$src" --out "$pack" --ranks 0,1 --pins "$PACK_PINS" --check-shards ;;
-      *) die "EXL3_SOURCE is range or download, not $EXL3_SOURCE" ;;
-    esac
+    if [[ -s "$pack/manifest.json" ]] && { for r in "${head_ranks[@]}"; do pinned_sums "$r"; done; } | LC_ALL=C sort -u |
+         (cd "$pack" && sha256sum -c --quiet >/dev/null 2>&1); then
+      log "$pack already holds the EXL3 experts of ranks ${head_ranks[*]}, the index and manifest.json, matching scripts/exl3-pack.sha256: nothing fetched"
+    else
+      case "$EXL3_SOURCE" in
+        range)
+          log "Fetching the routed experts of $EXL3_REPO @ ${EXL3_REVISION:0:8} ($EXL3_BRANCH) by range into $pack (~37.5 GiB, resumes)"
+          python3 -I tools/exl3_experts_pack.py fetch --repo "$EXL3_REPO" --rev "$EXL3_REVISION" --shards "$EXL3_SHARDS" \
+            --out "$pack" --ranks 0,1 --pins "$PACK_PINS" --limit-rate "$EXL3_LIMIT_RATE" ;;
+        download)
+          log "Downloading $EXL3_REPO @ ${EXL3_REVISION:0:8} ($EXL3_BRANCH), its model shards (~43.4 GiB, resumes)"
+          hf_download "$EXL3_REPO" "$EXL3_REVISION" 'model-*.safetensors' || die "$EXL3_REPO: the download failed"
+          src="$HF_CACHE/hub/models--${EXL3_REPO//\//--}/snapshots/$EXL3_REVISION"
+          python3 -I tools/exl3_experts_pack.py extract --repo "$EXL3_REPO" --rev "$EXL3_REVISION" --shards "$EXL3_SHARDS" \
+            --src "$src" --out "$pack" --ranks 0,1 --pins "$PACK_PINS" --check-shards ;;
+        *) die "EXL3_SOURCE is range or download, not $EXL3_SOURCE" ;;
+      esac
+    fi
     touch "$pack/.ok-head"
   fi
   [[ "$EXL3_EXPERTS" == 1 ]] && log "EXL3 experts OK: $pack"
@@ -281,24 +336,24 @@ snapshot_download(sys.argv[1], revision=sys.argv[2], cache_dir=sys.argv[3], allo
   fi
   log "Worker has $MODEL_ID @ ${MODEL_REVISION:0:8}"
   if [[ "$EXL3_EXPERTS" == 1 ]]; then
-    wpack="$WORKER_HF/$EXL3_PACK"
-    r1=$(grep -o 'experts-r1-[0-9]*-of-[0-9]*\.safetensors' "$pack/SHA256SUMS" | LC_ALL=C sort -u)
-    [[ -n "$r1" ]] || die "$pack/SHA256SUMS names no rank 1 files"
-    if ! worker 1 "test -f '$wpack/.ok-worker'"; then
+    mapfile -t r1 < <(pinned_sizes 1 | awk '{ print $2 }')
+    if (( ! worker_ok )); then
       log "Copying rank 1's experts to the worker ($wpack)"
       worker 1 "mkdir -p '$wpack'"
-      for f in model.safetensors.index.json manifest.json SHA256SUMS $r1; do
-        [[ -f "$pack/$f" ]] || die "$pack/$f is missing here (EXL3_PRUNE removed it? delete $pack/.ok-head and rerun)"
+      files=(model.safetensors.index.json manifest.json "${r1[@]}")
+      [[ -f "$pack/SHA256SUMS" ]] && files+=(SHA256SUMS)
+      for f in "${files[@]}"; do
+        [[ -f "$pack/$f" ]] || die "$pack/$f is missing here: delete $pack/.ok-head and $pack/state/done.txt and rerun"
         rsync -a --partial "$pack/$f" "$WORKER:$wpack/$f" -e "ssh -o BatchMode=yes"
       done
-      grep -E ' experts-r1-' "$pack/SHA256SUMS" | worker 1 "cd '$wpack' && sha256sum -c --quiet" ||
-        die "rank 1's experts on the worker do not match SHA256SUMS"
+      pinned_sums 1 | worker 1 "cd '$wpack' && sha256sum -c --quiet" ||
+        die "rank 1's experts or the index on the worker do not match scripts/exl3-pack.sha256"
       worker 1 "touch '$wpack/.ok-worker'"
     fi
     log "Worker has rank 1's EXL3 experts"
     # rank 0 reads only its own files: EXL3_PRUNE=1 (the default) removes rank 1's from the head once the worker has them
     if [[ "${EXL3_PRUNE:-1}" == 1 ]]; then
-      for f in $r1; do rm -f -- "${pack:?}/$f"; done
+      for f in "${r1[@]}"; do rm -f -- "${pack:?}/$f"; done
     fi
   fi
 fi

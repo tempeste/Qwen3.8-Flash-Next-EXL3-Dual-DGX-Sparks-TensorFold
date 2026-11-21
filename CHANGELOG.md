@@ -4,6 +4,13 @@ Every change to this recipe, newest first.
 
 ## Unreleased: first version
 
+- **Experts already in place**: `scripts/prepare.sh` uses an `EXL3_PACK` folder that already holds `manifest.json`
+  and, with the sums in `scripts/exl3-pack.sha256`, the index and a Spark's own rank's files (on the head also rank 1's
+  while the worker lacks them), instead of fetching or copying them again. The worker's copy is checked against those
+  pins, not the head's `SHA256SUMS`, which is optional. `.ok-head` and `.ok-worker` are dropped when a pinned file is
+  missing or of another size; prepare.sh stops when the pins file lacks a file or index line; the fetch refuses to
+  write through a symlink or hard link, and re-fetches the ranges of an output file it had to create again (rank 1's
+  after `EXL3_PRUNE`) even when `state/done.txt` lists them.
 - **The engine** (`patches/0001`-`0034`): TensorFold upstream `main` at `089a18dff` plus Flash Next at `--tp 2`
   (upstream PR #1784), two-rank KV formats and prompt-cache snapshots, collectives and shared decode rounds, routed
   experts from EXL3, prompt passes and mixed rounds, the prompt pipeline, batched picks and shared kept rows, 19 ported

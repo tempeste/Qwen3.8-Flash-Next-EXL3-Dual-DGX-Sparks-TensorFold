@@ -225,10 +225,18 @@ def write_index(out, ranks, source):
     os.replace(tmp, os.path.join(out, "model.safetensors.index.json"))
 
 
+def refuse_link(p):
+    if os.path.islink(p) or (os.path.exists(p) and os.stat(p).st_nlink > 1):
+        sys.exit(f"{p} is a symlink or a hard link to another file; refusing to write through it: remove the link here"
+                 " (the file it points to stays) or give a fresh output folder (EXL3_PACK for scripts/prepare.sh)")
+
+
 def prepare_outputs(out, ranks, want):
+    fresh = set()
     for rank in want:
         for f in ranks[rank]["files"]:
             p = os.path.join(out, f["file"])
+            refuse_link(p)
             total = 8 + len(f["raw"]) + f["data"]
             head = struct.pack("<Q", len(f["raw"])) + f["raw"]
             if os.path.exists(p) and os.path.getsize(p) == total:
@@ -239,6 +247,15 @@ def prepare_outputs(out, ranks, want):
             with open(p, "wb") as h:
                 h.write(head)
                 h.truncate(total)
+            fresh.add(f["file"])
+    return fresh
+
+
+def write_sums(out, lines):
+    tmp = os.path.join(out, "SHA256SUMS.tmp")
+    with open(tmp, "w") as o:
+        o.writelines(lines)
+    os.replace(tmp, os.path.join(out, "SHA256SUMS"))
 
 
 def write_manifest(out, ranks, repo, rev):
@@ -254,11 +271,7 @@ def write_manifest(out, ranks, repo, rev):
     with open(os.path.join(out, "manifest.json.tmp"), "w") as o:
         json.dump(m, o, indent=1)
     os.replace(os.path.join(out, "manifest.json.tmp"), os.path.join(out, "manifest.json"))
-    with open(os.path.join(out, "SHA256SUMS"), "w") as o:
-        for r in m["ranks"].values():
-            for f in r["files"]:
-                if f["sha256"]:
-                    o.write(f"{f['sha256']}  {f['file']}\n")
+    write_sums(out, [f"{f['sha256']}  {f['file']}\n" for r in m["ranks"].values() for f in r["files"] if f["sha256"]])
 
 
 def pinned_sums(pins, ranks):
@@ -278,10 +291,7 @@ def finish(args, ranks, want, pins):
     else:
         sums = pinned_sums(pins, ranks)
         if sums:
-            with open(os.path.join(args.out, "SHA256SUMS"), "w") as o:
-                for rank in ranks:
-                    for name, sha in sums[rank].items():
-                        o.write(f"{sha}  {name}\n")
+            write_sums(args.out, [f"{sha}  {name}\n" for rank in ranks for name, sha in sums[rank].items()])
             log(args.out, f"SHA256SUMS written from the pins (only ranks {want} are here)")
     if pins["file"]:
         verify_files(args.out, ranks, want, pins)
@@ -345,9 +355,14 @@ def fetch(args, pins):
     if args.only:
         for rank in want:
             ranks[rank]["files"] = [f for f in ranks[rank]["files"] if f["file"] == args.only] or ranks[rank]["files"]
-    prepare_outputs(args.out, ranks, want)
+    fresh = prepare_outputs(args.out, ranks, want)
     done_path = os.path.join(args.out, "state", "done.txt")
     done = set(open(done_path).read().split("\n")) if os.path.exists(done_path) else set()
+    stale = {f"{s} {a} {b}" for s, a, b, ts in plan if any(t[2] in fresh for t in ts)} & done
+    if stale:
+        done -= stale
+        log(args.out, f"{len(stale)} ranges in state/done.txt write into files created just now ({', '.join(sorted(fresh))}):"
+            " fetching them again")
     part, keyf = os.path.join(args.out, "part.bin"), os.path.join(args.out, "state", "part.key")
     got, t0 = sum(b - a for s, a, b, _ in plan if f"{s} {a} {b}" in done), time.time()
     got0 = got

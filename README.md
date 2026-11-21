@@ -204,10 +204,18 @@ after the defaults (`./start.sh restart --max-tokens 16384`).
 4. The checkpoint at its pin, into `~/.cache/huggingface`, checked file by file against `scripts/checkpoint.sha256`
    (the Hub's sha256 of every large file).
 5. The EXL3 experts into `~/.cache/huggingface/exl3-experts-2.68bpw` by `tools/exl3_experts_pack.py` (below), each
-   output file checked against `scripts/exl3-pack.sha256`.
+   output file checked against `scripts/exl3-pack.sha256`. A folder there (`EXL3_PACK`) that already holds
+   `manifest.json` and, with those sums, the index and rank 0's files is used as it is, and nothing is fetched; while
+   the worker lacks rank 1's files, the head's folder must hold rank 1's too (it copies them), or they are fetched
+   again.
 6. The worker's copy: the checkpoint over the link with `rsync` (then checked against `scripts/checkpoint.sha256`
-   there), and rank 1's expert files with the index (checked against `SHA256SUMS` there). Rank 1's files are then
-   removed from the head (`EXL3_PRUNE=0` keeps them).
+   there), and rank 1's expert files with the index and `manifest.json` (and `SHA256SUMS` when the head has one),
+   checked against `scripts/exl3-pack.sha256` there. A worker folder that already holds them with the pinned sums is
+   not copied to. Rank 1's files are then removed from the head (`EXL3_PRUNE=0` keeps them).
+
+The ready markers (`.ok-head`, `.ok-worker` in the experts folders) are trusted only while every pinned file they cover
+is there at its pinned size; otherwise the folder is checked again. The fetch refuses to write into an output file that
+is a symlink or has another hard link: remove the link or give a fresh `EXL3_PACK` folder.
 
 `scripts/prepare.sh --check-patches [DIR]` clones TensorFold at `TF_REF` and applies the patches without docker.
 
