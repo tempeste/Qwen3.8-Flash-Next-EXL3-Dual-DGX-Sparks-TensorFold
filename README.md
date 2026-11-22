@@ -23,8 +23,11 @@ whose scripts this recipe adapts ([`CREDITS.md`](CREDITS.md)).
 
 **Status.** The patch series, the image recipe, the launch command and the engine settings are those of the deployment
 the numbers below come from, and were checked against it without a Spark (see [What was checked](#what-was-checked)).
-The scripts in this form have not yet been run end to end on a pair of Sparks: treat the first run as a test, and
-report what breaks.
+On 22 Nov the scripts were run end to end on a pair of Sparks from a fresh clone: `prepare.sh` built the image from
+upstream TensorFold and these patches, checked the already-downloaded weights against the pinned sums, and `start.sh`
+served replies byte-identical to the deployment's (3 of 3 greedy, 4 of 4 seeded sampled). The weights download was
+exercised only for its first 256 MiB (it matched the pinned files byte for byte), and the experts-reuse step was
+rechecked on the Sparks on 23 Nov after a revision. Report what breaks on other setups.
 
 ## Performance and accuracy
 
