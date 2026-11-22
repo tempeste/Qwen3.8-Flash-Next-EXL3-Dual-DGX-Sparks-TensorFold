@@ -34,11 +34,86 @@ own logs under real agent traffic (**real**). **Every Spark ran with its GPU clo
 reports a default of 2,418 MHz. This recipe does not set the cap, so an uncapped pair may differ, most likely in prompt
 reading, which is bound by compute. Every before and after below ran on the same Sparks at the same cap.
 
+### Where this work started
+
+This work started from MiaAI-Lab's single-Spark recipe,
+[Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/tree/20e15e41f2f514a0d287710f4665ee1b5009ba41):
+one TensorFold engine on one Spark (TP=1). Patches 0002-0003 port its patches 0001-0017 ([`CREDITS.md`](CREDITS.md)).
+On 16 November it was run on these Sparks as published (its image, TensorFold v1.1.4; NVIDIA's FP4 checkpoint; fp8 KV
+cache; 5 streams × 262,144 tokens and a 4.2-4.7 GiB prompt cache a Spark), one copy on each Spark behind a relay that
+keeps a conversation on one Spark. The benchmark is MiaAI-Lab's [sparkDash](https://github.com/MiaAI-Lab/sparkDash): its
+decode test sends a short prose prompt (~80 tokens) and asks for 400 tokens at temperature 0.7 with thinking on, so it
+is close to decode-only load, not agent traffic; its prompt-reading test sends one prompt at a time.
+
+The single-Spark setup serves **10 streams × 262,144 tokens for the pair** (5 a Spark); this recipe serves **24 streams
+× 409,600 tokens** across both Sparks, with a 45 GiB prompt cache.
+
+| | streams × window | date, runs | decode 1 | 2 | 4 | 8 | 16 | prompt 4K | 32K | 131K | 262K |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| TP=1 recipe, one Spark | 5 × 262,144 | 16 Nov, 1 run | 51 | not measured | not measured | not measured | not measured | 2,314 | 2,133 | 1,950 | does not fit |
+| TP=1 recipe × 2, one copy a Spark | 10 × 262,144 | 16 Nov, 1 run | 51 | 85 | 151 | 193 | 209 | 2,314 | 2,133 | 1,950 | does not fit |
+| this recipe, engine of 16 Nov | 24 × 409,600 | 16 Nov, 1 run | 78 | 101 | 171 | 260 | 379 | 4,147 | 3,830 | 3,714 | 3,617 |
+| this recipe, engine of 20 Nov | 24 × 409,600 | 20 Nov, median of 3 | 75 | 105 | 171 | 258 | 375 | not listed | not listed | not listed | not listed |
+| this recipe, through `patches/0034` | 24 × 409,600 | 22 Nov, mean of 3 | not measured | not measured | not measured | not measured | not measured | 3,910 | 3,806 | 3,709 | 3,612 |
+
+Tokens a second, decode for all streams together (lab).
+
+- **One Spark.** At 1 stream the relay sends the one request to one Spark, and prompt reading runs one request at a
+  time, so those cells are one Spark's figures. The TP=1 recipe on one Spark at 2-16 streams was not measured.
+- **Above 10 streams** the TP=1 pair has no free stream, so at 16 streams six requests queue at the relay.
+- **262K** does not fit the TP=1 recipe's 262,144-token window with the template and the reply (sparkDash's own
+  "Skipped" row).
+- **Run counts.** The 16 November rows are one sparkDash run each; within a run its prompt reading is the mean of 3
+  samples at 4K and 32K and 2 at 131K, and 1 at 262K. This recipe's 16 November 4K figure was high for its build: five
+  later runs of the same build averaged 3,944. The 22 November row is the mean of 3 runs, each after a fresh engine
+  start (run-to-run spread under 1.5%).
+- The 16 November engine predates beside packing, reply-keep and the main stream's priority with beside on; the 20
+  November engine carries everything through `patches/0033` (five experts off); its prompt reading is not listed here
+  because the 22 November row, through `patches/0034`, is the engine this recipe ships. Decode through `patches/0034`
+  was not measured on this benchmark.
+
+### From the single-Spark recipe to this one
+
+The changes in build order, with what each gained when it was measured. Each gain is that change against the engine
+just before it, on the measure named; the measures differ from row to row, so the gains do not add up or chain.
+"Not measured alone" means no clean before and after of that change exists.
+
+| change (date) | gain | measure | lab or real |
+|---|---|---|---|
+| **Start:** the single-Spark recipe, one copy a Spark (16 Nov) | where this started: decode 51 / 85 / 151 / 193 / 209 at 1-16 streams for the pair; prompt reading 2,314 / 2,133 / 1,950 at 4K / 32K / 131K | sparkDash decode and prompt reading, 1 run (table above) | lab |
+| Two ranks at TP=2, one a Spark (upstream PR #1784's head split; before 8 Nov) | not measured alone | measured later against stock upstream TensorFold v1.2.8, one engine a Spark, not against the start row: that fits 3 streams a Spark against the pair's 24, and on replayed agent traffic finished 29 requests in 0.22 h against the pair's 178 in 0.20 h (14 Nov) | lab |
+| NVFP4 KV cache (before 8 Nov) | not measured alone | | |
+| EXL3 routed experts on the FP4 checkpoint (before 8 Nov) | decode 78 / 101 / 171 / 260 / 379 against 60 / 94 / 162 / 232 / 335 with the checkpoint's own NVFP4 experts; prompt reading 4,147 / 3,830 / 3,714 / 3,617 against 3,792 / 3,663 / 3,584 / 3,487 at 4K-262K | sparkDash, the 16 Nov engine with and without EXL3 experts, 1 run each, measured after the fact (16 Nov) | lab |
+| Keep and frame-ordering settings for the TP=2 prompt path (8 Nov) | decode +18.8%, prompt reading +12.9%, token-exact | an agent-traffic benchmark | lab |
+| Prompt-visit time budget (8 Nov) | worst decode stall cut by a third | longest decode stall | lab |
+| Draft-head prompt idle fixes (8 Nov) | 12% more agent turns finished, equal quality | agent turns finished in a fixed time | lab |
+| Larger RoCE messages, one attention launch a round, batched draft picks (8 Nov) | 28-stream decode round 172 → 146 ms, equal tokens | decode round time | lab |
+| Batched verify picks (9 Nov) | decode +9% beside a long prompt, token-exact | decode beside a long prompt | lab |
+| Decode HC split (10 Nov) | decode +6.5% at 27 streams, token-exact | decode-only | lab |
+| Exact sequence-parallel sums (10 Nov) | prompt reading +1.65%, first replies ~2% sooner | prompt reading | lab |
+| Mixed rounds: a prompt piece rides a decode round (10 Nov) | prompt reading while streams fill +21.6%, decode a stream +8.2% | mixed prompt and decode load | lab |
+| Riding-piece fix (10 Nov) | decode +7.2%, prompt reading +7.1% at 28 streams | mixed load | lab |
+| Four prompt-front settings (11 Nov) | cold prompt reading +9.5%, first-token time p50 −18.9% | mixed load | lab |
+| Five DeltaNet and prompt-sum settings (11 Nov) | full-load decode and prompt reading +7.5%, stream gaps over 1 s −66% | full load | lab |
+| Newer CUDA user-mode driver from the image (12 Nov) | decode a round +8.3% at light load; on the deployment +7.9% to +8.7% decode rounds a second a stream | light-load decode (lab); production hours before and after (real, observational) | lab and real |
+| Picture prompts at text speed (12 Nov) | a picture prompt reads in 1.02x the time of text (was 1.7x) | picture-prompt reading | lab |
+| 409,600-token window, kept pictures not encoded again (13 Nov) | warm first token at 20 pictures 16.5 → 1.56 s; busy decode 169.3 against 172.4 (1 run each) | picture conversations | lab |
+| Expert re-route (13 Nov; changes replies) | speed not measured alone (within noise); the busier rank reads 33.5% fewer expert bytes at 17-32 rows; quality 383 against 382 of 421 | expert bytes a round; a 421-task quality evaluation | lab |
+| Prompt cache 30 → 45 GiB (13 Nov) | not measured alone | | |
+| Prompt-cache row sharing (14 Nov) | cold re-reads 18 of 24 → 10 of 73 returning conversations; first-token p50 68 → 4.9 s; speed +0.2% (within noise) | a prompt-cache replay | lab |
+| Decode beside a prompt read: long prompt pieces on their own stream (14 Nov; fixed 16 Nov) | whole pair +27.8% / +24.8% / +13.7% at 8 / 16 / 24 streams; decode a stream beside a read +82% / +121% / +123%; prompt rows a second −32% / −32% / −28% | replayed agent traffic, 3 interleaved repeats | lab |
+| Late skip: short drafted windows skip DeltaNet end-state writes (16 Nov; idea from Picom-code) | +1.5% to +2.1% at 8-24 streams, within noise; exact | decode-only, 1 run a level | lab |
+| Any-size packing (relaxed; 18 Nov) | whole pair +1.6% and new prompt rows a second +2.6% at 16 streams; quality pass; no pack was logged, so the gain is not shown to come from packing | replayed agent traffic, 4 runs against 3 | lab |
+| Shared-prefix keep (19 Nov) | not measured alone | | |
+| Reply keep (relaxed; 20 Nov) | rows read a follow-up 11,827 → 1,611, first-token p50 6.85 → 1.10 s; decode gain not measured alone; on the deployment, 542,927 prompt rows not read again in its first 3 hours | a follow-up workload (lab); the engine's counters (real) | lab and real |
+| Stream-priority fix with beside on (22 Nov) | lone prompts read +4.4% to +5.8% faster at 4K-262K; replies byte-equal | sparkDash prompt reading, 3 fresh-start runs a build, alternated | lab |
+
+The changes from 8 November on were measured on one pair against the engine it then served; re-route, prompt-cache
+row sharing, reply keep and the priority fix were first rolled to one of the deployment's two pairs.
+
 ### Decode (lab)
 
-The benchmark ([sparkDash](https://github.com/MiaAI-Lab/sparkDash)) sends a short prose prompt (~80 tokens)
-and asks for 400 tokens at temperature 0.7 with thinking on, so this is close to decode-only load, not agent traffic.
-Whole-pair decode, tokens a second, 16 November:
+Whole-pair decode on sparkDash, tokens a second, 16 November, 1 run a level:
 
 | streams | 1 | 2 | 4 | 8 | 16 |
 |---|---:|---:|---:|---:|---:|
@@ -53,9 +128,9 @@ Whole-pair decode, tokens a second, 16 November:
 
 ### Prompt reading (lab)
 
-One request at a time, tokens a second. This recipe's row is the mean of 3 runs on 22 November, each after a fresh
-engine start (run-to-run spread under 1.5%), with the whole series through `patches/0034`; the engine before 0034,
-run in the same rounds, read 3,696 / 3,621 / 3,544 / 3,458:
+One request at a time, tokens a second. The mean of 3 runs on 22 November, each after a fresh engine start (run-to-run
+spread under 1.5%), with the whole series through `patches/0034`; the engine before 0034, run in the same rounds, read
+3,696 / 3,621 / 3,544 / 3,458:
 
 | | 4K | 32K | 131K | 262K |
 |---|---:|---:|---:|---:|
@@ -88,6 +163,10 @@ compared task by task (McNemar and sign tests, Holm-adjusted across depths).
 
 At 400K the run reached 3 of its 4 documents before its deadline, so it has 48 tasks there. Repeats at temperature 0.7
 (64 tasks at 200K and 400K, two repeats) scored 0.938 and 0.938, against 0.953 at temperature 0.
+
+**The prompt cache resumes new questions on a document already read.** In an earlier one-pass run of this test, every
+new question at 100K+ tokens on a document the engine had already read resumed from its kept state, 75 of 75, instead
+of reading the document again.
 
 ### Five experts (off by default)
 
