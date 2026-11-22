@@ -1,0 +1,65 @@
+ebook	title	author	slug	url	sha256	bytes
+1342	Pride and Prejudice	Jane Austen	pride-and-prejudice	https://gutenberg.pglaf.org/cache/epub/1342/pg1342.txt	3f6bb9d6f78e0293b56acd4714dd68cb7d6d1d293402031ce9d5a216bcaf9d75	772386
+84	Frankenstein; or, The modern Prometheus	Mary Wollstonecraft Shelley	frankenstein-or-the-modern-prometheus	https://gutenberg.pglaf.org/cache/epub/84/pg84.txt	2b97b7f8aad508649481d8dd4f6b54f9b965ddb3ba634e9151c815f537b49e42	448885
+11	Alice's Adventures in Wonderland	Lewis Carroll	alice-s-adventures-in-wonderland	https://gutenberg.pglaf.org/cache/epub/11/pg11.txt	01b38ea4c710a84bc18d0bd41271a5a1a92b94e97b2812f4dece97d4a694725e	174311
+1661	The Adventures of Sherlock Holmes	Arthur Conan Doyle	the-adventures-of-sherlock-holmes	https://gutenberg.pglaf.org/cache/epub/1661/pg1661.txt	922e2a12ccb43a4c9544c260b2166c6ad2097aeb5957faeee113f173bb857cd0	607606
+2701	Moby Dick; Or, The Whale	Herman Melville	moby-dick-or-the-whale	https://gutenberg.pglaf.org/cache/epub/2701/pg2701.txt	b5e88b71a1cda068e9ab1d94344c9d932338ba6da1a66def97a1aecd9cfcc87d	1276315
+98	A Tale of Two Cities	Charles Dickens	a-tale-of-two-cities	https://gutenberg.pglaf.org/cache/epub/98/pg98.txt	d54c2b80d40a40b982cd88852c6180bb944d95acdb028af3d0e01a1750681784	807197
+74	The Adventures of Tom Sawyer, Complete	Mark Twain	the-adventures-of-tom-sawyer-complete	https://gutenberg.pglaf.org/cache/epub/74/pg74.txt	74d77384b123a6360db9ab58463cff8b38df8525fbdc6000c81ee388e1f3cf10	434357
+76	Adventures of Huckleberry Finn	Mark Twain	adventures-of-huckleberry-finn	https://gutenberg.pglaf.org/cache/epub/76/pg76.txt	d617a37aa7ae1e1a93dcde2634db2bccb86824e31e29a55230bdbf77d6872d59	622460
+345	Dracula	Bram Stoker	dracula	https://gutenberg.pglaf.org/cache/epub/345/pg345.txt	96cd16eacdbfebae8fdda5591f66e0cc8ee76be18e0cd1aca02bc00615782d28	890348
+1400	Great Expectations	Charles Dickens	great-expectations	https://gutenberg.pglaf.org/cache/epub/1400/pg1400.txt	9a637118af8e953e9764ec603d9b0a032883384d465acac2e27966a80cf1c6f8	1058204
+1260	Jane Eyre: An Autobiography	Charlotte Bronte	jane-eyre-an-autobiography	https://gutenberg.pglaf.org/cache/epub/1260/pg1260.txt	13414dee2951c3ee731d76d2ffd822016b2479c892162760c5d0eb2aa5fa7631	1084803
+768	Wuthering Heights	Emily Bronte	wuthering-heights	https://gutenberg.pglaf.org/cache/epub/768/pg768.txt	e533fe750589f0421d5d744576315f5c2b9b0d69e981179ea0551bbf134c5e02	693819
+120	Treasure Island	Robert Louis Stevenson	treasure-island	https://gutenberg.pglaf.org/cache/epub/120/pg120.txt	5bc08275eacea8640b1aa185c645283bb8c564d7b23df6b03437d229b4fc6ebd	399873
+36	The war of the worlds	H. G. Wells	the-war-of-the-worlds	https://gutenberg.pglaf.org/cache/epub/36/pg36.txt	8417469e3ab664749f7b36ebb85799075818207b0380b54c27d07d592a44117d	366624
+35	The Time Machine	H. G. Wells	the-time-machine	https://gutenberg.pglaf.org/cache/epub/35/pg35.txt	2892e919000e17c83e1dac51b30f4675db50536b644d7579fe8a89bb399a9bdc	204384
+215	The call of the wild	Jack London	the-call-of-the-wild	https://gutenberg.pglaf.org/cache/epub/215/pg215.txt	30f569c5671bba7bbc4a92ab6d8ee01a0d3be00f994819c77da62c28041eb8a2	199757
+219	Heart of Darkness	Joseph Conrad	heart-of-darkness	https://gutenberg.pglaf.org/cache/epub/219/pg219.txt	1bcdf0a1ac611dd6b70a20d100a07085754da4e90a949d6031717b86cd6d020a	237074
+514	Little Women	Louisa May Alcott	little-women	https://gutenberg.pglaf.org/cache/epub/514/pg514.txt	36831477b339dbcd7e7206119d77e9e58b9727ef3c299d1a1dc4446e1db97850	1071398
+45	Anne of Green Gables	L. M. Montgomery	anne-of-green-gables	https://gutenberg.pglaf.org/cache/epub/45/pg45.txt	89a5e9fb2e0bb44562a969785385366f94e1da736aebee7d9cdf459eb0b5f9f6	606693
+55	The Wonderful Wizard of Oz	L. Frank Baum	the-wonderful-wizard-of-oz	https://gutenberg.pglaf.org/cache/epub/55/pg55.txt	969bffab7740d4d8a0bac332d78bd0152ad4a40a2efc52f06c74a9bb6120be75	237232
+16	Peter Pan [Peter and Wendy]	J. M. Barrie	peter-pan-peter-and-wendy	https://gutenberg.pglaf.org/cache/epub/16/pg16.txt	6b08714281fe38266a756741e4c62915cda7536c2f78cca501f7fd53f3f445ae	288769
+113	The Secret Garden	Frances Hodgson Burnett	the-secret-garden	https://gutenberg.pglaf.org/cache/epub/113/pg113.txt	40709a2894f0816a97dd8a67d3082cfc4dac31e45b45ee55a908d62e1dd18c23	475315
+140	The Jungle	Upton Sinclair	the-jungle	https://gutenberg.pglaf.org/cache/epub/140/pg140.txt	1a28274fdea8c1438ebad3d7d07946b3d8a0779754427ba4a4da3b64882b7514	854298
+2814	Dubliners	James Joyce	dubliners	https://gutenberg.pglaf.org/cache/epub/2814/pg2814.txt	6be7d8400ac2549459307d1c1a20a25c86a736984269d3e9d989c817814be60c	405706
+64317	The Great Gatsby	F. Scott Fitzgerald	the-great-gatsby	https://gutenberg.pglaf.org/cache/epub/64317/pg64317.txt	ce760ec377accd352b41bb8f64504a72d7aa18ab3afb42ded2b56cecacf29e35	306553
+541	The Age of Innocence	Edith Wharton	the-age-of-innocence	https://gutenberg.pglaf.org/cache/epub/541/pg541.txt	aae279f1a60ac64be53f63357e708a2fdaabdb334a1c92f81fc1c3b5c848a092	609882
+2641	A Room with a View	E. M. Forster	a-room-with-a-view	https://gutenberg.pglaf.org/cache/epub/2641/pg2641.txt	3dce58eb1786b10b79f8688968d293a1990dfed4a1f83a5c04a6a2a10381db36	415820
+160	The Awakening, and Selected Short Stories	Kate Chopin	the-awakening-and-selected-short-stories	https://gutenberg.pglaf.org/cache/epub/160/pg160.txt	31d4577d255806b92c6296419adddd5ca460bdb788743878a09ded1e19f4161a	392860
+33	The Scarlet Letter	Nathaniel Hawthorne	the-scarlet-letter	https://gutenberg.pglaf.org/cache/epub/33/pg33.txt	ae8d5a2d55a7b5d2b4b37497338892dab5ff6cc535bf523698da4ba6abe15ee7	513732
+829	Gulliver's Travels into Several Remote Nations of the World	Jonathan Swift	gulliver-s-travels-into-several-remote-nations-o	https://gutenberg.pglaf.org/cache/epub/829/pg829.txt	fca36de3de0d8b831b7588cf1df84639ccf4c503172d6444ee61d1c1b2036edd	613946
+521	The Life and Adventures of Robinson Crusoe	Daniel Defoe	the-life-and-adventures-of-robinson-crusoe	https://gutenberg.pglaf.org/cache/epub/521/pg521.txt	6c5c1dc78db2ecd92905b6dd75779eba2361d7ee38e55300002e5cbedda63778	653990
+244	A Study in Scarlet	Arthur Conan Doyle	a-study-in-scarlet	https://gutenberg.pglaf.org/cache/epub/244/pg244.txt	8bbec71f9fa9c2acc9afe9be70560ca5f65c1bc95ef5af8252e9097f8d012497	268777
+2852	The Hound of the Baskervilles	Arthur Conan Doyle	the-hound-of-the-baskervilles	https://gutenberg.pglaf.org/cache/epub/2852/pg2852.txt	aea75dfb3977a0a0222f838593c45dfbcb1af9fbb7bf5b60b1f13d5e452cbcf7	388057
+236	The Jungle Book	Rudyard Kipling	the-jungle-book	https://gutenberg.pglaf.org/cache/epub/236/pg236.txt	571353c4c69d127020fb16cd6a566f1d80101bc0fc3cf2b0c2ea5678bf4c769f	303640
+209	The Turn of the Screw	Henry James	the-turn-of-the-screw	https://gutenberg.pglaf.org/cache/epub/209/pg209.txt	171afa184a54b6004194e02047f5d01cf216d8bc519ddfb671a1e41d80bbdf65	259197
+2554	Crime and Punishment	Fyodor Dostoyevsky	crime-and-punishment	https://gutenberg.pglaf.org/cache/epub/2554/pg2554.txt	4a84a709a6e355f5fa555c7276c8a90125eb9d06f63bc8663410c3d1297eb688	1202773
+1232	The Prince	Niccolo Machiavelli	the-prince	https://gutenberg.pglaf.org/cache/epub/1232/pg1232.txt	33496a305f7a4b933784fb5aec95f920fbc3d4687794817e4cc444aa6578d2e4	308019
+205	Walden, and On The Duty Of Civil Disobedience	Henry David Thoreau	walden-and-on-the-duty-of-civil-disobedience	https://gutenberg.pglaf.org/cache/epub/205/pg205.txt	2d9a76a2e3e8195c69430516ebd33c4d0757a53ad432ff6186b7b794e6fe99f9	667957
+3300	An Inquiry into the Nature and Causes of the Wealth of Nations	Adam Smith	an-inquiry-into-the-nature-and-causes-of-the-wea	https://gutenberg.pglaf.org/cache/epub/3300/pg3300.txt	e91d52dca43fd0fd69baf7776b00a5d8e74b69675b6b608ca8a0378aaf3ae58d	2468951
+1228	On the Origin of Species By Means of Natural Selection	Charles Darwin	on-the-origin-of-species-by-means-of-natural-sel	https://gutenberg.pglaf.org/cache/epub/1228/pg1228.txt	362142cb7c6f90850477520cfe2a62fe423ae92ea8eb6d9cd8b30ddb39de60b9	970611
+5827	The Problems of Philosophy	Bertrand Russell	the-problems-of-philosophy	https://gutenberg.pglaf.org/cache/epub/5827/pg5827.txt	2505ea57849c64abe7962ffe56972174c9160606348e08cb7876d46b2c5b2d96	269536
+7370	Second Treatise of Government	John Locke	second-treatise-of-government	https://gutenberg.pglaf.org/cache/epub/7370/pg7370.txt	720196308ba75205761d1a763f6e42d3fb4bec8f8457a77c181f9df3bcf75eb8	338996
+147	Common Sense	Thomas Paine	common-sense	https://gutenberg.pglaf.org/cache/epub/147/pg147.txt	9c467182c78bd246ab05ce5bef11c32cb748ebaa5622dedc4bd4c02a8a0fff90	148539
+1404	The Federalist Papers	Alexander Hamilton John Jay James Madison	the-federalist-papers	https://gutenberg.pglaf.org/cache/epub/1404/pg1404.txt	0b92fadc9d7afd767eefd27805a20e44417ff26d1fb2f964229f39dcc7b2a65d	1186849
+23	Narrative of the Life of Frederick Douglass, an American Slave	Frederick Douglass	narrative-of-the-life-of-frederick-douglass-an-a	https://gutenberg.pglaf.org/cache/epub/23/pg23.txt	234c15348a66919bad1d534cdd48ee8ddf91f50115a706cbefaa8edd049672fd	249061
+408	The Souls of Black Folk	W. E. B. Du Bois	the-souls-of-black-folk	https://gutenberg.pglaf.org/cache/epub/408/pg408.txt	87f8e832484792b761a510b953d67e3835fa46a9f4231a508bfeb914a98559ca	428742
+20203	Autobiography of Benjamin Franklin	Benjamin Franklin	autobiography-of-benjamin-franklin	https://gutenberg.pglaf.org/cache/epub/20203/pg20203.txt	c5be0e49f68f0876be480074b9dc0712a8fdbc7faa7def3acc6765afba9bd128	467432
+2680	Meditations	Emperor of Rome Marcus Aurelius	meditations	https://gutenberg.pglaf.org/cache/epub/2680/pg2680.txt	6977474f82a39dd88a4af31a59504821658174d33c177732c54357e4d680b96c	425304
+132	The Art of War	active 6th century B.C. Sunzi	the-art-of-war	https://gutenberg.pglaf.org/cache/epub/132/pg132.txt	2301ae1ce20875381a316b2fd0ac5ada00f71bacdc732458a11b3674b358e360	342105
+5000	The Notebooks of Leonardo Da Vinci -- Complete	da Vinci Leonardo	the-notebooks-of-leonardo-da-vinci-complete	https://gutenberg.pglaf.org/cache/epub/5000/pg5000.txt	83e79e107270ea7cbbc4b478913978738ae3d763081e54bc173a663d08ca5b10	1433832
+26184	Simple Sabotage Field Manual	United States. Office of Strategic Services	simple-sabotage-field-manual	https://gutenberg.pglaf.org/cache/epub/26184/pg26184.txt	c009a5c1f171ca1952456d477d328dfc4e4007c1bd05f17590bec37ee1d5b488	75402
+1322	Leaves of Grass	Walt Whitman	leaves-of-grass	https://gutenberg.pglaf.org/cache/epub/1322/pg1322.txt	77c066a8774e2b04d8bfbc570d9aa5131410355cd6062ab5962ac773240f3140	780492
+2591	Grimms' Fairy Tales	Jacob Grimm Wilhelm Grimm	grimms-fairy-tales	https://gutenberg.pglaf.org/cache/epub/2591/pg2591.txt	377ebb8ca06cd8bc0b1015ddb54766c44f50dece731c53bb030f1cc00f54092a	560164
+1597	Andersen's Fairy Tales	H. C. Andersen	andersen-s-fairy-tales	https://gutenberg.pglaf.org/cache/epub/1597/pg1597.txt	f886b6c92c0c7884cb64059d84363f10977cfb12d0bc0b120c2207ce2f57b2f2	329056
+3825	Pygmalion	Bernard Shaw	pygmalion	https://gutenberg.pglaf.org/cache/epub/3825/pg3825.txt	bf2518b5c0f1e46e3190ab2e77a0ecb3e35a1e120b233e6cb27134395dff048a	215094
+844	The Importance of Being Earnest: A Trivial Comedy for Serious People	Oscar Wilde	the-importance-of-being-earnest-a-trivial-comedy	https://gutenberg.pglaf.org/cache/epub/844/pg844.txt	1b8a58099bb1cdef6a845277a4bacf2f4a268702c165bde30124d4b5105d1851	141840
+2542	A Doll's House : a play	Henrik Ibsen	a-doll-s-house-a-play	https://gutenberg.pglaf.org/cache/epub/2542/pg2542.txt	d72a481b08ca7ace73e8ca2087b2baec29fc00e0d6e493f5e877b12116bccf4f	169080
+1513	Romeo and Juliet	William Shakespeare	romeo-and-juliet	https://gutenberg.pglaf.org/cache/epub/1513/pg1513.txt	5a2037a19e60cccb67b3f5fc93a12cb65c58694ce6a1dc61d0d67d0d2502b3b4	169504
+245	Life on the Mississippi	Mark Twain	life-on-the-mississippi	https://gutenberg.pglaf.org/cache/epub/245/pg245.txt	91388a58a49f9c321fc5b1611560b0302d043a7e955c2f3f6c619d91befc8f01	843430
+3176	The Innocents Abroad	Mark Twain	the-innocents-abroad	https://gutenberg.pglaf.org/cache/epub/3176/pg3176.txt	0c95100895426b22f0a377bd4783f3fbd621b958b8f602c2c55192182b394fe0	1149343
+15399	The Interesting Narrative of the Life of Olaudah Equiano, Or Gustavus Vassa, The African	Olaudah Equiano	the-interesting-narrative-of-the-life-of-olaudah	https://gutenberg.pglaf.org/cache/epub/15399/pg15399.txt	0bb6c55d53e1b4cd673e303bd8779bb22aad87b6e40eefa7a4d6e3aa52a1ca47	479263
+46	A Christmas Carol in Prose; Being a Ghost Story of Christmas	Charles Dickens	a-christmas-carol-in-prose-being-a-ghost-story-o	https://gutenberg.pglaf.org/cache/epub/46/pg46.txt	8c36b93723d454982df045ec0efdf2664e5a48e6b5e2f670e883575f75ad0cc8	182250
+1250	Anthem	Ayn Rand	anthem	https://gutenberg.pglaf.org/cache/epub/1250/pg1250.txt	73057e044f9d2b7db1904c55bcfc2233344fd497facb82092be3cf76ceb83f20	130621
+730	Oliver Twist	Charles Dickens	oliver-twist	https://gutenberg.pglaf.org/cache/epub/730/pg730.txt	6c37f41a8a253e95eba0f990f61cf60ac2e6d625c306c13027672d67885a6b6a	955858

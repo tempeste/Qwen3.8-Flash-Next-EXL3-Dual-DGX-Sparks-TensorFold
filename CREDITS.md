@@ -104,6 +104,12 @@ The weights are not part of this repository; `scripts/prepare.sh` downloads them
 - **[Docker](https://www.docker.com/)** and the
   **[NVIDIA Container Toolkit](https://github.com/NVIDIA/nvidia-container-toolkit)** (Apache-2.0).
 
+## Benchmark text
+
+- **[Project Gutenberg](https://www.gutenberg.org)** and its volunteers: the public-domain books (in the US) whose text
+  is the filler of the reuse tests in `bench/` (`bench/corpus/books.tsv` lists each one; the Project Gutenberg licence
+  and trademark text is removed, see `bench/CORPUS-LICENSE`).
+
 ## Hardware
 
 - **[NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)** (GB10 Grace Blackwell, 128 GB

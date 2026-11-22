@@ -1,0 +1,19 @@
+The filler text in corpus/corpus.jsonl.gz
+
+The haystack filler is cut from public-domain books in English. Each book is listed in corpus/books.tsv with its
+title, author, Project Gutenberg ebook number, the exact text-file URL it was downloaded from and the sha256 of that
+file. These works are in the public domain in the United States. If you are outside the United States, check the
+copyright laws of your country before you use or share them.
+
+The files come from Project Gutenberg (https://www.gutenberg.org). Only the text between each file's "*** START OF"
+and "*** END OF" lines is used, so the Project Gutenberg licence and trademark text outside those lines is removed.
+Project Gutenberg allows this for public-domain works. What remains is not a Project Gutenberg edition and is not
+offered under the Project Gutenberg name or trademark.
+
+Changes made to the texts: line endings normalised, trailing spaces removed, typographic characters mapped to ASCII
+(the table is in fetch_corpus.py), and the text cut into blocks of 24 to 72 lines. Blocks were then selected and
+framed as tool results or notes (corpus/blocks.tsv lists the book and line range of each block). fetch_corpus.py
+rebuilds the corpus from the pinned files.
+
+The rest of bench/ (the scripts, manifest.json and this text) is part of this repository and is under its licence
+(LICENSE, Apache-2.0).
