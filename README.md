@@ -134,20 +134,20 @@ the deployment's two pairs.
 
 ### Decode (lab)
 
-Whole-pair decode on sparkDash, tokens a second, 15 November, 1 run a level:
+Whole-pair decode on sparkDash, tokens a second, with the whole series through `patches/0034`, each run after a fresh
+engine start:
 
 | streams | 1 | 2 | 4 | 8 | 16 |
 |---|---:|---:|---:|---:|---:|
-| **this recipe** (EXL3 experts, 24 × 409,600) | 78 | 101 | 171 | 260 | **379** |
+| **this recipe** (EXL3 experts, 24 × 409,600; mean of 9, 22 Nov) | 65 | 110 | 171 | 269 | **378** |
 
-- This row is the engine as it served on 15 November; changes rolled after that day (among them beside packing,
-  reply-keep and the main stream's priority with beside on) are in the series but not in this row. The series' own
-  engine on 20 November made 75 / 105 / 171 / 258 / 375 on the same benchmark
-  ([Five experts](#five-experts-off-by-default)).
-- The same engine with the checkpoint's own NVFP4 experts in place of EXL3 (`EXL3_EXPERTS=0`) made 60 / 94 / 162 /
-  232 / 335 the same day.
-- The whole series through `patches/0034` made 65 / 110 / 171 / 269 / 378, the mean of 9 fresh-start runs on 22
-  November ([Where this work started](#where-this-work-started)).
+- With the checkpoint's own NVFP4 experts in place of EXL3 (`EXL3_EXPERTS=0`): 61 / 107 / 157 / 238 / 336, against
+  60 / 107 / 174 / 271 / 379 for production in the same interleaved rounds on 22 November, 3 runs each (the EXL3 row
+  of [From the single-Spark recipe to this one](#from-the-single-spark-recipe-to-this-one)).
+- Earlier engines on the same benchmark: the engine as it served on 15 November, one run a level, made
+  78 / 101 / 171 / 260 / 379 (60 / 94 / 162 / 232 / 335 with NVFP4 experts); it predates beside packing, reply-keep
+  and the main stream's priority with beside on. The engine of 20 November made 75 / 105 / 171 / 258 / 375, medians
+  of 3 ([Five experts](#five-experts-off-by-default)).
 
 ### Prompt reading (lab)
 
@@ -235,8 +235,8 @@ Turn it on with `TF_FLASHNEXT_EXPERTS_TOPK=5 ./start.sh restart` (or `export TF_
   when both are up and addressed (`NCCL_RAILS=1`: one).
 - **Key-based ssh** from the first Spark (the head: rank 0 and the API) to the second (the worker):
   `ssh -o BatchMode=yes user@<worker> true` must work.
-- On both: Docker with the NVIDIA container runtime (your user in the `docker` group), `rsync`, `sha256sum`. On both also `python3`; on the
-  head also `curl` and the `hf` CLI or Python's `huggingface_hub`.
+- On both: Docker with the NVIDIA container runtime (your user in the `docker` group), `rsync`, `sha256sum` and
+  `python3`; on the head also `curl` and the `hf` CLI or Python's `huggingface_hub`.
 - **Disk.** On each Spark ~96 GiB for the checkpoint under `~/.cache/huggingface`, the EXL3 experts of its rank
   (~19 GiB on the head, ~18 GiB on the worker; the head holds both ranks', ~37.5 GiB, until the worker has its copy),
   and the image under Docker's root (`IMAGE_FREE_GB`, 40 GB asked for; the build's own size is not measured here).
@@ -380,7 +380,9 @@ Less common: `MODEL_ID` / `MODEL_REVISION`, `EXL3_REPO` / `EXL3_REVISION` / `EXL
 deployment serves with (and `NCCL_MAX_NCHANNELS=4`), grouped by the patch that adds each; each patch's message
 describes its flags ("Flags this patch adds"). `start.sh` passes them to both ranks, which compare their settings when
 they connect. Any of these names set in the environment, `scripts/local.sh` (exported) or `.env` replaces the file's
-value; `ENGINE_UNSET="A B"` leaves names out. `TENSORFOLD_API_KEY` (the server's API keys) goes to rank 0 by name only. With the default `HOST=0.0.0.0` and no key, anyone who can reach port 8000 can use the model: set a key, or `HOST=127.0.0.1` behind your own gateway.
+value; `ENGINE_UNSET="A B"` leaves names out. `TENSORFOLD_API_KEY` (the server's API keys) goes to rank 0 by name
+only. With the default `HOST=0.0.0.0` and no key, anyone who can reach port 8000 can use the model: set a key, or
+`HOST=127.0.0.1` behind your own gateway.
 
 What the defaults are, in short:
 
@@ -463,7 +465,7 @@ xgrammar and dlpack license files (Apache-2.0). This repository's Apache License
 
 Built on [TensorFold](https://github.com/ashhart/TensorFold) by Ash Hart ([ashhart](https://github.com/ashhart)) and
 the TensorFold contributors. The series carries upstream work by laudney (PR #1784, the two-rank head split every
-later patch builds on), Armin (PR #1942's DeltaNet lanes and three ported commits), shuuul, Jürgen Schmied,
+later patch builds on), Armin (PR #1942's DeltaNet lanes and three ported patches), shuuul, Jürgen Schmied,
 devopsfortunato and Ash Hart. The scripts are adapted from MiaAI-Lab's two-Spark recipe; patches 0002-0003 port
 MiaAI-Lab's single-Spark recipe patches 0001-0017; the GPU top-k candidate idea comes from MiaAI-Lab's DeepSeek-V4.1
 recipe (patch 0021); `TF_FLASHNEXT_LATE_SKIP` from Picom-code's pico-dgx-qwen38 patch 0111; the five-expert switch

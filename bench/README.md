@@ -25,8 +25,8 @@ near-duplicates, two-record joins, passages to copy). Every request is streamed,
 | long-context accuracy (LCQ v2) | `lcq.py run` | all 28 planned haystacks, 8,192 to 400,000 tokens: 16 questions each, plus two sampled passes (temperature 0.7) on 4 of them | exact rate and score by depth (`lcqstats.py table` adds Wilson intervals and paired tests between servers) |
 
 A server without the feature shows it directly: a server that keeps no state where requests part resumes none of
-`fork`'s workers 3-6, and one whose cache is too small for pass 1 gets none of `ret`'s 4 back warm. To measure a feature, run the probe against the server with and without it, each from a
-fresh start, at least 3 runs a side, interleaved (A B B A A B ...), and compare the counts and first-token medians.
+`fork`'s workers 3-6, and one whose cache is too small for pass 1 gets none of `ret`'s 4 back warm. To measure a
+feature, run the probe against the server with and without it, each from a fresh start, at least 3 runs a side, interleaved (A B B A A B ...), and compare the counts and first-token medians.
 
 ## Commands
 
