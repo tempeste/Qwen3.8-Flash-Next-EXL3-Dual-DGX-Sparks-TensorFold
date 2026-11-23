@@ -1,14 +1,16 @@
 # Patches
 
-34 patches on upstream [TensorFold](https://github.com/ashhart/TensorFold) `main` at [`089a18dff289d4c58043c1957ad0d7fe73d814b3`](https://github.com/ashhart/TensorFold/commit/089a18dff289d4c58043c1957ad0d7fe73d814b3) (2026-11-02, changelog: #1855 under Unreleased). Apply them in filename order to a checkout of that commit:
+34 patches on upstream [TensorFold](https://github.com/ashhart/TensorFold) `main` at [`089a18dff289d4c58043c1957ad0d7fe73d814b3`](https://github.com/ashhart/TensorFold/commit/089a18dff289d4c58043c1957ad0d7fe73d814b3) (2026-11-02, changelog: #1855 under Unreleased). Apply them in filename order to a fresh checkout of that commit; set `RECIPE` to this recipe's folder and the snippet works from any folder:
 
 ```sh
-git clone https://github.com/ashhart/TensorFold.git && cd TensorFold
+RECIPE=/path/to/recipe
+TF=$(mktemp -d)
+git clone https://github.com/ashhart/TensorFold.git "$TF" && cd "$TF"
 git checkout 089a18dff289d4c58043c1957ad0d7fe73d814b3
-for p in ../patches/*.patch; do git apply "$p"; done
+for p in "$RECIPE"/patches/*.patch; do git apply --check "$p" && git apply "$p"; done
 ```
 
-`scripts/prepare.sh --check-patches` does the same in a temporary folder, and the image build applies them the same way.
+`scripts/prepare.sh --check-patches` does exactly this for you: it clones TensorFold at that commit into a new temporary folder and applies every patch with `git apply --check` and `git apply`, as the image build does.
 
 Each patch's `From:` line is its author. The patches that carry upstream TensorFold work keep their upstream authors (and author dates), and their messages name the upstream commit or pull request they come from and what was changed to fit this series. The rest are this series' own work; where one ports or follows someone else's work, its message says whose, and the table below repeats it.
 
