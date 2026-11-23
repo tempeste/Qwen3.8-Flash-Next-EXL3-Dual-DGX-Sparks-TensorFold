@@ -197,6 +197,35 @@ At 400K the run reached 3 of its 4 documents before its deadline, so it has 48 t
 new question at 100K+ tokens on a document the engine had already read resumed from its kept state, 75 of 75, instead
 of reading the document again.
 
+### KV cache: 4-bit by default, 8-bit as a switch
+
+The KV cache (the per-token keys and values the model's attention layers keep for each conversation) is stored in
+NVFP4, a 4-bit format. Setting `KV_DTYPE=fp8` stores it in 8 bits instead; `KV_DTYPE=bf16` keeps it at full precision
+(lab, sparkDash and the fidelity test below, dates UTC):
+
+- **Speed:** the same within noise. With fp8 KV, whole-pair decode at 16 streams was 2.5% lower [-1.1%, +6.3%] and
+  prompt reading 0.7-0.9% higher than with NVFP4 (3 fresh-start runs each, interleaved, 22 Nov).
+- **Room:** NVFP4 keeps more conversations warm. The same 86 kept prompt-cache states took 8,977 MiB with NVFP4 and
+  10,652 MiB with fp8, so the 45 GiB prompt cache holds about 19% more of them with NVFP4 (sparkDash's prompts, up to
+  262K tokens; for long conversations the KV share, and so the difference, is larger). Live conversations' KV is
+  smaller in the same proportion.
+- **Fidelity:** NVFP4 moves the next-token distribution about twice as far from full precision as fp8 does; the most
+  likely token agrees about as often. Teacher-forced next-token distributions against bf16 KV on this engine, 128
+  decode rows a prompt (3 prompts at 32K and 131K, 2 at 262K and 400K: prose and code), bootstrap 95% intervals, one
+  stream (23 Nov):
+
+| context | fp8 mean KL | NVFP4 mean KL | fp8 top-1 agreement | NVFP4 top-1 agreement |
+|---:|---:|---:|---:|---:|
+| 32K | 0.013 [0.009, 0.017] | 0.025 [0.019, 0.031] | 96.6% [95.1, 97.4] | 95.6% [94.0, 96.6] |
+| 131K | 0.015 [0.010, 0.020] | 0.027 [0.020, 0.035] | 94.5% [92.2, 96.6] | 94.5% [91.9, 96.9] |
+| 262K | 0.004 [0.002, 0.006] | 0.006 [0.002, 0.009] | 97.7% [95.3, 99.2] | 99.2% [98.8, 100.0] |
+| 400K | 0.006 [0.004, 0.010] | 0.012 [0.009, 0.016] | 97.3% [95.7, 98.8] | 97.3% [95.3, 99.2] |
+
+The drift is largest on prose; on the code prompt it is near zero at 262K and 400K, and both formats agree with full
+precision on 97-100% of its rows.
+The long-context accuracy above was measured with NVFP4, the default. Choose fp8 if you want the lower drift and do
+not need the larger prompt cache.
+
 ### Five experts (off by default)
 
 `TF_FLASHNEXT_EXPERTS_TOPK=K` (1-9; unset, `0` or `10`: off) keeps each token's top K of the model's 10 routed experts
@@ -358,7 +387,7 @@ lines, read, never run). The first that sets a value wins: the environment, `scr
 | `MASTER_ADDR` / `MASTER_PORT` | the head's link address / `29500` | the ranks' rendezvous (keep it on the private link) |
 | `CONTEXT` | `409600` | prompt + reply window per stream; past 262,144 it needs `TF_FLASHNEXT_YARN` (2: up to 524,288) |
 | `PARALLEL` | `24` | streams decoded together |
-| `KV_DTYPE` | `nvfp4` | `--kv-cache`: `nvfp4` or `fp8` (lossy), `bf16` (exact) |
+| `KV_DTYPE` | `nvfp4` | `--kv-cache`: `nvfp4` (default) or `fp8` (lossy; see [KV cache](#kv-cache-4-bit-by-default-8-bit-as-a-switch)), `bf16` (exact) |
 | `PROMPT_CACHE_GIB` | `45` | memory for kept conversation states (prefix reuse) |
 | `MAX_TOKENS` / `THINKING` / `REASONING_EFFORT` | `32768` / `1` / `xhigh` | a request's defaults |
 | `TEMPERATURE` / `TOP_P` / `TOP_K` | `1.0` / `0.95` / `20` | sampling defaults |
