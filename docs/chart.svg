@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="300" viewBox="0 0 760 300" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<style>
+.t{fill:#1f2328}.m{fill:#59636e}.a{fill:#9aa4b0}.b{fill:#2f81f7}
+@media (prefers-color-scheme: dark){.t{fill:#e6edf3}.m{fill:#9198a1}.a{fill:#5d6672}.b{fill:#4493f8}}
+</style>
+<text x="0" y="22" class="t" font-size="17" font-weight="600">Where it started → this recipe (two DGX Sparks, sparkDash)</text>
+<g font-size="13">
+<text x="0" y="62" class="t">Decode, 16 conversations</text>
+<rect x="230" y="48" width="254" height="16" rx="3" class="a"/><text x="490" y="61" class="m">213 tok/s</text>
+<rect x="230" y="68" width="450" height="16" rx="3" class="b"/><text x="686" y="81" class="t" font-weight="600">378 tok/s</text>
+<text x="0" y="132" class="t">Prompt reading, 4K tokens</text>
+<rect x="230" y="118" width="268" height="16" rx="3" class="a"/><text x="504" y="131" class="m">2,315 tok/s</text>
+<rect x="230" y="138" width="450" height="16" rx="3" class="b"/><text x="686" y="151" class="t" font-weight="600">3,893 tok/s</text>
+<text x="0" y="202" class="t">Prompt reading, 262K tokens</text>
+<text x="230" y="201" class="m">does not fit</text>
+<rect x="230" y="208" width="418" height="16" rx="3" class="b"/><text x="654" y="221" class="t" font-weight="600">3,612 tok/s</text>
+</g>
+<g font-size="12">
+<rect x="0" y="262" width="12" height="12" rx="2" class="a"/><text x="18" y="273" class="m">single-Spark recipe, one copy on each Spark (10 × 262,144 tokens)</text>
+<rect x="0" y="282" width="12" height="12" rx="2" class="b"/><text x="18" y="293" class="m">this recipe, one engine across both Sparks (24 × 409,600 tokens)</text>
+</g>
+</svg>

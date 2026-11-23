@@ -2,7 +2,7 @@
 
 Every change to this recipe, newest first.
 
-## Unreleased: first version
+## 1.0 (23 Nov 2026): first version
 
 - **Experts already in place**: `scripts/prepare.sh` uses an `EXL3_PACK` folder that already holds `manifest.json`
   and, with the sums in `scripts/exl3-pack.sha256`, the index and a Spark's own rank's files (on the head also rank 1's

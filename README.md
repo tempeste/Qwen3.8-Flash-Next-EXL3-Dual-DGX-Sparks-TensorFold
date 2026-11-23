@@ -1,5 +1,22 @@
 # Qwen3.8-Flash-Next on two DGX Sparks with TensorFold, EXL3 experts
 
+**24 conversations of up to 409,600 tokens at once, on two DGX Sparks.** Open patches, scripts and
+reproducible benchmarks.
+
+![Where it started and this recipe: decode and prompt reading](docs/chart.svg)
+
+| (lab, sparkDash v2.90.0, GPU clock capped at 1.8 GHz) | single-Spark recipe, one copy on each Spark | this recipe |
+|---|---:|---:|
+| conversations × window | 10 × 262,144 | 24 × 409,600 |
+| decode, whole pair, 16 conversations | 213 tok/s | **378 tok/s** |
+| prompt reading, 4K tokens | 2,315 tok/s | **3,893 tok/s** |
+| prompt reading, 262K tokens | does not fit | **3,612 tok/s** |
+| long-context accuracy, 131K-400K tokens | not measured | **96% exact** |
+| a new question on a document already read, first token | not measured | **0.35 s** |
+
+Every change from the single-Spark starting point is measured on its own in
+[From the single-Spark recipe to this one](#from-the-single-spark-recipe-to-this-one).
+
 Serve **Qwen3.8-Flash-Next** from two NVIDIA DGX Sparks (GB10, 128 GB each, linked by their ConnectX-7 ports) through
 an OpenAI-compatible API, with [TensorFold](https://github.com/ashhart/TensorFold)'s Zig engine (`tensorfold-native`)
 split across the two Sparks at `--tp 2`: one rank on each.
@@ -514,5 +531,6 @@ scripts/            config.sh (settings), engine.env (the engine's variables), p
 tools/              exl3_experts_pack.py (the per-rank EXL3 experts folder)
 bench/              the prompt-reuse tests and LCQ v2 (bench/README.md)
 patches/            0001-0034, applied to TensorFold at TF_REF in filename order
+docs/               chart.svg (the chart at the top of this README)
 CHANGELOG.md, CREDITS.md, LICENSE, NOTICE
 ```
