@@ -5,14 +5,20 @@ reproducible benchmarks.
 
 ![Where it started and this recipe: decode and prompt reading](docs/chart.svg)
 
-| (lab, sparkDash v2.90.0, GPU clock capped at 1.8 GHz) | single-Spark recipe, one copy on each Spark | this recipe |
+| (lab, sparkDash unless noted) | [MiaAI-Lab's single-Spark recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold), a copy on each Spark | this recipe |
 |---|---:|---:|
 | conversations × window | 10 × 262,144 | 24 × 409,600 |
-| decode, whole pair, 16 conversations | 213 tok/s | **378 tok/s** |
-| prompt reading, 4K tokens | 2,315 tok/s | **3,893 tok/s** |
+| decode, 8 conversations | 193 tok/s | **269 tok/s** |
+| decode, peak | 202 tok/s (serves 10 at once) | **378 tok/s** at 16 |
+| prompt reading, 4K tokens | 2,239 tok/s | **3,893 tok/s** |
 | prompt reading, 262K tokens | does not fit | **3,612 tok/s** |
+| [agent load](#mixed-agent-load-lab), 16 conversations served at once | 30 tok/s, 120 s (at 8 × 163,840) | **104 tok/s, 42 s** |
+| [agent load](#mixed-agent-load-lab), its published settings (10 at once) | 24 tok/s, 347 s | **175 tok/s, 27 s** |
 | long-context accuracy, 131K-400K tokens | not measured | **96% exact** |
 | a new question on a document already read, first token | not measured | **0.35 s** |
+
+Agent load: decode, then the median first token of a follow-up turn. The single-Spark recipe is its current version
+(TensorFold v1.2.7). GPU clocks capped at 1.8 GHz.
 
 Every change from the single-Spark starting point is measured on its own in
 [From the single-Spark recipe to this one](#from-the-single-spark-recipe-to-this-one).
@@ -61,7 +67,10 @@ This work started from MiaAI-Lab's single-Spark recipe,
 one TensorFold engine on one Spark (TP=1). Patches 0002-0003 port its patches 0001-0017 ([`CREDITS.md`](CREDITS.md)).
 On 22 November it was run on these Sparks as published (its image, TensorFold v1.1.4; NVIDIA's FP4 checkpoint; fp8 KV
 cache; 5 streams × 262,144 tokens and a 4.2-4.7 GiB prompt cache a Spark), once on one Spark alone and once as one copy
-on each Spark behind a relay that keeps a conversation on one copy. The benchmark is MiaAI-Lab's
+on each Spark behind a relay that keeps a conversation on one copy. On 24 November its current version
+([`b956dba8`](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/tree/b956dba8a468f1cf376d60bbbd9b9ed51ff2f0a9),
+TensorFold v1.2.7, same settings) was run the same two ways. The top table uses it; the gains below start from the 22
+November version. The benchmark is MiaAI-Lab's
 [sparkDash](https://github.com/MiaAI-Lab/sparkDash): its decode test sends a short prose prompt (~80 tokens) and asks
 for 400 tokens at temperature 0.7 with thinking on, so it is close to decode-only load, not agent traffic; its
 prompt-reading test sends one prompt at a time.
@@ -71,43 +80,34 @@ The single-Spark setup serves **10 streams × 262,144 tokens for the pair** (5 a
 
 | | streams × window | date, runs | decode 1 | 2 | 4 | 8 | 16 | prompt 4K | 32K | 131K | 262K |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| TP=1 recipe, one Spark | 5 × 262,144 | 22 Nov, mean of 3 | 46 | 70 | 101 | 107 | 114 | 2,327 | 2,136 | 1,951 | does not fit |
-| TP=1 recipe × 2, one copy a Spark | 5 × 262,144 a copy, 10 × 262,144 in all | 22 Nov, mean of 3 | 49 | 96 | 150 | 209 | 213 | 2,315 | 2,129 | 1,948 | does not fit |
-| our engine at TP=1, one Spark | 12 × 409,600 | 22 Nov, mean of 3 | 49 | 82 | 136 | 208 | 220 | 2,225 | 2,105 | 2,034 | 1,976 |
-| our engine at TP=1 × 2, one copy a Spark | 12 × 409,600 a copy, 24 × 409,600 in all | 22 Nov, mean of 3 | 52 | 102 | 169 | 254 | 401 | 2,237 | 2,106 | 2,037 | 1,974 |
+| single-Spark recipe (TensorFold v1.1.4), one Spark | 5 × 262,144 | 22 Nov, mean of 3 | 46 | 70 | 101 | 107 | 114 | 2,327 | 2,136 | 1,951 | does not fit |
+| single-Spark recipe (TensorFold v1.1.4) × 2, one copy a Spark | 5 × 262,144 a copy, 10 × 262,144 in all | 22 Nov, mean of 3 | 49 | 96 | 150 | 209 | 213 | 2,315 | 2,129 | 1,948 | does not fit |
+| single-Spark recipe, current version (TensorFold v1.2.7), one Spark | 5 × 262,144 | 24 Nov, median of 3 | 41 | 78 | 108 | 108 | 111 | 2,270 | 2,083 | 1,875 | does not fit |
+| single-Spark recipe, current version × 2, one copy a Spark | 5 × 262,144 a copy, 10 × 262,144 in all | 24 Nov, median of 3 | 40 | 91 | 148 | 193 | 202 | 2,239 | 1,976 | 1,871 | does not fit |
+| this recipe at TP=1, one Spark | 12 × 409,600 | 22 Nov, mean of 3 | 49 | 82 | 136 | 208 | 220 | 2,225 | 2,105 | 2,034 | 1,976 |
+| this recipe at TP=1 × 2, one copy a Spark | 12 × 409,600 a copy, 24 × 409,600 in all | 22 Nov, mean of 3 | 52 | 102 | 169 | 254 | 401 | 2,237 | 2,106 | 2,037 | 1,974 |
 | this recipe, engine of 15 Nov | 24 × 409,600 | 15 Nov, 1 run | 78 | 101 | 171 | 260 | 379 | 4,147 | 3,830 | 3,714 | 3,617 |
 | this recipe, engine of 20 Nov | 24 × 409,600 | decode 20 Nov, median of 3; prompt 21 Nov, mean of 3 | 75 | 105 | 171 | 258 | 375 | 3,696 | 3,621 | 3,544 | 3,458 |
 | this recipe, through `patches/0034` | 24 × 409,600 | 22 Nov, mean of 9 | 65 | 110 | 171 | 269 | 378 | 3,893 | 3,803 | 3,711 | 3,612 |
 
 Tokens a second on sparkDash, decode for all streams together (lab). Dates are UTC.
 
-- **Our engine at TP=1** is this recipe's engine and image on one Spark, without the settings that need two ranks:
-  decode beside a prompt read, beside packing, overlap, mixed last, mixed sequence-parallel, ride fast, head sharding
-  and the two-rank `TF_FLASHNEXT_TP_*` settings are off, because the engine refuses them at TP=1. Reply keep stays set
-  but does nothing at TP=1. Everything else is as in production: late skip, prompt-cache row sharing, EXL3 experts
-  (cut for one rank), expert re-route and the shared pool. Each copy serves 12 × 409,600 with a 23 GiB prompt cache,
-  production's 45 GiB split in two.
-- **TP=2 against our engine at TP=1 × 2.** On the same two Sparks, TP=2 reads a prompt 76-83% faster than TP=1 × 2 at
-  4K-262K. Its total decode at 16 streams is about 5% lower (378 against 401), and at 1-8 streams the difference is
-  within the noise. TP=2 is still the recipe, for three reasons:
-  - Both Sparks read every prompt, and agents send 4.4-5.6 new prompt tokens for every token they generate
-    ([Agent traffic](#agent-traffic-lab-and-real)).
-  - Decode beside a prompt read needs two ranks, and on agent traffic it is what keeps decode going while prompts are
-    read (the "Decode beside a prompt read" row below).
-  - A single conversation can use the whole pair's memory: the 45 GiB prompt cache is one cache for every
-    conversation, where a TP=1 copy keeps 23 GiB for the conversations the relay sends it.
-- **Queueing.** The TP=1 recipe holds 5 streams on one Spark and 10 on the pair, and our engine at TP=1 holds 12 a
-  copy. Requests past those counts wait at the engine or the relay: the TP=1 recipe's at 8 and 16 streams on one Spark
-  and at 16 on the pair, our engine at TP=1's at 16 streams on one Spark.
-- **262K** does not fit the TP=1 recipe's 262,144-token window with the template and the reply (sparkDash's own
+- **This recipe at TP=1** runs on one Spark without the settings the engine refuses at TP=1 (decode beside a prompt
+  read, beside packing, overlap, mixed last, mixed sequence-parallel, ride fast, head sharding, `TF_FLASHNEXT_TP_*`).
+  Everything else is as at TP=2. Each copy serves 12 × 409,600 with a 23 GiB prompt cache, half of TP=2's 45 GiB.
+- **Why TP=2 anyway.** TP=2 reads prompts 76-83% faster than TP=1 × 2; its decode is about 5% lower at 16 streams
+  (378 against 401) and level at 1-8. Agent traffic is mostly prompt reading (4.4-5.6 new prompt tokens per generated
+  token, [Agent traffic](#agent-traffic-lab-and-real)), decode beside a prompt read needs two ranks, and one 45 GiB
+  prompt cache serves every conversation instead of two 23 GiB halves.
+- **Queueing.** Requests past a setup's streams wait: the single-Spark recipe holds 5 a Spark, this recipe at TP=1 12
+  a copy.
+- **262K** does not fit the single-Spark recipe's 262,144-token window with the template and the reply (sparkDash's
   "Skipped" row).
-- **Run counts.** Every row measured on 21 or 22 November is a mean over runs that each started a fresh engine, with
-  the arms interleaved: 3 runs for each TP=1 row and for the 20 November engine's prompt reading (21 November), and 9
-  for the engine through `patches/0034`. The 15 November row is one run; within a run, sparkDash's prompt reading is the mean of 3 samples at
-  4K and 32K, 2 at 131K and 1 at 262K. Its 4K figure was high for its build: five later runs of the same build averaged
-  3,944.
-- The 15 November engine predates beside packing, reply keep and the main stream's priority with beside on. The 20
-  November engine carries everything through `patches/0033` (five experts off).
+- **Runs.** Every row from 21 November on comes from fresh-engine runs with the setups interleaved: means of 3 for the
+  22 November single-Spark and TP=1 rows and the 20 November engine's prompt reading, of 9 for `patches/0034`; medians
+  of 3 for the 24 November rows. The 15 November row is one run, and its 4K figure ran high (five later runs of that
+  build averaged 3,944). The 15 November engine predates beside packing, reply keep and the main stream's priority; the
+  20 November engine has everything through `patches/0033`.
 
 ### From the single-Spark recipe to this one
 
@@ -121,7 +121,7 @@ rerun; the rest are sparkDash or our own benchmarks named in the row.
 | change (date) | gain | measure | lab or real |
 |---|---|---|---|
 | **Start:** the single-Spark recipe, one copy a Spark (as published; measured 22 Nov) | where this started: decode 49 / 96 / 150 / 209 / 213 at 1-16 streams for the pair (5 × 262,144 a copy, 10 × 262,144 in all), 46 / 70 / 101 / 107 / 114 on one Spark (5 × 262,144); prompt reading 2,327 / 2,136 / 1,951 at 4K / 32K / 131K, 262K does not fit its 262,144-token window | sparkDash decode and prompt reading, 3 fresh-start runs of each, interleaved (22 Nov; table above) | lab |
-| Two ranks at TP=2, one a Spark (upstream PR #1784's head split; 2 Nov) | decode +19.1%* / +15.3%* / -1.6%* / +3.2%* / -5.4% at 1-16 streams; prompt reading +76.4% / +80.7% / +82.0% / +83.0% at 4K-262K; streams: our engine at TP=1 × 2 serves 12 × 409,600 a copy, 24 × 409,600 in all; TP=2 serves 24 × 409,600 | sparkDash decode and prompt reading, 3 fresh-start runs of each arm against 3 of production, interleaved (22 Nov); TP=1 × 2 is our engine at TP=1, one copy a Spark behind a relay that keeps a conversation on one copy, against TP=2 on the same two Sparks | lab |
+| Two ranks at TP=2, one a Spark (upstream PR #1784's head split; 2 Nov) | decode +19.1%* / +15.3%* / -1.6%* / +3.2%* / -5.4% at 1-16 streams; prompt reading +76.4% / +80.7% / +82.0% / +83.0% at 4K-262K; streams: this recipe at TP=1 × 2 serves 12 × 409,600 a copy, 24 × 409,600 in all; TP=2 serves 24 × 409,600 | sparkDash decode and prompt reading, 3 fresh-start runs of each arm against 3 of production, interleaved (22 Nov); TP=1 × 2 is this recipe at TP=1, one copy a Spark behind a relay that keeps a conversation on one copy, against TP=2 on the same two Sparks | lab |
 | NVFP4 KV cache (engine 2 Nov; in production from 3 Nov) | decode -12.2%* / +5.9%* / +3.4%* / +2.9%* / +2.5%* at 1-16 streams; prompt reading -3.2%* / -0.8% / -0.9% / -0.7% at 4K-262K: no speed change on sparkDash; capacity: fp8 KV also served 24 × 409,600, so these tests did not show a capacity gain | sparkDash decode and prompt reading, 3 fresh-start runs of each arm against 3 of production, interleaved (22 Nov); the arm is production with fp8 KV, the format before it | lab |
 | EXL3 routed experts on the FP4 checkpoint (engine 5 Nov; in production from 5 Nov) | decode -2.3%* / 0.0% / +11.2%* / +13.6%* / +12.7% at 1-16 streams; prompt reading -1.9%* / +3.3% / +3.4% / +3.3% at 4K-262K | sparkDash decode and prompt reading, 3 fresh-start runs of each arm against 3 of production, interleaved (22 Nov); the arm is production with the checkpoint's own NVFP4 experts | lab |
 | Keep and frame-ordering settings for the TP=2 prompt path (8 Nov) | decode +18.8%, prompt reading +12.9%, token-exact | an agent-traffic benchmark | lab |
@@ -193,9 +193,58 @@ Decode-only load and agent traffic are far apart. Agents send 4.4-5.6 new prompt
 | replayed agent-shaped streams, whole pair, tok/s (lab) | 144 | 182 | 180 |
 | time to first token p50, agent-shaped (lab) | 3.4 s | 7.5 s | 18 s |
 
-On real traffic the deployment's goal, 300+ generated tokens a second for the pair in 90% of busy minutes, **was not
-reached**. In the busiest hour sampled (20 November), with up to ~10 streams a pair, the busiest minutes reached 290 and
-253 tok/s on the two pairs, and no minute reached 300 (real).
+[Mixed agent load](#mixed-agent-load-lab) measures this with an open, seeded workload.
+
+### Mixed agent load (lab)
+
+sparkDash is close to decode-only. Coding agents hold long conversations and add a tool result every turn, so the
+server reads prompts while other conversations decode. [`bench/agentload.py`](bench/README.md#agent-workload-agentloadpy)
+generates that load from a seed: 16 conversations at once, each opened on 100,000 or 131,072 tokens of public-domain
+book text; every turn adds 2,048-8,192 tokens as a tool result and asks for a small Python function, and every reply is
+exactly 1,024 tokens (`--fixed-length`). A conversation that outgrows its limit starts over, read cold. It is
+synthetic, not replayed traffic.
+
+Each run started a fresh engine, warmed every conversation up and measured 600 s, with the setups interleaved. The
+single-Spark recipe ran a copy on each Spark, 8 conversations a copy, with no relay. No request was refused or failed.
+
+**Up to 262,144 tokens** (24 Nov, 6 runs a setup over two pairs; median [95% interval]):
+
+| | single-Spark recipe (5 × 262,144 a copy) | this recipe |
+|---|---:|---:|
+| decode, all conversations | 24 tok/s [24, 25] | **175 tok/s** [165, 185] |
+| first token of a follow-up turn, median / p90 | 347 s / 493 s | **27 s / 70 s** |
+| turns finished in 600 s | 15 | **106** |
+| decode speed of one conversation | 4.5 tok/s | **20-22 tok/s** |
+| pauses over 1 s between reply tokens | 1,866 | **282** |
+
+The single-Spark recipe serves 5 conversations a copy, so 3 of each copy's 8 wait for a slot. At `PARALLEL=8` and
+262,144 it does not start (6 of 6), for lack of memory, as its README says.
+
+**Up to 163,840 tokens, all 16 served at once** (25-26 Nov, 4 runs a setup). The single-Spark recipe also ran at
+`PARALLEL=8 CONTEXT=163840`, a change to its settings that its README calculates fits. Conversations start over more
+often here, so this recipe's numbers are lower than above.
+
+| | single-Spark recipe | single-Spark recipe, 8 × 163,840 | this recipe |
+|---|---:|---:|---:|
+| decode, all conversations | 25 tok/s [24, 26] | 30 tok/s [29, 30] | **104 tok/s** [79, 144] |
+| first token of a follow-up turn, median / p90 | 311 s / 452 s | 120 s / 283 s | **42 s / 86 s** |
+| turns finished in 600 s | 17 | 18 | **65** |
+
+This recipe made 104 tok/s on one pair (3 runs) and 141 on the other (1 run).
+
+**Prompt reading under this load.** The single-Spark recipe reads more new text a second (3,249 against 1,713 tok/s
+in the first table) because its follow-up turns read their history again: on one Spark, the weights and windows leave
+it 3-5 GiB of prompt cache, and, as its README notes, a follow-up then starts from the beginning. This recipe resumes
+each conversation from its 45 GiB prompt cache (about 26,600 tokens a second reused), so it reads only the new text.
+
+**24 conversations, this recipe alone** (24-25 Nov, 6 runs each):
+
+| contexts | decode | first token of a follow-up turn, median / p90 |
+|---|---:|---:|
+| 100,000-131,072, up to 262,144 | 189 tok/s [176, 197] | 51 s / 107 s |
+| 131,072-262,144, up to 409,600 | 98 tok/s [92, 109] | 87 s / 165 s |
+
+Commands to rerun these are in [`bench/README.md`](bench/README.md#agent-workload-agentloadpy).
 
 ### Long-context accuracy (lab)
 
@@ -456,25 +505,20 @@ its earlier turns instead of reading the whole prompt again.
 
 ## What was checked
 
+On a pair of Sparks, from a fresh clone (22-23 Nov): see **Status** above. Not exercised: the full weights download
+(only its first 256 MiB).
+
 Without a Spark (the details are in this repository's history and can be re-run):
 
-- `patches/` applies with `git apply` onto a fresh clone of TensorFold at `089a18dff` (`scripts/prepare.sh
-  --check-patches`), and the result is the deployment's engine tree, which carries the five-expert switch
-  (`patches/0033`, off by default), except reworded comments and strings.
-- The `docker run` commands `DRY_RUN=1 ./start.sh` prints match the deployment's launcher for both ranks: the same
-  docker options, the same 113 container variables (all but the link's netdev, RoCE devices, GID index and the experts
-  folder's path, which depend on the machine), and the same `serve` arguments except `--host` (the deployment binds
-  127.0.0.1 behind a gateway).
-- The image recipe is the deployment's Dockerfile with the source taken from a clone plus `patches/` instead of a
-  source tarball of the same tree.
-- `tools/exl3_experts_pack.py` lays out the pinned shards exactly as the deployment's folder: from the shards' real
-  headers it writes a `model.safetensors.index.json` byte-identical to the deployment's, and the same ten files with
-  the same sizes and tensor counts. One output file was fetched by range from the pinned branch and its sha256 equals
-  the deployment's. The cut from whole shards (`EXL3_SOURCE=download`) was checked byte for byte on synthetic shards.
-
-Not checked without a Spark: the image build itself, the link detection on real CX7 ports, the copy to the worker, and a
-full start. The deployment's engine is built and serving from the same code; this recipe's own image build has not
-been run.
+- `patches/` applies with `git apply` onto TensorFold at `089a18dff` (`scripts/prepare.sh --check-patches`) and gives
+  the deployment's engine tree, apart from reworded comments and strings.
+- `DRY_RUN=1 ./start.sh` prints the deployment's `docker run` for both ranks: the same options, the same 113 container
+  variables apart from the machine's own (link netdev, RoCE devices, GID index, experts path), and the same `serve`
+  arguments apart from `--host`.
+- The image recipe is the deployment's Dockerfile, built from a clone plus `patches/` instead of a source tarball.
+- `tools/exl3_experts_pack.py` reproduces the deployment's experts folder: a byte-identical index and the same ten
+  files, sizes and tensor counts; one file fetched from the pinned branch matched its sha256, and the cut from whole
+  shards was checked byte for byte on synthetic shards.
 
 ## Licenses
 
@@ -529,7 +573,7 @@ start.sh, stop.sh   start and stop both ranks
 scripts/            config.sh (settings), engine.env (the engine's variables), prepare.sh (image and weights on both
                     Sparks), nodes.sh (ssh and the link), local.sh.example, checkpoint.sha256, exl3-pack.sha256
 tools/              exl3_experts_pack.py (the per-rank EXL3 experts folder)
-bench/              the prompt-reuse tests and LCQ v2 (bench/README.md)
+bench/              the prompt-reuse tests, LCQ v2 and the agent workload (bench/README.md)
 patches/            0001-0034, applied to TensorFold at TF_REF in filename order
 docs/               chart.svg (the chart at the top of this README)
 CHANGELOG.md, CREDITS.md, LICENSE, NOTICE

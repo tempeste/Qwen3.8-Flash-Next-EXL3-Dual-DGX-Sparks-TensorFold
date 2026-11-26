@@ -1,4 +1,4 @@
-# bench: prompt-reuse tests
+# bench: prompt-reuse tests and an agent workload
 
 The tables in the top-level README report three serving features that a lone-prompt benchmark cannot show:
 prompt-cache reuse (a new question on a document already read), shared-prefix keep (requests that share an opening
@@ -100,3 +100,57 @@ The licence of the texts is in [`CORPUS-LICENSE`](CORPUS-LICENSE).
 The needles, seeds (8181, splitmix64), question texts, grading and every probe's method are the ones behind the
 README's tables. Only the filler is new: the README's results used filler cut from a private source repository, so
 the haystacks here are different bytes at the same depths, and a rerun gives comparable, not identical, numbers.
+
+## Agent workload (`agentload.py`)
+
+`reuseprobe.py` and `lcq.py` send one request at a time. `agentload.py` loads a server the way a group of coding agents
+does: S streams at once (16 by default), each holding a long conversation. It is generated from a seed, not replayed
+from real traffic, so every server gets the same work.
+
+- **Turn 0** opens a conversation on CTX tokens of this folder's corpus (`--ctx`), framed as tool results and notes,
+  then asks for a small Python function from a fixed list.
+- **A warm turn** appends the reply, a tool result of 2,048-8,192 tokens (`--chunk`) and the next task, so the
+  server's prompt cache can resume it.
+- **A cold turn** opens a new conversation: by chance (`--cold-share`, 2%) or when the next turn would pass
+  `--max-context` (262,144; `--long` allows up to 409,600).
+- Replies are capped at 1,024 tokens (`--max-tokens`), temperature 0, thinking off. `--fixed-length` also sends
+  `ignore_eos` and `min_tokens`, so every reply is exactly that long on a server that honours them (both setups in the
+  top-level README did).
+
+After a warm-up in which every stream finishes its first turn, it measures 600 s (`--measure`) and reports generated
+tokens a second, new and cached prompt tokens a second, each stream's decode speed, first-token times (warm and cold
+turns apart), gaps between tokens, turns finished, refusals by kind, and, with `--slots`, how many turns were sent
+while every slot was busy. The output file is JSON lines: the first describes the run (settings, plan sha256, URLs,
+slots), then one line per attempt (stream, turn, send, first-token and end times, status, usage and cached tokens,
+token arrival times), then `window` and `end` lines.
+
+### Commands
+
+```sh
+cd bench
+python3 agentload.py verify
+python3 agentload.py plan --streams 16 --ctx 100000,131072 --fixed-length
+python3 agentload.py run out/A1.al.jsonl --url http://127.0.0.1:8000 --model Qwen3.8-Flash-Next --label A1 \
+  --slots 24 --streams 16 --ctx 100000,131072 --fixed-length
+python3 agentload.py table --arm A out/A*.al.jsonl --arm B out/B*.al.jsonl
+```
+
+`--url` may be given more than once: stream k goes to URL k mod the number of URLs, which is how the single-Spark
+recipe ran as two copies without a relay. Give both setups the same options, restart each server before every run
+(its prompt cache would still hold the last run), and interleave at least 3 runs a side (A B B A A B). `table` and
+`compare` refuse runs of different work. A run takes 25-30 minutes. `python3 agentload.py -h` lists every option and its default.
+
+### The runs in the top-level README
+
+[Mixed agent load](../README.md#mixed-agent-load-lab) used these plans with this folder's corpus, so a rerun sends
+the same requests (`plan` prints the sha256):
+
+| table | options | plan sha256 |
+|---|---|---|
+| up to 262,144 | `--streams 16 --ctx 100000,131072 --fixed-length` | `95efbed3d625` |
+| up to 163,840, all served at once | `--streams 16 --ctx 100000,131072 --max-context 163840 --fixed-length` | `2013af8bc0dd` |
+| 24 conversations, up to 262,144 | `--streams 24 --ctx 100000,131072 --fixed-length` | `6fe57aa9cf36` |
+| 24 conversations, up to 409,600 | `--streams 24 --long --max-context 409600 --ctx 131072,200000,262144 --fixed-length --warmup-max 2400` | `950eefa5ce89` |
+
+This recipe was one URL with `--slots 24`; the single-Spark recipe two URLs, one a Spark, with `--slots 5` (`--slots 8`
+at 8 × 163,840).

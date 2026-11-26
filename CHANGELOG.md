@@ -2,6 +2,17 @@
 
 Every change to this recipe, newest first.
 
+## 1.1 (26 Nov 2026): mixed agent load, current single-Spark baseline
+
+- **Mixed agent load** (README, [Mixed agent load](README.md#mixed-agent-load-lab)): 16 conversations of 100K tokens
+  or more at once, 1,024-token replies, against the single-Spark recipe at its published settings and at
+  8 × 163,840 a copy; 24 conversations up to 262,144 and up to 409,600 on this recipe alone.
+- **`bench/agentload.py`**: the seeded agent workload behind those tables, with the plans and commands to rerun them
+  (`bench/README.md`).
+- **Baseline**: the table at the top compares with the single-Spark recipe's current version (TensorFold v1.2.7,
+  measured 24 Nov). The gains from the starting point still start from the version this work began with (TensorFold
+  v1.1.4, 22 Nov); both versions are in [Where this work started](README.md#where-this-work-started).
+
 ## 1.0 (23 Nov 2026): first version
 
 - **Experts already in place**: `scripts/prepare.sh` uses an `EXL3_PACK` folder that already holds `manifest.json`
